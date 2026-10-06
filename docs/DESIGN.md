@@ -110,7 +110,7 @@ crates/qsh-cli/            package qsh-cli, binaries `qsh` and `qsh-server`
   src/terminal.rs          raw mode, resize, escapes (~. ~d ~s ~?), status line
   tests/                   end-to-end tests with a fake ssh
 fuzz/                      cargo-fuzz targets
-docs/                      DESIGN.md (this), protocol.md, security.md
+docs/                      DESIGN.md (this), protocol.md, security.md, m2.md (M2 design and plan)
 man/                       generated man pages
 packaging/                 debian/, rpm/, alpine/, arch/, homebrew/, systemd/, openrc/
 scripts/install.sh         curl | sh installer for release binaries
@@ -134,7 +134,8 @@ qsh doctor [host]                      what works, what does not, the exact fix
 qsh-server bootstrap | pipe            used over ssh by the client
 qsh-server daemon [--foreground]       the per-user daemon (started on demand)
 qsh-server status | stop
-qsh-server doctor | tune [--apply]     host checks; tuning shows a diff and asks
+qsh-server doctor | tune [--apply|--revert]   host checks; tuning shows a diff and asks
+qsh-server upgrade                     replace the running daemon in place, keeping sessions
 ```
 
 - ssh's options pass through: `-p`, `-l`, `-i`, `-J`, `-F`, `-o`, `-4`, `-6`, `-v`. `--` ends options; a host named like a subcommand: `qsh -- ls`.
@@ -146,18 +147,22 @@ qsh-server doctor | tune [--apply]     host checks; tuning shows a diff and asks
 
 ## 7. Self-optimizing connections
 
+The M2 mechanisms are specified in [m2.md](m2.md) (design and implementation plan), with their
+wire formats in protocol.md.
+
 | Mechanism | What it does | Milestone |
 |---|---|---|
 | Transport race | QUIC, TLS and ssh pipe with staggered starts; the first to answer the hello wins, then one ATTACH on it | M0 |
 | Dead path detection | no frame for 45 s, or typed input unanswered for 8 s → race again | M0 |
 | Network change | watch default route and addresses (netlink on Linux, route socket on macOS), migrate the QUIC connection at once | M1 |
-| Path memory | per network (interface + gateway + public address the server sees): remember which transports and ports worked; start with the winner, skip known-blocked UDP, re-probe in the background | M2 |
-| NAT keepalive learning | start at 20 s; when the server sees the client's address change without a migration, the NAT timed out: halve the interval for that network | M2 |
-| Port fallback | extra listening ports (443 when allowed); the client tries them when the first is blocked | M2 |
-| Smart catch-up | the server keeps a screen model; when unacknowledged output exceeds ~2 s of the path's throughput, stop streaming and send the current screen instead, marking the gap in scrollback. Ctrl-C answers at once | M2 |
-| Compression | zstd for output, negotiated, used when the path is slow and the data compresses | M2 |
+| Path memory | per destination and network (keyed hashes; interfaces, gateways, source prefixes): remember which transport and port worked and which were blocked; start with the winner, leave out known-blocked transports and re-probe them in the background, move to a better transport when it comes back; a miss or a wrong memory falls back to the full race at once | M2 (0.3) |
+| NAT keepalive learning | QUIC keep-alive starts at 20 s; when PATH_INFO shows the client's address changed without a migration while it was idle, the NAT timed out: halve it for that network (floor 5 s), grow back × 1.25 after 30 quiet minutes (ceiling 25 s); no extra application PING on idle QUIC, so a phone's radio wakes once per interval | M2 (0.3) |
+| Port fallback | `extra_ports` the daemon binds where it can (443 where the administrator allows unprivileged binding), announced in the bootstrap reply; the client tries them 300 ms apart per transport and remembers the one that worked | M2 (0.3) |
+| Live upgrade | a newer `qsh-server` replaces the running daemon by exec in place: sessions, programs, exit statuses, ports and keys survive; clients reconnect after GOAWAY (RESTART) | M2 (0.3) |
+| Smart catch-up | the server keeps a screen model (`vt100`); when unacknowledged output exceeds 2 s of the measured delivery rate, or the user types while output is backed up, it sends the current screen (SNAPSHOT) instead of the backlog and marks the gap in scrollback. Adaptive pacing keeps about one RTT + 100 ms queued: Ctrl-C answers within 2 RTT + 100 ms plus the snapshot's transfer time | M2 (0.4) |
+| Compression | zstd (`ruzstd`, pure Rust) per message, independent frames ≤ 64 KiB, used below 4 MiB/s when the output compresses | M2 (0.4) |
+| Host tuning | `qsh-server doctor` checks UDP buffers, GSO/GRO, BBR, MTU, ports, firewall (ufw, firewalld, nftables, iptables), SELinux/AppArmor, linger, runtime dir, containers, cloud provider (from DMI, no network calls) and prints the fix for this distribution; `tune --apply` applies the fixes with the distribution's tools after showing a diff, records them and `--revert`s them; `qsh doctor HOST` adds client-side probes and a diagnosis | M2 (0.5) |
 | Predictive echo | like mosh: local echo, underlined until confirmed; off in full-screen programs and on fast paths | M3 |
-| Host tuning | `qsh-server doctor` checks UDP buffers, BBR, GSO, MTU, firewall (ufw, firewalld, nftables, iptables), SELinux, linger, cloud security groups hints; `tune --apply` fixes them with the distribution's own tools after showing a diff | M2 |
 
 Supported targets: Ubuntu 20.04+, Debian 11+, Fedora, RHEL/Rocky/Alma 8+, Alpine, Arch, openSUSE, Amazon Linux 2023 on x86_64, aarch64, armv7, riscv64; macOS client and server. Windows client later.
 
@@ -165,7 +170,11 @@ Supported targets: Ubuntu 20.04+, Debian 11+, Fedora, RHEL/Rocky/Alma 8+, Alpine
 
 - **M0 Foundation**: workspace, protocol specification, `qsh-core` (proto, mux, crypto, transports, session layer, server, client), `qsh` and `qsh-server` with interactive bootstrap, unit + end-to-end tests, fuzz targets, CI (fmt, clippy, test, MSRV, deny), static release builds, install script, README, security doc.
 - **M1 Daily driver**: `attach` / `ls` / `kill` with saved credentials, escapes and status line, install prompt, network change watcher, config file, man pages and completions, distribution packaging, distribution-matrix end-to-end tests.
-- **M2 Self-optimizing**: daemon upgrade without losing sessions (hand the ptys to the new daemon over the control socket), path memory, keepalive learning, port fallback, smart catch-up, compression, doctor and tune, chaos tests (netem loss / latency / UDP block / address change).
+- **M2 Self-optimizing** ([m2.md](m2.md)): 0.3.0 path memory, keepalive learning, port fallback,
+  daemon upgrade without losing sessions (exec in place, keeping the programs as children), chaos
+  tests in CI (network namespaces, netem loss / latency / reordering, UDP block, address change,
+  NAT rebinding); 0.4.0 smart catch-up and compression; 0.5.0 doctor and tune per distribution,
+  `qsh doctor HOST`, and a published benchmark against ssh and mosh.
 - **M3 Beyond ssh**: predictive echo, port forwarding (`-L -R -D`), `qsh cp` (resumable), agent forwarding, Homebrew.
 - **M4 System service (optional)**: `qshd`, a root daemon with privilege separation that authenticates SSH keys and certificates itself on one port, for hosts where only one UDP port is open and for fleets.
 - **Public 1.0** when M1 is solid and the protocol has had a review; then packaging requests to Debian, Fedora, Alpine, Arch (AUR first).

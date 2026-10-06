@@ -414,14 +414,15 @@ Capabilities defined by qsh/1:
 
 | Capability | Meaning | Status |
 |---|---|---|
-| `zstd` | the server may send OUTPUT_ZSTD (section 7.12) | reserved, M2 |
-| `snapshot` | the server may send SNAPSHOT to an attachment that asked for it (section 7.8) | reserved, M2 |
+| `zstd` | the server may send OUTPUT_ZSTD (section 7.12) and compressed SNAPSHOT data (section 7.8.3) | defined |
+| `snapshot` | the server may send SNAPSHOT to an attachment that asked for it (section 7.8) | defined |
 | `forward` | port forwarding channels | reserved, M3 |
 | `copy` | file copy channels | reserved, M3 |
 | `agent` | ssh agent forwarding | reserved, later |
 
 Until the sections that define a reserved capability's semantics are complete, implementations
-MUST NOT offer it.
+MUST NOT offer it. `zstd` and `snapshot` are complete (sections 7.8 and 7.12); an
+implementation offers them only once it implements those sections in full.
 
 ### 5.5 PING (0x03) and PONG (0x04)
 
@@ -461,9 +462,14 @@ connection changes (QUIC connection migration or NAT rebinding). An IPv4-mapped 
 address of the ssh connection, if it knows it, and Family 0 otherwise. Any other Family value
 is a FRAME_ERROR.
 
-The client uses PATH_INFO to recognize the network it is on (path memory) and to detect NAT
-timeouts: when the observed address or port changes although the client did not change its
-own address, a NAT between them dropped the mapping and created a new one (section 12.4).
+The server SHOULD send a PATH_INFO within 1 s of the change becoming visible to it (the first
+packet from the new address that its QUIC stack accepts), because clients time NAT keepalive
+learning by it.
+
+The client uses PATH_INFO to detect NAT timeouts: when the observed address or port changes
+although the client did not change its own address, a NAT between them dropped the mapping and
+created a new one (section 12.4). PATH_INFO is informative: a client MUST NOT base a security
+decision on it (the server may be wrong, or lie).
 
 ### 5.7 GOAWAY (0x06)
 
@@ -483,6 +489,8 @@ channels continue; the sender closes the connection when they are done or when i
   ERROR (SESSION_ENDED) (section 7.13), and GOAWAY with IDLE before closing an idle connection
   (section 12.5).
 - A client MAY send GOAWAY with NO_ERROR before it closes a connection on purpose.
+- A server sends GOAWAY with RESTART before it restarts in place (section 10.6); the client
+  reconnects shortly and resumes its sessions.
 - A client receiving GOAWAY with IDLE moves its sessions to a new connection when it needs to.
   A client receiving GOAWAY with SHUTDOWN follows section 7.13: if none of its sessions on that
   connection is left, it MUST NOT reconnect, and in particular MUST NOT start the ssh pipe
@@ -818,7 +826,8 @@ the differences of section 7.14.5):
 5. It discards output below `S` from its replay buffer (`base` = max(`base`, `S`)).
 6. It sends output starting at `S`, preceded by OUTPUT_GAP if `S` is below `base` (section 7.7),
    and EXIT once the program has exited and all output has been sent (section 7.10). When `S`
-   was LATEST or a gap was sent, it SHOULD make the program redraw (section 7.7).
+   was LATEST or a gap was sent, it SHOULD make the program redraw (section 7.7), or, when
+   snapshots are allowed on the attachment, follow section 7.8.6 instead.
 
 The client, on ATTACHED:
 
@@ -917,6 +926,9 @@ A sender of ACK MUST NOT acknowledge bytes it has not received. `Output Received
 Cadence: a receiver SHOULD send ACK when 32 768 bytes or more are unacknowledged, or 200 ms after
 the oldest unacknowledged byte arrived, whichever comes first, and MUST send it within 1 s of
 receiving data. The server SHOULD acknowledge input within 200 ms. ACKs are not acknowledged.
+A client that set ACCEPT_SNAPSHOT SHOULD acknowledge output every 16 384 bytes or 50 ms while
+output arrives continuously: the server's pacing (section 7.6) counts unacknowledged bytes, so
+prompt ACKs keep the amount queued ahead of an interrupt's effect small.
 
 ### 7.6 Replay buffers and output pacing
 
@@ -926,14 +938,27 @@ server discards the oldest bytes, advancing `base`, **even if they are unacknowl
 server MUST keep reading the pseudo-terminal whether or not a client is attached or keeping up:
 a slow or absent client never blocks the program.
 
-The server SHOULD NOT keep more than about two bandwidth-delay products of output (at least
-256 KiB) sent but unacknowledged on an attachment; the rest waits in the replay buffer. The
-amount in flight is `sent_end − max(last_ack, gap_to)` (section 7.5), where `gap_to` is the `To`
-of the latest OUTPUT_GAP (or the `Offset` of the latest SNAPSHOT) sent on the attachment, 0 if
-none: skipped bytes are not in flight, and the server MUST NOT wait for an acknowledgement of
-them before it sends more. This
-keeps the transport's buffers short, so that output can still be skipped (section 7.8) and an
-interrupt typed by the user is followed quickly by the program's reaction.
+The server SHOULD NOT keep much more output sent but unacknowledged on an attachment than the
+path holds; the rest waits in the replay buffer. The amount in flight is
+`sent_end − max(last_ack, gap_to)` (section 7.5), where `gap_to` is the `To` of the latest
+OUTPUT_GAP (or the `Offset` of the latest SNAPSHOT) sent on the attachment, 0 if none: skipped
+bytes are not in flight, and the server MUST NOT wait for an acknowledgement of them before it
+sends more. The `Data` of a SNAPSHOT counts as in flight until an ACK with `Received` ≥ its
+`Offset` arrives. This keeps the transport's buffers short, so that output can still be skipped
+(section 7.8) and an interrupt typed by the user is followed quickly by the program's reaction.
+
+RECOMMENDED pacing (the reference implementation's): per attachment and output stream, the
+server measures the **delivery rate** `T`: on each ACK that advances `last_ack`, a sample is the
+newly acknowledged offsets (minus skipped ranges inside them) divided by the time since the
+previous accepted ACK, used only when output was waiting in the replay buffer during the whole
+interval (otherwise the sample measures the program, not the path); `T` is the maximum of the
+per-second averages of the samples of the last 10 s; before the first sample, `cwnd / srtt` of
+the QUIC connection, or 1 MiB/s on the mux layer. With `R` the smoothed round-trip time (QUIC's
+estimate, or PING over the mux layer, which the server then sends every 5 s while it streams
+output), the window is `clamp(1.25 × T × (R + 100 ms), 64 KiB, 8 MiB)` on a tty session and
+`max(2 × T × (R + 100 ms), 256 KiB)`, at most 8 MiB, on a pipe session. `T` is counted in
+output offsets (uncompressed bytes), so the window converts to the same time with and without
+compression (section 7.12).
 
 **Client, input.** The client keeps all unacknowledged input in its replay buffer, with a
 capacity of at least 64 KiB (default 1 MiB). It MUST NOT discard unacknowledged input: dropping
@@ -961,42 +986,182 @@ happen at attach (step 6 of section 7.3) and during an attachment.
   that a cut-off escape sequence could have left behind.
 - After sending OUTPUT_GAP the server SHOULD make the program redraw its screen, for example by
   changing the pseudo-terminal's window size and changing it back, which delivers SIGWINCH;
-  full-screen programs repaint, a shell's prompt is unaffected.
+  full-screen programs repaint, a shell's prompt is unaffected. When it follows the gap with a
+  resync SNAPSHOT (section 7.8.6) it does not need to.
 - `From ≥ To`, or a `From` that is not the expected offset (section 7.4), is a SEQUENCE_ERROR.
 - OUTPUT_GAP is also how the server announces output it will never send because the session is
   ending (section 7.11): it then carries `To` = the output end, and EXIT follows.
 - OUTPUT_GAP is never sent on a pipe session (section 7.14.5).
 
-### 7.8 SNAPSHOT (0x18) — capability `snapshot` (semantics: M2)
+### 7.8 SNAPSHOT (0x18) — capability `snapshot`
 
 ```
 SNAPSHOT Payload {
   Offset (u64),                 // output offset the screen state corresponds to
-  Flags (u8),                   // bit 0: FINAL
-  Columns (u16),
+  Flags (u8),                   // bit 0 (0x1): FINAL; bit 1 (0x2): ZSTD
+  Columns (u16),                // the screen size the snapshot was drawn for
   Rows (u16),
-  Data (..),                    // data…, terminal bytes that redraw the screen
+  Data (..),                    // data…, terminal bytes that redraw the screen (section 7.8.4)
 }
 ```
 
 Smart catch-up: when the client is far behind (for example several seconds of a fast-scrolling
-program's output over a slow link), the server may skip the backlog and send the current screen
-instead. SNAPSHOT may be sent only if the `snapshot` capability was negotiated **and** the
-ATTACH had the ACCEPT_SNAPSHOT flag.
+program's output over a slow link), the server skips the backlog and sends the current screen
+instead. The server keeps a terminal emulator state (a *screen model*) of each tty session for
+this, fed with exactly the output bytes it appends to the replay buffer.
 
-Semantics fixed now:
+#### 7.8.1 Meaning
 
 - A snapshot replaces the output from the expected offset `S` (section 7.4) up to `Offset`:
-  the client treats it as OUTPUT_GAP{S, Offset} followed by `Data`. `Offset` ≥ `S`.
-- A snapshot may be split into several SNAPSHOT messages, sent back to back with no other
-  output message in between, all with the same `Offset`, `Columns` and `Rows`; the last has
-  FINAL set. The client applies them in order and sets `received` = `Offset` after the FINAL
-  one. A snapshot's total `Data` MUST NOT exceed 1 MiB.
+  the client treats it as OUTPUT_GAP{S, Offset} followed by `Data`. `Offset` ≥ `S`. A snapshot
+  with `Offset` > `S` is a **skip snapshot**; one with `Offset` = `S` skips nothing and is a
+  **resync snapshot** (it repaints the screen and restores modes, for example after a replay
+  that started in the middle of the stream, section 7.8.6).
 - `Data` does not consume output offsets; output continues at `Offset`.
+- `Data` is the server's screen model at offset `Offset`, rendered as terminal bytes according
+  to the content profile (section 7.8.4). Written to a terminal in any state, it leaves the
+  terminal showing that screen.
 
-Left to M2 (servers MUST NOT send SNAPSHOT and clients MUST NOT offer `snapshot` until then): the
-exact content profile of `Data` (which terminal sequences it may use, how it restores modes,
-the alternate screen and the cursor), and when a server chooses to send it.
+#### 7.8.2 When it may be sent
+
+A server MAY send SNAPSHOT only on a tty session, only when the `snapshot` capability was
+negotiated, and only on an attachment whose ATTACH had the ACCEPT_SNAPSHOT flag. A client that
+receives SNAPSHOT otherwise, or on a pipe session, MUST treat it as a PROTOCOL_VIOLATION stream
+error. A client sets ACCEPT_SNAPSHOT only when it writes the output to a terminal that
+understands the sequences of section 7.8.4 (in practice: any terminal compatible with xterm).
+
+`Columns` and `Rows` are the size of the session's terminal when the snapshot was taken. If the
+client's terminal has another size (a resize crossed the snapshot), the client still writes the
+snapshot; the program redraws after the RESIZE it receives.
+
+#### 7.8.3 Splitting and compression
+
+- A snapshot may be split into several SNAPSHOT messages, sent back to back with no OUTPUT,
+  OUTPUT_GAP, OUTPUT_ZSTD, EXIT or other SNAPSHOT in between, all with the same `Offset`,
+  `Columns` and `Rows`; the last has FINAL set. The client applies them in order and sets
+  `received` = `Offset` after the FINAL one. Other messages that do not belong to the output
+  stream (ACK) may be interleaved.
+- **ZSTD flag**: when bit 1 is set, the message's `Data` is one zstd frame subject to every rule
+  of section 7.12 (declared content size 1 – 65 536 bytes, checked before decompressing); its
+  decompressed content is the message's part of the snapshot. The flag MAY be set only if the
+  `zstd` capability was negotiated; otherwise the message is a PROTOCOL_VIOLATION. Each
+  message of a split snapshot sets or clears the flag independently.
+- A snapshot's total `Data`, after decompression, MUST NOT exceed 1 MiB (`MAX_SNAPSHOT`); a
+  client that receives more fails the channel with FRAME_ERROR.
+
+#### 7.8.4 Content profile
+
+`Data`, after decompression and concatenation of the messages of one snapshot, consists only
+of:
+
+- printable characters, UTF-8 encoded (no C0 control characters except CR and LF, no DEL, no C1
+  control characters, no invalid UTF-8), and CR LF line ends;
+- the escape sequences in the table below, with decimal parameters and nothing else (ESC is
+  0x1b, CSI is ESC `[`, OSC is ESC `]`, ST is ESC `\`).
+
+| Sequence | Name | Purpose |
+|---|---|---|
+| `CSI ! p` | DECSTR, soft reset | the first sequence of every snapshot: resets the pen, cursor visibility, origin and insert modes, autowrap (on), cursor keys and keypad (normal), the scroll region, the saved cursor and the character sets, without clearing the screen or the scrollback |
+| `CSI ? 1049 h`, `CSI ? 1049 l` | alternate screen | switch screens (`h` also saves the cursor and clears the alternate screen) |
+| `CSI Pr ; Pc H` | CUP | position the cursor |
+| `CSI K` | EL | erase to the end of the line with the default background (only right after `CSI m`) |
+| `CSI Pm m` | SGR | parameters 0, 1, 2, 3, 4, 5, 7, 8, 9, 22 – 25, 27 – 29, 30 – 37, 39, 40 – 47, 49, 90 – 97, 100 – 107, `38;5;n`, `48;5;n`, `38;2;r;g;b`, `48;2;r;g;b`; an empty parameter list means 0 |
+| `CSI Pt ; Pb r` | DECSTBM | the scroll region |
+| `CSI ? Pm ; … h`, `CSI ? Pm ; … l` with one or more Pm from 1, 9, 25, 1000, 1002, 1003, 1004, 1005, 1006, 1015, 2004 | DEC private modes (set / reset several at once) | application cursor keys (1), cursor visible (25), mouse tracking (9, 1000, 1002, 1003) and its encodings (1005, 1006, 1015), focus reporting (1004), bracketed paste (2004) |
+| `ESC =`, `ESC >` | DECKPAM, DECKPNM | application / normal keypad |
+| `OSC 1 ; text ST`, `OSC 2 ; text ST` | icon name, window title | `text`: at most 256 bytes of printable UTF-8 |
+| `CSI Ps SP q` with Ps 0 – 6 | DECSCUSR | cursor style (OPTIONAL) |
+
+A server MUST NOT put anything else into `Data`, and MUST build `Data` from its screen model,
+never by copying bytes of the program's output. In particular `Data` never contains a sequence
+that makes the terminal answer (device status, attributes, or any query: the answer would be
+typed into the session as input), changes the clipboard (OSC 52), the palette or fonts, sends a
+notification, rings the bell, or resets the terminal hard (RIS, which also clears the
+scrollback in many terminals).
+
+**What the snapshot reproduces.** The cells of the normal screen and, when the alternate screen
+is active, of the alternate screen too: characters including wide and combining characters,
+their SGR attributes (bold, faint, italic, underline, blink, inverse, invisible, strikethrough,
+foreground and background in the 16-color, 256-color and 24-bit forms), and line wrapping (a
+row that continues on the next row is written up to its last column and followed directly by
+the next row's cells, so the terminal's own wrapping joins them); which screen is active; the
+cursor position (of both screens: the normal screen's cursor is restored when the program
+leaves the alternate screen) and its visibility; the scroll region; the current SGR pen; the
+state of each DEC private mode of the table; the keypad mode; the window title and icon name;
+and, in a skip snapshot of the normal screen, up to 100 lines of the skipped output that
+scrolled off the screen (the *tail*), pushed into the terminal's scrollback.
+
+**What it does not reproduce**: the scrollback older than the tail (that is the gap), the saved
+cursor (DECSC), character set designations, origin mode, insert mode, tab stops, a pending
+wrap at the last column, palette and color changes, hyperlinks (OSC 8), images and anything
+else not listed above. A server whose model saw the program use origin mode or a character set
+other than ASCII since the screen was last cleared SHOULD also make the program redraw after the
+snapshot (section 7.7) to repair what the snapshot cannot express.
+
+**Order.** `Data` is written in this order:
+
+1. `CSI ! p`.
+2. The normal screen: `CSI ? 1049 l`, then
+   - in a skip snapshot, the *scroll-push*: `CSI <Rows> ; 1 H`, CR LF, then each tail line
+     followed by `CSI m` and CR LF, then Rows − 1 times CR LF. This moves the previous screen
+     and the tail into the terminal's scrollback and leaves the screen blank, using only
+     scrolling, which every terminal keeps in its scrollback (erasing the display does not);
+   - then every row of the normal screen, top to bottom: `CSI <row> ; 1 H` (omitted when the
+     previous row wraps into this one), the cells with the SGR changes they need, `CSI m`, and
+     `CSI K` when the row ends in blank cells with default attributes (cells that are blank but
+     have a background color are written as spaces).
+3. If the alternate screen is active: `CSI <r> ; <c> H` to the normal screen's cursor,
+   `CSI ? 1049 h`, then every row of the alternate screen as in step 2.
+4. `CSI <top> ; <bottom> r` if the active screen's scroll region is not the whole screen.
+5. Every DEC private mode of the table except 1 and 25, set (`h`) or reset (`l`) explicitly
+   (DECSTR does not reset them), the modes in each state MAY be combined in one sequence;
+   mode 1 and the keypad only when they differ from DECSTR's defaults; then the window title and
+   icon name when they are not empty; then DECSCUSR (optional).
+6. The current SGR pen (`CSI Pm m`) when it is not the default.
+7. `CSI <row> ; <col> H` to the active screen's cursor, then `CSI ? 25 l` if it is hidden.
+
+A resync snapshot skips the scroll-push (step 2 starts with the rows), so it never duplicates
+lines in the scrollback.
+
+**Client processing.** The client removes whatever it drew itself (a status line), writes
+`Data` to the terminal unchanged, and passes it through whatever it uses to follow the
+terminal's state (for example which screen is active). Before a skip snapshot on the normal
+screen it SHOULD write one line of its own saying how many bytes were skipped; the scroll-push
+then moves that line into the scrollback, where it marks the gap. A client MAY check that
+`Data` follows this section; one that does buffers the whole snapshot (at most 1 MiB) and
+writes it only when it passes, and otherwise fails the channel with PROTOCOL_VIOLATION without
+writing any of it.
+
+#### 7.8.5 When a server sends a snapshot
+
+RECOMMENDED (the reference implementation's rules; `U` = output not yet acknowledged,
+`end − max(last_ack, gap_to)`; `B` = output not yet sent, `end − sent_end`; `T` and the window
+as in section 7.6):
+
+- **Backlog**: `U > max(2 s × T, 256 KiB)`, once the attachment has at least 1 s of delivery
+  rate samples (500 ms on QUIC).
+- **Input**: the server accepts INPUT while `B > max(window, 64 KiB)`. It stops sending from
+  the backlog at once and takes the snapshot when the program's output pauses for 20 ms, or
+  after 100 ms, whichever comes first, so that the snapshot shows the program's reaction (an
+  interrupt, a key typed into a pager).
+- **Hysteresis**: no new snapshot before the previous one has been acknowledged (`Received` ≥
+  its `Offset`) and 1 s has passed.
+
+The snapshot is taken at the replay buffer's current end `E` (`Offset` = `E`); the server then
+continues with OUTPUT from `E`. After a snapshot the server does not make the program redraw
+(except as said in section 7.8.4).
+
+#### 7.8.6 Attach
+
+At an attach that starts output at `S` (section 7.3) with snapshots allowed, the server SHOULD
+bound the replay: with `budget` = max(2 s × the initial rate estimate, 256 KiB), if `end − S` >
+`budget` or `S` < `base`, it chooses a cut `C` = max(`base`, `end − budget`), moved to just after
+the first LF within the 4 096 bytes after it if there is one, or `C` = `end` if the alternate
+screen is active at `end`. It sends OUTPUT_GAP{S, C} (if `C` > `S`), the output from `C` to
+`end`, and then a resync snapshot, instead of making the program redraw. This applies to FRESH
+attaches too: a new client process still receives the scrollback (section 7.2) when the path can
+carry it within the budget, and the newest part of it plus the exact screen when it cannot.
+Without snapshots the server behaves as section 7.3 says.
 
 ### 7.9 RESIZE (0x17)
 
@@ -1110,22 +1275,49 @@ without an exit status to report, or its output was truncated: HANGUP timeout, `
 daemon shutdown), ERROR with SESSION_TAKEN_OVER, another ERROR, or the server's FIN after
 DETACH. No output follows EXIT or the ERROR (section 7.10); after EXIT only ACKs may follow.
 
-### 7.12 OUTPUT_ZSTD (0x1c) — capability `zstd` (reserved, M2)
+### 7.12 OUTPUT_ZSTD (0x1c) — capability `zstd`
 
 ```
 OUTPUT_ZSTD Payload {
   Offset (u64),                 // offset of the first decompressed byte
-  Frame (..),                   // data…, one complete zstd frame [RFC 8878]
+  Frame (..),                   // data…, exactly one zstd frame [RFC 8878]
 }
 ```
 
-Reserved for compressed output. The decompressed content is exactly what an OUTPUT with the
-same `Offset` would carry. The zstd frame MUST declare its content size, which MUST be between 1
-and 65 536 bytes; a receiver MUST check the declared size before decompressing and treat a
-larger one, or a frame whose output does not match it, as a FRAME_ERROR. Frames are
-independent (no shared context between messages), so replay and resume work unchanged.
-Dictionaries and when to compress are left to M2; until then the capability MUST NOT be
-offered.
+Compressed output. The decompressed content is exactly what an OUTPUT with the same `Offset`
+would carry: the output stream's offsets count decompressed bytes, and the next output message
+starts at `Offset` plus the decompressed length. A server MAY send OUTPUT_ZSTD instead of OUTPUT
+on tty and pipe sessions when the `zstd` capability was negotiated; error output (ERROR_OUTPUT)
+and input are never compressed.
+
+**Frames are independent**: no context is shared between messages and no dictionary is used,
+so replay, resume and gaps work exactly as with OUTPUT. A server keeps its replay buffer
+uncompressed and compresses when it sends.
+
+**Frame rules.** Before it decompresses anything, the receiver MUST check the frame header
+[RFC 8878, section 3.1.1] and treat any violation as a FRAME_ERROR stream error:
+
+1. `Frame` starts with the magic number `28 b5 2f fd` (a skippable frame is a violation);
+2. in the Frame_Header_Descriptor, Single_Segment_flag is 1, the Reserved bit is 0 and
+   Dictionary_ID_flag is 0. Single-segment frames have no Window_Descriptor: the window is the
+   content size;
+3. Frame_Content_Size (whatever the size of its field) is between 1 and 65 536
+   (`MAX_ZSTD_CONTENT`);
+4. after decompression, the frame's last block (and its content checksum, if the
+   Content_Checksum_flag is set, which the receiver then verifies) ends exactly at the end of the
+   payload, and exactly Frame_Content_Size bytes were produced. A decoder MUST stop as soon as
+   it would produce more.
+
+These rules bound what a receiver commits per message, whatever the sender does: a 64 KiB
+window, 64 KiB of output and the decoder's fixed tables. A message of a few bytes can therefore
+expand to at most 64 KiB, and the receiver's memory and CPU per message are bounded.
+
+**When to compress** (RECOMMENDED, the reference implementation's policy): when the
+attachment's delivery rate `T` (section 7.6) is below 4 MiB/s; when at least 512 bytes are
+ready (single keystroke echoes go out raw and at once), reading up to 64 KiB of backlog per
+message; while the recent frames of the stream compressed to less than 85 % of their size
+(otherwise stop, and try one chunk again after 1 MiB or 2 s); and only when the frame is at
+least 10 % smaller than the raw data. A sender MAY use any compression level.
 
 ### 7.13 Session lifetime
 
@@ -1137,7 +1329,8 @@ offered.
   earlier as described in section 7.10.
 - HANGUP and `qsh kill` (bootstrap op `kill`) hang a session up and remove it at once; an
   attached client receives EXIT or ERROR (SESSION_ENDED) as in section 7.11.
-- Sessions live in the daemon's memory: when the daemon stops, all its sessions end. On a
+- Sessions live in the daemon's memory: when the daemon stops, all its sessions end (a restart
+  in place, section 10.6, is not a stop: it keeps them). On a
   request to stop (SIGTERM, `qsh-server stop`, a service manager stopping the unit) the daemon:
   1. stops accepting connections and bootstrap requests;
   2. hangs up every session (section 7.11, all at once, so the 2 s waits overlap);
@@ -1516,7 +1709,10 @@ per [RFC 9002] or any congestion controller that is safe for the Internet.
   | Setting | Recommended value | Why |
   |---|---|---|
   | `max_idle_timeout` | 60 s | rides out a network switch; the session layer recovers beyond it |
-  | client keep-alive (QUIC PING) | 20 s without packets, adapted per network (section 12.4) | keeps NAT mappings |
+  | client keep-alive (QUIC PING) | 20 s without packets, learned per network between 5 and 25 s (section 12.4) | keeps NAT mappings |
+  | server keep-alive | 20 s | |
+  | UDP socket buffers (`SO_RCVBUF`, `SO_SNDBUF`) | 4 MiB requested (the kernel caps it at `net.core.rmem_max` / `wmem_max`) | bursts at large bandwidth-delay products |
+  | stateless reset key | derived from the daemon's identity key, so that it survives a daemon restart (section 10.6) | clients learn at once that a connection is gone |
   | `initial_max_streams_bidi` | server 128, client 0 | sessions per connection |
   | `initial_max_stream_data_bidi_*` | ≥ 256 KiB | throughput at high RTT |
   | `initial_max_data` | server ≤ 64 KiB (REQUIRED, section 6.6), raised with MAX_DATA to ≥ 1 MiB once authenticated | pre-auth memory |
@@ -1533,6 +1729,10 @@ TLS 1.3 [RFC 8446] over TCP, used where UDP is blocked or throttled.
 - The mux layer (section 8) starts with the first byte of application data in each direction;
   there is no preface.
 - Endpoints SHOULD set `TCP_NODELAY`; keystrokes must not wait for Nagle's algorithm.
+- Servers SHOULD use BBR as the congestion control of their TCP sockets where the system lets
+  an unprivileged process choose it (Linux: `TCP_CONGESTION`, permitted when `bbr` is in
+  `net.ipv4.tcp_allowed_congestion_control`): on long lossy paths loss-based congestion control
+  collapses (m2.md §8).
 - The server's `tcp` port is by default the same number as its `udp` port.
 
 ### 9.3 The ssh pipe
@@ -1610,7 +1810,8 @@ only widens its exposure.
 ssh passes the remote command to the user's login shell, which may be any shell (bash, zsh,
 fish, tcsh, …), and the non-interactive `PATH` often lacks `~/.local/bin`, where `qsh install`
 puts the server. The client therefore SHOULD send exactly this remote command, as a single
-argument after the destination, with `<SUB>` replaced by `bootstrap` or by `pipe --version N`:
+argument after the destination, with `<SUB>` replaced by `bootstrap`, by `pipe --version N`, or,
+for diagnostics, by `doctor --json --probe`:
 
 ```
 sh -c 'for p in "$(command -v qsh-server)" "$HOME/.local/bin/qsh-server"; do if [ -n "$p" ] && [ -x "$p" ]; then exec "$p" <SUB>; fi; done; exit 42'
@@ -1711,6 +1912,7 @@ Reply to `new` and `attach`:
 | `server` | string | server implementation, informative |
 | `tty` | boolean | `false` for a pipe session (section 7.14), REQUIRED then; absent or `true` for a tty session |
 | `ssh_addr` | string, optional | the server address of the ssh connection (from `SSH_CONNECTION`); the client MAY try it as an additional address for QUIC and TLS |
+| `extra_ports` | array of objects, optional | further ports of the same daemon (section 12.6): each `{"port": N, "udp": bool, "tcp": bool}`, N in 1 – 65 535, at least one of `udp` and `tcp` true; at most 8 entries. A client ignores invalid entries and entries beyond the eighth, and stores the rest with the credentials |
 
 Example (one line, wrapped here):
 
@@ -1719,6 +1921,13 @@ Example (one line, wrapped here):
  "key":"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
  "cert_sha256":"5f1c…(64 hex digits)…","udp":60443,"tcp":60443,"caps":[],
  "server":"qsh-server/0.1.0"}
+```
+
+With an extra port 443 bound on UDP only (the administrator allows it, section 12.6):
+
+```
+{"qsh":1,…,"udp":60443,"tcp":60443,"extra_ports":[{"port":443,"udp":true,"tcp":false}],
+ "caps":["snapshot","zstd"],"server":"qsh-server/0.4.0"}
 ```
 
 Reply to `list`:
@@ -1773,8 +1982,9 @@ needed, then hands the request to it over the daemon's local control socket and 
 answer. A daemon started this way MUST detach from the ssh session: new session (`setsid`), and
 standard input, output and error not connected to the ssh channel. Otherwise ssh waits for the
 daemon to exit and the bootstrap never completes. The control socket protocol between
-`qsh-server` processes of one installation is implementation-specific and not part of qsh/1;
-its security requirements are in [security.md](security.md).
+`qsh-server` processes of one installation is implementation-specific and not part of qsh/1
+(section 10.6 records the reference implementation's rules for upgrades); its security
+requirements are in [security.md](security.md).
 
 ### 10.5 `qsh-server pipe`
 
@@ -1806,6 +2016,53 @@ version 1:     "\nQSH-PIPE/1\n"   (12 bytes: 0a 51 53 48 2d 50 49 50 45 2f 31 0a
   behind it.
 - Exit status: 0 when either side closed the stream, 1 on errors (including an unsupported
   version), 42 reserved (section 10.2).
+
+### 10.6 Daemon restarts and upgrades
+
+A daemon MAY restart **in place**, keeping its sessions: for example when its program was
+replaced by a newer version. What clients see:
+
+- every connection ends with GOAWAY carrying RESTART (section 11.2), and then closes;
+- sessions, their keys (no rotation happens), their output and input offsets, the daemon's
+  certificate and its ports are unchanged, so a client reconnects with the credentials it has,
+  without ssh, and resumes every session as after any lost connection (section 7.3);
+- a client receiving RESTART SHOULD reconnect after about 500 ms (± 20 % jitter), without the
+  back-off of section 12.2, and MUST NOT treat its sessions as ended. (A client that does not
+  know the code treats it like INTERNAL_ERROR and reconnects with back-off, which also works.)
+
+A daemon that cannot keep its sessions (it is stopping, or a restart failed) MUST NOT send
+RESTART; it follows section 7.13.
+
+**qsh-server's control socket.** The control socket protocol remains internal to an
+implementation (section 10.4), but packagers combine versions of `qsh-server` on one host (a
+package upgrade replaces the binary while the old daemon runs), so the reference
+implementation fixes these rules for itself, and other implementations that want to upgrade
+qsh-server daemons in place follow them:
+
+- Every request is one JSON line; requests carry `"v"` (2 from qsh-server 0.3.0 on, 1 before)
+  and, from version 2, `"version"` (the requester's semantic version) and `"exe"` (the absolute
+  path of its own executable).
+- When a daemon that supports upgrades receives a request from a strictly newer `qsh-server`
+  (and its configuration allows automatic upgrades), it answers `{"restarting":true}` instead of
+  serving the request, and upgrades to `exe`. The requester closes, reconnects to the socket
+  (performing every check of [security.md](security.md) §4.3 again: directory, peer user id) and
+  repeats its request for up to 10 s. An older daemon answers a version-2 request as it always
+  did; the requester simply uses it.
+- Op `upgrade` (`{"v":2,"op":"upgrade","exe":"/usr/bin/qsh-server","force":false}`) asks for an
+  upgrade explicitly; the answer is `{"restarting":true}` or `{"ok":false,"error":"…"}`.
+- Op `status` answers, from version 2, at least: `version`, `pid`, `udp`, `tcp`, `extra_ports`,
+  `cert_sha256`, `sessions` (a count), `upgrade` (`"auto"` or `"manual"`) and `handoff` (the
+  state formats it can write and read, below).
+- `qsh-server handoff-probe` prints one line, `{"qsh-server":"<version>","handoff":[1]}`, and
+  exits 0. A daemon upgrades only to an executable whose probe succeeds within 5 s, reports a
+  newer version (unless forced) and shares a state format with it.
+- The state passed from the old to the new program (sessions, keys, buffers, offsets, the
+  descriptors of pseudo-terminals, pipes and sockets) never leaves the process: the reference
+  implementation re-executes itself in place (same process id, so the session programs remain
+  its children) with the state in an anonymous, encrypted file descriptor. Its format is private
+  to the implementation and versioned by the `handoff` numbers; format 1 of qsh-server is
+  documented in m2.md section 10.5. The security requirements are in
+  [security.md](security.md) §4.8.
 
 ## 11. Errors
 
@@ -1844,6 +2101,7 @@ version 1:     "\nQSH-PIPE/1\n"   (12 bytes: 0a 51 53 48 2d 50 49 50 45 2f 31 0a
 | 0x12 | SESSION_TAKEN_OVER | stream | a newer attachment took the session | stop; do not re-attach automatically |
 | 0x13 | SESSION_ENDED | stream | the session was ended (HANGUP, `kill`, TTL, daemon shutdown) without an exit status to report, or with its output truncated | exit |
 | 0x14 | SEQUENCE_ERROR | stream | offsets or acknowledgements inconsistent (section 7) | attach once more; then give up on the session |
+| 0x15 | RESTART | connection | the daemon restarts in place and keeps every session (section 10.6); sent in GOAWAY | reconnect after about 500 ms, without back-off; resume every session |
 
 A client receiving SESSION_TAKEN_OVER MUST NOT re-attach automatically: two clients doing so
 would take the session from each other forever. (A client that itself moved the session to a
@@ -1880,9 +2138,27 @@ of one outstanding ATTACH per session (section 7.2) trivially true.
 | TLS | after 400 ms (QUIC gets a head start: only QUIC survives address changes) | 8 s |
 | ssh pipe | after 3 s, if neither QUIC nor TLS has succeeded | ssh's own `ConnectTimeout` (10 s) |
 
-With path memory (M2), a client starts with the transport and port that worked last on the
-current network and skips transports known to be blocked there, re-probing them in the
-background.
+**Extra ports** (section 12.6). Each transport has a list of candidate ports: the primary port
+of the bootstrap reply, then the extra ports that have that transport, in announced order. Within
+a transport, each further candidate starts 300 ms after the previous one while the earlier ones
+keep running (a blocked UDP port answers nothing, so waiting for it would cost the whole attempt
+timeout). A client SHOULD NOT run more than 6 direct attempts at once, which keeps it below the
+server's limit of unauthenticated connections per source address (section 6.6).
+
+**Path memory** (RECOMMENDED). The client remembers, per destination and per network (a keyed
+hash of the default routes' interfaces, gateways and source prefixes), which transport and port
+worked and which transports failed in a way that says something about the network (no answer to
+the handshake, a reset during it, no SERVER_HELLO after it) while another transport worked. On
+reconnecting it starts the remembered transport and port at once, leaves transports out that
+failed there recently and probes them again in the background with exponential back-off (1 min
+up to 24 h), and starts TLS 1.5 × the remembered QUIC handshake time after QUIC (between 250 ms
+and 2 s) instead of 400 ms. If a race without the left-out transports fails, the next attempt
+runs the full race at once and the memory of failures for that network is cleared: the memory
+changes order and timing, never which transports are allowed. When a background probe finds a
+better transport (QUIC over TLS over the ssh pipe), the client MAY move its sessions to it by
+re-attaching them there (an ordinary resume; it ignores the SESSION_TAKEN_OVER on its own old
+streams), at most once per server per 60 s. The design, the storage and the privacy rules are in
+m2.md section 3.
 
 ### 12.2 Reconnecting
 
@@ -1907,6 +2183,12 @@ The client declares the connection dead and races again when:
   even if the terminal stream is held up by flow control; or
 - over QUIC, the QUIC idle timeout fires.
 
+Over QUIC a client MAY replace the idle PING by the QUIC keep-alive (section 12.4): the
+keep-alive keeps the NAT mapping and the server's acknowledgements of it prove that the path
+works, so "nothing received" then means no UDP datagram received for max(45 s, 3 × the
+keep-alive interval). This saves a second radio wake-up per interval on phones. Over TLS and
+the ssh pipe the PING every 15 s stays.
+
 A connection that is dead for one session is dead for all sessions it carries: a client that
 shares a connection between sessions closes it once, and all sessions resume on the new one.
 
@@ -1915,10 +2197,20 @@ shares a connection between sessions closes it once, and all sessions resume on 
 - The client watches its default route and addresses (netlink on Linux, route sockets on BSD
   and macOS). When they change, it migrates QUIC connections to a new socket at once, and
   replaces TLS and pipe connections, which cannot move.
-- Path memory keys a network by interface, gateway and the public address PATH_INFO reports.
-- NAT keepalive learning: start with a QUIC keep-alive of 20 s. When PATH_INFO reports a new
-  address or port although the client did not migrate, a NAT dropped the mapping: halve the
-  keep-alive interval for that network (minimum 5 s).
+- Path memory keys a network by the interfaces, gateways and source address prefixes of its
+  default routes (section 12.1).
+- **NAT keepalive learning.** A NAT that forgets an idle UDP mapping loses everything the server
+  sends until the client sends again: output written while the user waits arrives only with the
+  next keystroke or keep-alive. The client therefore keeps its QUIC keep-alive interval `K`
+  below the NAT's timeout, per network: `K` starts at 20 s. A PATH_INFO reporting a new address
+  or port, when the client did not rebind its socket or see a network change in the last 10 s
+  and had sent nothing but keep-alives for the previous `K`, means that the NAT timed out: `K`
+  becomes max(K / 2, 5 s) for that network, at most once per 60 s. After 30 minutes without such
+  an event at the current `K`, `K` becomes min(1.25 × K, 25 s). The ceiling keeps two lost
+  keep-alives within the 60 s idle timeout. QUIC stacks fix the keep-alive interval when a
+  connection is created; when `K` falls below the value of a live connection, the client sends
+  PING every `K` while idle until it replaces the connection. A configured interval disables
+  learning.
 
 ### 12.5 Server housekeeping
 
@@ -1939,8 +2231,15 @@ shares a connection between sessions closes it once, and all sessions resume on 
 The daemon listens on UDP and TCP on the first port of 60443–60542 on which it can bind both
 (the same number), so every user of a shared host gets their own daemon and port; the bootstrap
 reply tells the client which. It SHOULD listen on IPv6 and IPv4 (a dual-stack socket, or two
-sockets). Extra ports (for example 443 where the administrator allows it) are reserved for port
-fallback (M2) and will be announced by additional bootstrap reply members.
+sockets).
+
+**Extra ports.** A daemon MAY listen on further ports configured by the user or administrator
+(qsh_config(5) `extra_ports`), for networks that block the primary port; on UDP and TCP
+independently, wherever the bind succeeds (a port another process holds, or one below
+`net.ipv4.ip_unprivileged_port_start` on Linux, is skipped). It MUST NOT share a port with
+another socket (`SO_REUSEPORT`), and it announces exactly the ports it bound, in the bootstrap
+reply member `extra_ports` (section 10.4). Every port of a daemon is the same daemon: same
+certificate, same sessions, one set of pre-authentication limits (section 6.6).
 
 ## 13. Extensibility and versioning
 
@@ -2001,8 +2300,8 @@ Assigned types are listed in section 3.5.
 
 | Range | Use |
 |---|---|
-| 0x00 – 0x14 | section 11.2 (0x0e – 0x0f unassigned) |
-| 0x15 – 0x2fff | unassigned, specification required |
+| 0x00 – 0x15 | section 11.2 (0x0e – 0x0f unassigned) |
+| 0x16 – 0x2fff | unassigned, specification required |
 | 0x3000 – 0x3fff | private use |
 | 0x4000 and above | unassigned, specification required |
 
@@ -2010,8 +2309,8 @@ Assigned types are listed in section 3.5.
 
 | Name | Reference | Status |
 |---|---|---|
-| `zstd` | section 7.12 | reserved, M2 |
-| `snapshot` | section 7.8 | reserved, M2 |
+| `zstd` | section 7.12 | defined |
+| `snapshot` | section 7.8 | defined |
 | `forward` | — | reserved, M3 |
 | `copy` | — | reserved, M3 |
 | `agent` | — | reserved |
@@ -2040,6 +2339,9 @@ Not extensible within a protocol version (section 8.1).
 | Pipe version argument | `qsh-server pipe --version N` |
 | Bootstrap format version | 1 |
 | Bootstrap ops | `new`, `attach`, `list`, `kill` |
+| Bootstrap reply members added compatibly | `extra_ports` (section 10.4) |
+| Discovery sub-commands (section 10.2) | `bootstrap`, `pipe --version N`, `doctor --json --probe` |
+| zstd frame magic (section 7.12) | `28 b5 2f fd` |
 | Session kinds (bootstrap member `tty`) | `true` (default): tty session; `false`: pipe session |
 | Bootstrap error codes | `bad-request`, `unsupported`, `no-session`, `limit`, `daemon`, `internal` |
 | Exit status "no qsh-server" | 42 |
@@ -2066,6 +2368,12 @@ The threat model, the assets and adversaries, and the reasoning behind each mech
 - Implementations MUST parse every message defensively: check `Length` before allocating, check
   every offset and count, and never trust a peer's value as a size without a bound. Every parser
   in the reference implementation is fuzzed.
+- Compressed output is bounded before it is decompressed: one single-segment frame per message,
+  at most 64 KiB declared and produced (section 7.12). Snapshots are at most 1 MiB, built by the
+  server from its screen model with a fixed set of sequences that cannot make the client's
+  terminal answer, write the clipboard or reset it (section 7.8.4).
+- A daemon restart in place (section 10.6) keeps sessions and keys inside the process; the
+  requirements on the state it carries across the exec are in security.md §4.8.
 
 ## Appendix A. Worked example and test vectors
 
@@ -2097,8 +2405,7 @@ mux DATA frame:
 31 2e 30
 ```
 
-(Capabilities whose semantics are still reserved are shown here only to illustrate the
-encoding; section 5.4 forbids offering them until they are specified.)
+(An implementation offers these two capabilities only once it implements sections 7.8 and 7.12.)
 
 ### A.2 ATTACH
 
@@ -2257,6 +2564,72 @@ EXIT, after all output, and the client's final ACK:
                            ACK, Received = 8192, Error Received = 105
 ```
 
+### A.8 SNAPSHOT
+
+A resync snapshot (it skips nothing: the client expected output at offset 1 048 576) of a
+20 × 3 terminal on the normal screen. The screen shows `$ ls`, `a.txt` in green, and a prompt
+`$ ` with the cursor after it; bracketed paste is on, the title is `web1`, everything else is in
+its default state. This is the reference implementation's encoding; others are valid as long as
+they follow section 7.8.4.
+
+```
+18                         Type = SNAPSHOT
+40 86                      Length = 134
+00 00 00 00 00 10 00 00    Offset = 1048576
+01                         Flags = FINAL
+00 14                      Columns = 20
+00 03                      Rows = 3
+1b 5b 21 70                CSI ! p            DECSTR
+1b 5b 3f 31 30 34 39 6c    CSI ? 1049 l       normal screen
+1b 5b 31 3b 31 48          CSI 1 ; 1 H        row 1
+24 20 6c 73                "$ ls"
+1b 5b 4b                   CSI K
+1b 5b 32 3b 31 48          CSI 2 ; 1 H        row 2
+1b 5b 33 32 6d             CSI 32 m           green
+61 2e 74 78 74             "a.txt"
+1b 5b 6d                   CSI m              default pen
+1b 5b 4b                   CSI K
+1b 5b 33 3b 31 48          CSI 3 ; 1 H        row 3
+24                         "$" (the trailing blank cell is left to EL)
+1b 5b 4b                   CSI K
+1b 5b 3f 39 3b 31 30 30    CSI ? 9;1000;1002;1003;1004;1005;1006;1015 l
+30 3b 31 30 30 32 3b 31                       mouse tracking and its encodings,
+30 30 33 3b 31 30 30 34                       focus reporting: all off
+3b 31 30 30 35 3b 31 30
+30 36 3b 31 30 31 35 6c
+1b 5b 3f 32 30 30 34 68    CSI ? 2004 h       bracketed paste on
+1b 5d 32 3b 77 65 62 31    OSC 2 ; "web1"
+1b 5c                      ST
+1b 5b 33 3b 33 48          CSI 3 ; 3 H        the cursor
+```
+
+### A.9 OUTPUT_ZSTD
+
+`hello\r\n` at offset 4 096, as a zstd frame with one raw block. Frame_Header_Descriptor 0x20:
+Single_Segment_flag set, a one-byte Frame_Content_Size of 7; block header `39 00 00`: last
+block, raw, 7 bytes:
+
+```
+1c                         Type = OUTPUT_ZSTD
+18                         Length = 24
+00 00 00 00 00 00 10 00    Offset = 4096
+28 b5 2f fd                zstd magic
+20                         Frame_Header_Descriptor: Single_Segment
+07                         Frame_Content_Size = 7
+39 00 00                   Block_Header: Last_Block, Raw_Block, Block_Size = 7
+68 65 6c 6c 6f 0d 0a       "hello\r\n"
+```
+
+1 000 bytes of `=` at offset 8 192 in 11 bytes of frame: Frame_Header_Descriptor 0x60
+(Single_Segment, a two-byte Frame_Content_Size, which stores the size minus 256: 744 =
+`e8 02`), one RLE block of 1 000 bytes (`43 1f 00`) repeating 0x3d. The receiver checks the
+declared 1 000 against the 65 536 limit before decompressing; a frame declaring 65 537 or more,
+lacking Single_Segment, or producing more or fewer bytes than declared is a FRAME_ERROR.
+
+```
+1c 13 00 00 00 00 00 00 20 00 28 b5 2f fd 60 e8 02 43 1f 00 3d
+```
+
 ## Appendix B. Design rationale
 
 **Why bootstrap over ssh.** Every server qsh will ever talk to already runs sshd, and every user
@@ -2390,6 +2763,30 @@ daemon's environment on would make each session depend on how the daemon happene
 started. A fixed, minimal set plus what the login shell's own profile files set gives the same
 environment every time.
 
+**Why independent zstd frames of at most 64 KiB.** A streaming compression context across
+messages compresses a little better, but a reconnect, a gap or a snapshot would break it, and
+both sides would have to keep and resynchronize it; independent frames make OUTPUT_ZSTD exactly
+as resumable as OUTPUT. Requiring single-segment frames with a declared size lets a receiver
+bound memory and work from the first bytes of the frame, before decompressing anything.
+
+**Why a whitelisted, model-built snapshot.** Copying bytes of the program's output into a
+snapshot would replay whatever the program once sent, including queries whose answers the
+terminal would type into the session, clipboard writes and hard resets. Rendering from a screen
+model with a fixed set of sequences makes the snapshot's effect on the terminal exactly the
+screen it shows, and lets both sides test it: the reference implementation checks that feeding
+a snapshot to a fresh model reproduces the original on every item of the profile.
+
+**Why the scroll-push.** Terminals keep lines in their scrollback when they scroll off the top,
+but differ on whether erasing the display does (xterm does not; some terminals do). Moving the
+old screen and the tail out by scrolling and then painting rows with cursor positioning gives
+the same scrollback on every terminal.
+
+**Why restart in place.** The session programs are the daemon's children; a new process could
+take their terminals over a socket, but not their exit statuses, and service managers treat the
+exit of the main process as the end of the service. Executing the new program in the same
+process keeps both, and keeps the listening ports, so that no other user can take them during
+the upgrade.
+
 **Lessons from TokenSSH Link.** The first implementation (TokenSSH Link, not wire compatible)
 shaped several rules: the pre-authentication size limit (a 1 MiB frame limit let any
 unauthenticated peer make the daemon allocate a megabyte), the idle-connection limit (QUIC
@@ -2426,7 +2823,21 @@ detached-daemon requirement of section 10.4.
 | Server input queue per session | ≥ 64 KiB, default 1 MiB | 7.4 |
 | `LATEST` (`Output Received`) | 2^64 − 1 | 7.2 |
 | SERVER_HELLO wait per race candidate; ATTACH answer timeout (client) | 5 s | 12.1 |
-| Snapshot size | ≤ 1 MiB | 7.8 |
+| Snapshot size (`MAX_SNAPSHOT`, after decompression) | ≤ 1 MiB | 7.8.3 |
+| Snapshot tail | ≤ 100 lines | 7.8.4 |
+| Catch-up: backlog trigger (RECOMMENDED) | unacknowledged output > max(2 s × delivery rate, 256 KiB) | 7.8.5 |
+| Catch-up: input trigger settle (RECOMMENDED) | 20 ms of quiet output, at most 100 ms | 7.8.5 |
+| Catch-up: hysteresis (RECOMMENDED) | previous snapshot acknowledged and 1 s | 7.8.5 |
+| ACK cadence while streaming, with ACCEPT_SNAPSHOT (SHOULD) | 16 384 bytes or 50 ms | 7.5 |
+| Pacing window, tty session (RECOMMENDED) | clamp(1.25 × T × (R + 100 ms), 64 KiB, 8 MiB) | 7.6 |
+| zstd declared content size (`MAX_ZSTD_CONTENT`) | 1 – 65 536 bytes | 7.12 |
+| Compress below (RECOMMENDED) | 4 MiB/s delivery rate, chunks ≥ 512 bytes | 7.12 |
+| Extra ports announced | ≤ 8 | 10.4, 12.6 |
+| Direct race attempts at once (SHOULD NOT exceed) | 6 | 12.1 |
+| Stagger between ports of one transport | 300 ms | 12.1 |
+| Reconnect after GOAWAY RESTART | about 500 ms, ± 20 % | 10.6 |
+| NAT keepalive learning: start, floor, ceiling | 20 s, 5 s, 25 s | 12.4 |
+| NAT keepalive learning: growth | × 1.25 after 30 min without a timeout | 12.4 |
 | `DETACHED_TTL` | 6 h | 7.13 |
 | `EXITED_TTL` | 1 h | 7.13 |
 | Hangup: wait for the program | 2 s | 7.11 |

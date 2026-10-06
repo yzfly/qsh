@@ -25,7 +25,9 @@ Please do not open public issues for security problems.
   bounded number of connections per source address and per daemon.
 - **Nothing runs as root.** `qsh-server` is a per-user program, run by the user over ssh or by
   the user's service manager. It never changes its user id and starts processes only as the
-  user it runs as.
+  user it runs as. The one exception is an administrator's command: `sudo qsh-server tune
+  --apply` changes a short, fixed list of host settings after showing them and asking, and is
+  never run automatically (section 4.9).
 
 ## 2. Assets
 
@@ -39,6 +41,8 @@ Please do not open public issues for security problems.
 | Daemon private key | `$XDG_STATE_HOME/qsh/` on the server | whoever holds it can impersonate the daemon to clients that pinned it (but still cannot attach to sessions) |
 | The user's ssh credentials | the user's ssh client and agent | qsh uses them only through the ssh program; it never reads them |
 | Availability of the user's sessions | the daemon | the point of qsh is that sessions survive |
+| Path memory | `$XDG_STATE_HOME/qsh/paths.json` on the client | which networks the user used to reach which hosts (hashed) |
+| Host configuration | `/etc/sysctl.d/90-qsh.conf`, `/etc/modules-load.d/qsh.conf`, firewall rules, `/var/lib/qsh/tune.json` | written by `tune --apply` as root; affect the whole host |
 
 ## 3. Trust anchors and assumptions
 
@@ -144,6 +148,11 @@ Have accounts on the same host and can run arbitrary programs, bind free ports, 
   free one, and the bootstrap reports the real port. A process of another user listening on a
   port the client remembers cannot impersonate the daemon, because of pinning. Another user can
   occupy all hundred ports and deny the direct transports; the ssh pipe still works (section 9).
+  Extra ports (protocol §12.6) are taken by whichever daemon binds them first; the bootstrap
+  announces only the ports a daemon actually holds, and pinning makes a port held by someone
+  else useless to them. `SO_REUSEPORT` is never used, so no other process can share a daemon's
+  port. During an upgrade in place the sockets stay open (section 4.8), so the ports never become
+  free.
 - **Local files and sockets**, all created by `qsh-server` with explicit modes:
 
   | Path | Mode | Contents |
@@ -152,6 +161,7 @@ Have accounts on the same host and can run arbitrary programs, bind free ports, 
   | `$XDG_RUNTIME_DIR/qsh/control.sock` (name implementation-defined) | 0600 socket | control socket for `bootstrap`, `pipe`, `status` and `stop` |
   | `$XDG_STATE_HOME/qsh/` (default `~/.local/state/qsh/`) | 0700 directory | persistent state |
   | `$XDG_STATE_HOME/qsh/identity.*` (names implementation-defined) | 0600 files | the daemon's private key and certificate |
+  | an unlinked file in `$XDG_RUNTIME_DIR/qsh/`, only during an upgrade and only where `memfd_create` does not exist | 0600, encrypted | the sessions' state (section 4.8) |
 
   Every directory, file and socket is created with its mode given explicitly (`mkdir` and
   `open` with the mode, a socket bound inside the 0700 directory and then set to 0600), and a
@@ -203,7 +213,8 @@ Have accounts on the same host and can run arbitrary programs, bind free ports, 
 - **Session state files (`qsh attach`).** They live in `$XDG_STATE_HOME/qsh/sessions/`
   (directory 0700, files 0600, both created with explicit modes; a directory or file that others
   may read, or that belongs to someone else, is refused, never quietly tightened). A state file
-  holds the destination and ssh options, the daemon's host, ports and certificate fingerprint,
+  holds the destination and ssh options, the daemon's host, ports (extra ports included) and
+  certificate fingerprint,
   the session id, the session kind and the session key; no offsets (a new client attaches with
   FRESH). The client writes them atomically (a temporary file with mode 0600 in the same
   directory, synced, renamed, then the directory synced) so a crash never leaves a truncated
@@ -219,6 +230,17 @@ Have accounts on the same host and can run arbitrary programs, bind free ports, 
   (section 4.3): the hub accepts only peers with its own user id, and every hub client checks
   the directory with `lstat` and the hub's peer user id before it sends anything.
 - The client MUST NOT print keys or proofs in verbose or debug output.
+- **Path memory** (`$XDG_STATE_HOME/qsh/paths.json`, 0600 in the 0700 state directory, written
+  atomically like the state files) records, per destination and network, which transports and
+  ports worked, failure marks, RTT, loss and the learned keepalive (m2.md §3). It holds no
+  secret, but it is a record of where the user has been: destinations and networks appear only
+  as HMAC-SHA256 values keyed with a random salt kept in the file (so a copy reveals a host only
+  to someone who guesses its name, as with ssh's hashed known_hosts), times are whole days, there
+  is one entry per destination and network (no history), entries expire after 30 days, the file
+  holds at most 256 of them, and `path_memory = false` turns it off. It is advisory: a corrupt or
+  hostile file can make a connection slower (a wrong order of attempts) but never prevents one
+  (a race that fails with the remembered plan is followed at once by the full race) and never
+  affects authentication.
 
 ### 4.5 A stolen state file
 
@@ -255,7 +277,15 @@ already has what qsh protects there. What matters is what it can do to the clien
   per connection by the client (capabilities) and per use by the user.
 - **Robust parsing.** Every client parser is bounded and fuzzed: message lengths are checked
   before allocation (protocol §3.2), snapshots are limited to 1 MiB and compressed frames to
-  64 KiB of declared, checked output (protocol §7.8, §7.12). The client keeps at most 1 MiB of
+  64 KiB of declared, checked output (protocol §7.8, §7.12). **Decompression bombs**: a client
+  checks each zstd frame's header before decompressing: one single-segment frame with a declared
+  content size of at most 64 KiB, no dictionary, nothing after it; the decoder stops at the
+  declared size. Memory per message is therefore bounded by a 64 KiB window and 64 KiB of output
+  whatever the frame claims, and the decoder (`ruzstd`) is written in Rust.
+- **Snapshots** are terminal bytes like any output and reach the terminal the same way; a
+  hostile server could send the same bytes as OUTPUT. A correct server builds them from a screen
+  model with a fixed set of sequences (protocol §7.8.4), so that a snapshot never replays
+  queries, clipboard writes or resets the program once sent; a client MAY enforce that profile. The client keeps at most 1 MiB of
   the bootstrap's output while it keeps draining ssh's stdout to the end (protocol §10.4), does
   all offset arithmetic checked and rejects attach offsets beyond what it sent (protocol §7.3),
   and resets with UNKNOWN_CHANNEL any stream the server opens without a negotiated reason
@@ -264,8 +294,11 @@ already has what qsh protects there. What matters is what it can do to the clien
   and clear configured port forwardings (protocol §10.1), so the server gets no access to the
   user's agent through qsh even if the user's ssh configuration forwards it for interactive
   logins.
-- **Lies**: the server can lie about exit codes, PATH_INFO, sessions and capabilities. These
-  affect only the client's display and path heuristics, never its security decisions.
+- **Lies**: the server can lie about exit codes, PATH_INFO, sessions, capabilities, extra ports
+  and its doctor report. These affect only the client's display and path heuristics (path memory,
+  keepalive learning, the order of attempts), never its security decisions: every port is
+  pinned like the primary one, and a lie about the network can at worst make reconnects slower
+  or keepalives more frequent (bounded: 5 s at the most frequent).
 
 ### 4.7 The daemon's identity, stolen
 
@@ -279,6 +312,66 @@ ability to make the client fail, and the session ids the client names in ATTACH.
 implementation's rotation command); the daemon creates a new identity, clients fail the pin and
 re-bootstrap over ssh, which gives them the new fingerprint. Because the pin is replaced only
 through ssh, the old identity becomes useless at once.
+
+### 4.8 Daemon upgrades in place
+
+A daemon upgrades by executing a newer `qsh-server` in its own process, keeping its sessions
+(protocol §10.6, m2.md §10). What this exposes, and the rules:
+
+- **Who can trigger it**: only a peer on the control socket, which is already the daemon's own
+  user (section 4.3), with a request naming an executable; and the daemon itself, for the file it
+  was started from. Someone who can talk to the control socket can already create sessions and
+  run anything as the user.
+- **Which program it executes**: an absolute path to a regular file owned by root or by the
+  user, not writable by group or others (a binary another user could change is refused), that
+  answers the version probe within 5 s with a strictly newer version (downgrades only with an
+  explicit `--force`, never automatically) and a state format both sides know. The probe runs
+  the candidate as the user, with an empty environment except `PATH`, which is no more than the
+  user's own `qsh-server bootstrap` would do with it.
+- **Descriptors**: every descriptor of the daemon is close-on-exec, as before (section 4.3);
+  for the exec it clears that flag on exactly the descriptors the new program adopts (its
+  listening sockets, the control socket's listener, each session's pseudo-terminal master or
+  pipes, the state, the state key's pipe, the old executable) and on nothing else. The new
+  program checks each adopted descriptor's type and owner (`fstat`) before using it, and closes
+  the rest of the numbers it was told about if they do not match. No descriptor crosses a socket
+  (`SCM_RIGHTS` is not used), so no other process is involved.
+- **The state** (session keys included) never touches a file in clear: it is written to an
+  anonymous memory file (`memfd_create`) where the system has one, otherwise to a 0600 file
+  created in the private runtime directory and unlinked at once; in both cases sealed with
+  ChaCha20-Poly1305 under a fresh 32-byte key that travels only through an inherited pipe and is
+  zeroized after use. The state is parsed with bounds on every count and length, and the parser
+  is fuzzed, like every network parser.
+- **Failure** never leaves sessions without an owner: every check happens before the exec; an
+  exec that fails returns to the old program unchanged; on Linux the new program that cannot
+  restore the state executes the old program again (kept open since the daemon started) with the
+  same state.
+- **Connections** are closed with GOAWAY (RESTART) before the exec; clients re-authenticate on
+  new connections as always, with keys that did not change. The QUIC stateless reset key is
+  derived from the identity key (HKDF), so it is as secret as that key and survives the restart.
+
+### 4.9 Host tuning (`qsh-server tune`, root)
+
+`qsh-server doctor` only reads (files under `/proc`, `/sys` and `/etc`, the output of status
+commands) and makes no network calls; run as root it can additionally read firewall rules and
+audit logs. `qsh-server tune --apply` is the only part of qsh that changes anything as root:
+
+- it runs only when an administrator runs it with root privileges, shows the complete plan (file
+  diffs and exact commands), and asks for confirmation on the terminal (`--yes` for scripts);
+  packages, the daemon and the client never run it (`qsh doctor HOST --tune` runs it over
+  `ssh -t` in front of the user, who sees the plan and answers the prompts);
+- it changes only: `/etc/sysctl.d/90-qsh.conf` (socket buffer limits, the allowed TCP congestion
+  controls, and only with explicit flags the default congestion control and
+  `ip_unprivileged_port_start`), `/etc/modules-load.d/qsh.conf` (`tcp_bbr`), rules in ufw or
+  firewalld that allow the daemon's ports, linger for the invoking user; and its own record,
+  `/var/lib/qsh/tune.json`, which lists every change with what is needed to undo it;
+- `tune --revert` undoes only what that record lists and only where the host still matches
+  what tune wrote, so it never removes an administrator's later change;
+- **Trade-offs the administrator must accept explicitly**: opening the port range exposes every
+  user's daemon to the network (each still requires a session key; consider restricting the
+  source addresses, which the printed commands show how to do); `--allow-low-ports=N` lets
+  every local user bind ports N – 1023 and so occupy a privileged service's port before it
+  starts, which is acceptable on a single-user host only; `--bbr-default` changes the congestion
+  control of every TCP connection of the host.
 
 ## 5. Mechanisms and what they defend
 
@@ -304,6 +397,11 @@ through ssh, the old identity becomes useless at once.
 | Per-user daemon, no root | §4.3 here | privilege escalation; cross-user access |
 | Socket peer credential checks on both ends, `lstat` of the runtime directory by every user of it, explicit 0700/0600 modes | §4.3 here | other local users reaching the daemon, or posing as it to local clients |
 | Session environment built from a fixed list | protocol §10.3 | stale ssh agent sockets and connection variables leaking into sessions |
+| zstd frame header checked before decompression, 64 KiB bound, Rust decoder | protocol §7.12 | decompression bombs, decoder memory bugs on the client |
+| Snapshots built from a model with a fixed profile | protocol §7.8.4 | replaying terminal queries (input injection), clipboard writes, resets |
+| Upgrade by exec in place: validated, probed executable; only listed descriptors inherited; encrypted state | §4.8 here | sessions lost or hijacked during upgrades; key material on disk |
+| Path memory hashed, bounded, advisory | §4.4 here | location history in clear; a corrupt file blocking connections |
+| tune: explicit, confirmed, recorded, revertible | §4.9 here | silent changes to the host's security posture |
 
 ## 6. Cryptography
 
@@ -371,6 +469,12 @@ daemon's private key):
   acknowledges its output, and memory stays bounded by the replay buffers (protocol §7.14.5).
 - **Sessions per user** are limited by the daemon (bootstrap error `limit`); one user cannot use
   qsh to exhaust the host beyond what their account can do anyway.
+- **Screen models** cost memory per tty session (about 40 bytes per cell for two screens plus 100
+  lines); they exist only up to 262 144 cells (larger terminals get none), so a client cannot
+  make the daemon allocate a model for an absurd size. Feeding the model costs CPU per byte of
+  output, which the program itself produces (the user's own load). Compression happens only
+  below 4 MiB/s of delivery rate.
+- **Decompression** on the client is bounded per message (protocol §7.12).
 
 ## 8. Deployment guidance
 
@@ -384,9 +488,16 @@ daemon's private key):
   inherited by the user's sessions and break them (`NoNewPrivileges=` breaks `sudo`;
   `PrivateTmp=`, `ProtectSystem=`, `ProtectHome=` change what the shell sees). The daemon is a
   login service; it is confined by the user's own permissions.
-- **Firewalls**: the direct transports need UDP and TCP on the user's port in 60443–60542.
-  Administrators who do not want them can leave the ports closed: qsh then uses the ssh pipe,
-  which needs nothing beyond sshd. `qsh-server doctor` reports what is reachable.
+- **Firewalls**: the direct transports need UDP and TCP on the user's port in 60443–60542 (and
+  on any configured extra ports). Administrators who do not want them can leave the ports
+  closed: qsh then uses the ssh pipe, which needs nothing beyond sshd. `qsh-server doctor`
+  reports what is reachable and prints the distribution's own command to open the ports;
+  packages ship a firewalld service and a ufw application profile named `qsh` but never enable
+  them. `tune` (section 4.9) applies such changes only when the administrator asks.
+- **Port 443**: a per-user daemon can listen on 443 only where the administrator lowered
+  `net.ipv4.ip_unprivileged_port_start` (a host-wide change with the trade-off of section 4.9).
+  qsh never uses file capabilities or setuid for this; a root service for one shared port is a
+  later milestone.
 - **Logout policy**: where systemd-logind has `KillUserProcesses=yes`, every process started
   from a login session, a daemon started by `bootstrap` included, is killed when that ssh login
   ends. qsh respects that policy: sessions then survive only if the daemon runs from the user
@@ -398,8 +509,10 @@ daemon's private key):
 - **The state file is an unencrypted credential** for the lifetime of its session (section
   4.5). It is rotated on every attach and dies with the session, but between attaches anyone who
   can read the user's files on the client can attach.
-- **Sessions do not survive a daemon restart** (upgrade, reboot, `qsh-server stop`): they live in
-  the daemon's memory. Clients see SESSION_UNKNOWN and start a new session.
+- **Sessions do not survive a daemon stop** (reboot, `qsh-server stop`, a crash): they live in
+  the daemon's memory. Clients see SESSION_UNKNOWN and start a new session. An upgrade of
+  `qsh-server` keeps them (section 4.8), from the first version that implements upgrades on: the
+  daemon that is replaced must already know how.
 - **Keystroke timing** is not obfuscated (OpenSSH has done so since 9.5). Planned.
 - **No post-quantum key exchange yet** with the ring provider; recorded traffic could be
   decrypted by a future quantum computer. qsh will enable X25519MLKEM768 when its crypto
