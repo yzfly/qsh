@@ -26,5 +26,8 @@
 - [ ] 小问题：`qsh --help` 里 `[user@]host` 两边的反引号被原样显示
 - [ ] `keepalive`、`predict` 配置项还没接上（M2 / M3）
 - [ ] `qsh kill --all` 对每个会话各跑一次 ssh（密码用户会被问多次），考虑一次 ssh 批量结束
-- [ ] 发行版打包实际跑通（Debian / Fedora / Alpine / Arch 用各自工具构建一次），AUR 先上
+- [x] 发行版打包实际跑通（2026-10-06）：Debian 12/13、Ubuntu 24.04、Fedora、Alpine、Arch、Homebrew 都用各自官方工具从源码构建、lint、安装、跑一次真实会话（.github/workflows/packaging.yml）；详情和正式收录步骤见 packaging/README.md
+- [ ] 0.2.1 稳健性：打包时暴露的不稳定测试（daemon 启动等待、重连后 Ctrl-C 可能没送到——疑似真 bug、busybox yes）、rcgen 0.14 / clap_mangen 0.3（之后 Debian / Fedora 不用 vendor 就能构建）、帮助文本反引号
+- [ ] M2 规范（docs/m2.md）：路径记忆、保活学习、端口回退、智能追帧 SNAPSHOT、zstd、doctor / tune（按发行版）、daemon 无损升级、netem 混沌测试与对比基准
+- [ ] 需要用户决定 / 用户账号的对外动作：AUR 账号上传 qsh 包；建 Homebrew tap 仓库 yzfly/homebrew-tap；Debian ITP（维护者身份、邮件）；Fedora 包审核
 - [ ] M2 预研：`qsh-server doctor / tune`（各发行版防火墙、UDP 缓冲、BBR）、路径记忆、保活学习、智能追帧
