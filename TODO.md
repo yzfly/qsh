@@ -15,5 +15,17 @@
 - [x] M0 工程化：README（中英）、许可证、CI / 发版 / 发行版矩阵流水线、打包文件、安装脚本
 - [x] M0 核心：qsh-core + qsh / qsh-server，QUIC / TLS / ssh 管道三路竞速、断线续传、本机测试 63 项全过
 - [x] 9 个发行版（Ubuntu 20.04/24.04、Debian 12、Fedora、Rocky 9、Alpine、Arch、openSUSE、Amazon Linux 2023）真实 sshd 端到端全过：直连 QUIC、UDP 被封走 TLS、只剩 ssh 走管道
-- [ ] 对抗性审查（2 高 4 中 10 低）修复中：H1 本地用户冒充 daemon、H2 输出溢出后误杀会话、非终端会话不保真（改为管道会话 + 独立 stderr）、会话泄漏、pre-auth DoS 等；同步修协议规范
-- [ ] M0 收尾：GitHub CI 全绿（剩 macOS 一个测试、模糊测试抓到的编解码 bug）、9 个发行版端到端通过、对抗性代码审查的问题修完、协议补记实现中的偏差（bootstrap `tty`、KEY_CONFIRM 无状态文件时的行为等），然后公开仓库、发 v0.1.0
+- [x] 对抗性审查（2 高 4 中 10 低）全部修完，协议规范同步更新；新增「管道会话」：非终端命令逐字节保真、stderr 分开、stdin 结束送达
+- [x] CI 全绿（Linux、macOS、MSRV、cargo deny、4 个模糊测试目标），9 个发行版端到端全过，6 个平台发版构建全过
+- [x] 仓库公开（2026-10-06），发布 v0.1.0：https://github.com/yzfly/qsh/releases/tag/v0.1.0 ；一行命令安装实测可用，构建来源证明可验证
+- [x] v0.1.1：远端没有 qsh-server 时提示一条现在就能用的安装命令（0.1.0 提示的 `qsh install` 要到 M1 才有）
+
+## 下一步（M1 日常可用）
+
+- [ ] `qsh install HOST` 和首次连接时提议安装（按远端架构从 Release 下载或从本机拷贝，校验 SHA256SUMS）
+- [ ] `qsh attach / ls / kill`，会话凭据存 `$XDG_STATE_HOME/qsh/sessions/`（0600）
+- [ ] 网络变化监听（Linux netlink、macOS route socket），QUIC 立即迁移
+- [ ] 配置文件 `/etc/qsh/qsh_config`、`~/.config/qsh/config`
+- [ ] 断线时的状态提示行打磨
+- [ ] 发行版打包实际跑通（Debian / Fedora / Alpine / Arch 用各自工具构建一次），AUR 先上
+- [ ] M2 预研：`qsh-server doctor / tune`（各发行版防火墙、UDP 缓冲、BBR）、路径记忆、保活学习、智能追帧
