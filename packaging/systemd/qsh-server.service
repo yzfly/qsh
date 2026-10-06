@@ -30,8 +30,13 @@ Documentation=man:qsh-server(1) https://github.com/yzfly/qsh
 [Service]
 Type=exec
 ExecStart=/usr/bin/qsh-server daemon --foreground
-# `qsh-server stop` asks the daemon to end its sessions cleanly; SIGTERM does the same.
+# `qsh-server stop` asks the daemon to end its sessions cleanly; SIGTERM does the same: it
+# hangs up every session (SIGHUP, as sshd does), sends each attached client the program's exit
+# status, then GOAWAY, and exits (protocol.md 7.13).
 KillSignal=SIGTERM
+# SIGTERM to the daemon only: it ends the sessions itself. Whatever is left in the cgroup when it
+# has exited (programs that ignore SIGHUP) gets SIGKILL.
+KillMode=mixed
 TimeoutStopSec=15s
 Restart=on-failure
 RestartSec=2s

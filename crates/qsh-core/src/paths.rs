@@ -11,8 +11,10 @@
 
 use std::fs;
 use std::io;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
+
+use tokio::net::UnixStream;
 
 use crate::sys;
 
@@ -100,6 +102,37 @@ impl Paths {
         Ok(&self.runtime)
     }
 
+    /// Check the runtime directory before connecting to a socket in it, without creating it:
+    /// false when it does not exist (so nothing can listen there), an error when it is not a
+    /// private directory of this user ([`check_private_dir`]).
+    pub fn check_runtime(&self) -> io::Result<bool> {
+        match check_private_dir(&self.runtime) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Connect to `socket`, a unix socket in the runtime directory (the daemon's control socket,
+    /// the hub's socket), checking first that the directory is private to this user
+    /// ([`Paths::check_runtime`]) and then that the process at the other end runs as this user
+    /// ([`check_peer`]). None when the directory does not exist or nothing listens on the
+    /// socket; an error when either check fails, since then someone else may be listening.
+    pub async fn connect_private(&self, socket: &Path) -> io::Result<Option<UnixStream>> {
+        if !self.check_runtime()? {
+            return Ok(None);
+        }
+        let stream = match UnixStream::connect(socket).await {
+            Ok(stream) => stream,
+            Err(e) if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused) => {
+                return Ok(None)
+            }
+            Err(e) => return Err(e),
+        };
+        check_peer(&stream)?;
+        Ok(Some(stream))
+    }
+
     /// The state directory, created with mode 0700 if missing.
     pub fn ensure_state(&self) -> io::Result<&Path> {
         ensure_private_dir(&self.state)?;
@@ -107,31 +140,70 @@ impl Paths {
     }
 }
 
-/// Create `dir` (and its parents) with mode 0700 if missing; check that the user owns it and
-/// nobody else may use it.
+/// Create `dir` (and its parents) with mode 0700 if missing, then check it with
+/// [`check_private_dir`]. An existing directory that is too open is refused, not changed:
+/// whoever made it so may already have used it.
 pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
     match fs::DirBuilder::new().recursive(true).mode(0o700).create(dir) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(e),
     }
+    check_private_dir(dir)
+}
+
+/// Check that `dir` is a directory (not a symbolic link to one) that belongs to the effective
+/// user and that nobody else may enter or change (no group or other permission bits). Nothing is
+/// changed; a directory that fails is refused with an error saying why.
+///
+/// A socket found in such a directory was put there by this user: nobody else can create,
+/// replace or rename entries in it. The directory itself cannot be swapped either: its parent is
+/// the user's own `XDG_RUNTIME_DIR`, or `/tmp`, where the sticky bit stops others from renaming
+/// what the user created.
+pub fn check_private_dir(dir: &Path) -> io::Result<()> {
     // symlink_metadata: a symbolic link planted in /tmp must not redirect us elsewhere
     let meta = fs::symlink_metadata(dir)?;
-    if !meta.is_dir() {
+    if meta.file_type().is_symlink() || !meta.is_dir() {
         return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
+            io::ErrorKind::PermissionDenied,
             format!("{} is not a directory", dir.display()),
         ));
     }
     if meta.uid() != sys::euid() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            format!("{} belongs to another user (uid {})", dir.display(), meta.uid()),
+            format!(
+                "{} belongs to another user (uid {}); refusing to use it",
+                dir.display(),
+                meta.uid()
+            ),
         ));
     }
     if meta.mode() & 0o077 != 0 {
-        // Ours, just too open (an older umask): tighten it
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{} is accessible to other users (mode {:o}); refusing to use it (chmod 700 it, or remove it)",
+                dir.display(),
+                meta.mode() & 0o7777
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Check that the process at the other end of a unix socket runs as the effective user
+/// (`SO_PEERCRED` on Linux, `getpeereid` on the BSDs and macOS).
+pub fn check_peer(stream: &UnixStream) -> io::Result<()> {
+    let cred = stream.peer_cred()?;
+    if cred.uid() != sys::euid() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "the process behind the socket runs as uid {}, not as this user; refusing to talk to it",
+                cred.uid()
+            ),
+        ));
     }
     Ok(())
 }
@@ -155,6 +227,7 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("qsh-paths-{}-{name}", std::process::id()));
@@ -162,15 +235,30 @@ mod tests {
         dir
     }
 
+    /// Review L5: a directory that is too open is refused, never quietly tightened.
     #[test]
-    fn private_dir_is_created_0700_and_tightened() {
+    fn private_dir_is_created_0700_and_a_too_open_one_is_refused() {
         let root = scratch("private");
         let dir = root.join("a/b");
         ensure_private_dir(&dir).unwrap();
         assert_eq!(fs::metadata(&dir).unwrap().mode() & 0o777, 0o700);
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
-        ensure_private_dir(&dir).unwrap();
-        assert_eq!(fs::metadata(&dir).unwrap().mode() & 0o777, 0o700);
+        for mode in [0o755, 0o710, 0o701, 0o777] {
+            fs::set_permissions(&dir, fs::Permissions::from_mode(mode)).unwrap();
+            let e = ensure_private_dir(&dir).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}");
+            assert!(e.to_string().contains("accessible to other users"), "{e}");
+            // Left as it was
+            assert_eq!(fs::metadata(&dir).unwrap().mode() & 0o777, mode);
+        }
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let paths = Paths {
+            runtime: dir.clone(),
+            ..Paths::under(&root)
+        };
+        assert!(paths.check_runtime().unwrap());
+        let missing = Paths::under(&root.join("missing"));
+        assert!(!missing.check_runtime().unwrap());
+        assert!(!root.join("missing").exists(), "check_runtime creates nothing");
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -44,8 +44,8 @@ impl QuicClient {
     /// Connect to the daemon at `host`:`port` whose certificate has `fingerprint`.
     pub async fn connect(&self, host: &str, port: u16, fingerprint: Fingerprint) -> io::Result<quinn::Connection> {
         let (endpoint, ipv6) = self.endpoint()?;
-        let config = crypto::quic_client(fingerprint)?;
-        tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+        let (config, pin) = crypto::pinned_quic_client(fingerprint)?;
+        let connection = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
             let addresses: Vec<SocketAddr> = tokio::net::lookup_host((host, port)).await?.collect();
             // A dual stack socket reaches both families; an IPv4 one only IPv4
             let address = addresses
@@ -57,10 +57,15 @@ impl QuicClient {
                 .connect_with(config, address, crypto::SERVER_NAME)
                 .map_err(io::Error::other)?
                 .await
-                .map_err(io::Error::other)
+                .map_err(|e| pin.error(io::Error::other(e)))
         })
         .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "QUIC handshake timed out"))?
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "QUIC handshake timed out"))??;
+        if let Err(e) = check_alpn(&connection) {
+            connection.close(quinn::VarInt::from_u32(0), b"");
+            return Err(e);
+        }
+        Ok(connection)
     }
 
     /// The network changed: move the endpoint, and with it every connection, to a new UDP
@@ -84,6 +89,15 @@ impl QuicClient {
             .as_ref()
             .and_then(|(e, _)| e.local_addr().ok())
     }
+}
+
+/// Check that a QUIC connection negotiated ALPN `qsh/1` (protocol.md 9.1), on either side.
+pub fn check_alpn(connection: &quinn::Connection) -> io::Result<()> {
+    let protocol = connection
+        .handshake_data()
+        .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+        .and_then(|data| data.protocol);
+    crypto::check_alpn(protocol.as_deref())
 }
 
 /// The daemon's QUIC endpoint on an already bound UDP socket (see `sys::udp_any`).

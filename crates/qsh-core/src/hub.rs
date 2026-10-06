@@ -307,6 +307,7 @@ async fn open_session(
         let terminal = Terminal {
             input,
             output,
+            errors: None,
             events: None,
         };
         match session.run(terminal).await {
@@ -358,8 +359,11 @@ async fn open_session(
 
 /// Run a session in the hub at `paths`, relaying `terminal`: the session's exit status, or
 /// None when no hub answered (the caller may then run the session itself).
+///
+/// The runtime directory and the hub's user are checked first ([`Paths::connect_private`]): an
+/// error when someone else could be listening on the socket.
 pub async fn open(paths: &Paths, request: &OpenRequest, terminal: Terminal) -> io::Result<Option<i32>> {
-    let Ok(stream) = UnixStream::connect(paths.hub_socket()).await else {
+    let Some(stream) = paths.connect_private(&paths.hub_socket()).await? else {
         return Ok(None);
     };
     let (mut r, mut w) = stream.into_split();
@@ -379,6 +383,8 @@ pub async fn open(paths: &Paths, request: &OpenRequest, terminal: Terminal) -> i
                 }
                 Input::Detach => (T_DETACH, Vec::new()),
                 Input::Hangup => (T_HANGUP, Vec::new()),
+                // Hub sessions are tty sessions: the end of input is ^D, as typed
+                Input::Eof => (T_INPUT, vec![4]),
             };
             if write_frame(&mut w, t, &payload).await.is_err() {
                 return;
@@ -406,9 +412,10 @@ pub async fn open(paths: &Paths, request: &OpenRequest, terminal: Terminal) -> i
     result
 }
 
-/// Send `request` to the hub: its JSON answer, or None when no hub runs.
+/// Send `request` to the hub: its JSON answer, or None when no hub runs. Checked as in
+/// [`open`].
 pub async fn request(paths: &Paths, request: Request) -> io::Result<Option<Value>> {
-    let Ok(mut stream) = UnixStream::connect(paths.hub_socket()).await else {
+    let Some(mut stream) = paths.connect_private(&paths.hub_socket()).await? else {
         return Ok(None);
     };
     let t = match request {

@@ -59,6 +59,14 @@ pub mod limits {
     pub const INPUT_QUEUE: usize = 1 << 20;
     /// The server closes a connection without attachments after this long (GOAWAY IDLE).
     pub const IDLE_CONNECTION: Duration = Duration::from_secs(60);
+    /// Unauthenticated connections per daemon, counted from acceptance (`MAX_PREAUTH_CONNS`).
+    pub const MAX_PREAUTH_CONNS: usize = 64;
+    /// Unauthenticated connections per IPv4 address or IPv6 /64 (`MAX_PREAUTH_PER_SOURCE`).
+    pub const MAX_PREAUTH_PER_SOURCE: usize = 8;
+    /// AUTH_FAILED per source address in a burst: a token bucket of 10 …
+    pub const FAILURE_BURST: u32 = 10;
+    /// … refilled with one token every 6 s (10 per minute).
+    pub const FAILURE_REFILL: Duration = Duration::from_secs(6);
 }
 
 /// Implementation name sent in the hellos.

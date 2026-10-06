@@ -9,6 +9,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use super::varint;
 use super::ErrorCode;
+use crate::crypto::SessionKey;
 
 /// Message type numbers (protocol.md section 3.5).
 pub mod types {
@@ -52,6 +53,10 @@ pub mod types {
     pub const HANGUP: u64 = 0x1b;
     /// OUTPUT_ZSTD
     pub const OUTPUT_ZSTD: u64 = 0x1c;
+    /// INPUT_EOF (pipe sessions)
+    pub const INPUT_EOF: u64 = 0x1d;
+    /// ERROR_OUTPUT (pipe sessions)
+    pub const ERROR_OUTPUT: u64 = 0x1e;
 }
 
 /// Maximum payload of the first control message (CLIENT_HELLO / SERVER_HELLO).
@@ -196,6 +201,9 @@ pub enum Message {
         size: WindowSize,
         /// [`ATTACH_ACCEPT_SNAPSHOT`], [`ATTACH_FRESH`]; undefined bits are ignored.
         flags: u64,
+        /// Pipe sessions (7.14.2): the client's `received` for stderr, or [`LATEST`] with
+        /// [`ATTACH_FRESH`]. None when the payload ends after `flags` (a tty session).
+        error_received: Option<u64>,
     },
     /// 7.3
     Attached {
@@ -203,13 +211,18 @@ pub enum Message {
         input_received: u64,
         /// The offset at which output on this attachment starts.
         output_start: u64,
-        /// The rotated session key.
-        next_key: [u8; 32],
+        /// The rotated session key (its `Debug` output does not show it).
+        next_key: SessionKey,
         /// HMAC-SHA256(session key, "qsh/1 attached" || CB).
         server_proof: [u8; 32],
+        /// Pipe sessions (7.14.2): the offset at which stderr on this attachment starts.
+        error_start: Option<u64>,
     },
     /// 6.5
-    KeyConfirm,
+    KeyConfirm {
+        /// The first 8 bytes of SHA-256(Next Key): which key is confirmed.
+        key_id: [u8; 8],
+    },
     /// 7.4
     Input {
         /// Offset of the first byte in the input stream.
@@ -228,6 +241,8 @@ pub enum Message {
     Ack {
         /// First offset not yet received.
         received: u64,
+        /// Pipe sessions, client to server (7.14.2): the same for stderr.
+        error_received: Option<u64>,
     },
     /// 7.7
     OutputGap {
@@ -257,11 +272,25 @@ pub enum Message {
         output_end: u64,
         /// How the program ended.
         status: ExitStatus,
+        /// Pipe sessions (7.14.2): total length of the stderr stream.
+        error_end: Option<u64>,
     },
     /// 7.11
     Detach,
     /// 7.11
     Hangup,
+    /// 7.14.4: the program's stdin ends at `offset` (pipe sessions).
+    InputEof {
+        /// The input end: the offset just after the last byte of input.
+        offset: u64,
+    },
+    /// 7.14.3: the program's stderr (pipe sessions).
+    ErrorOutput {
+        /// Offset of the first byte in the error output stream.
+        offset: u64,
+        /// The bytes.
+        data: Vec<u8>,
+    },
     /// 7.12 (capability `zstd`)
     OutputZstd {
         /// Offset of the first decompressed byte.
@@ -339,9 +368,19 @@ impl<'a> Fields<'a> {
         self.take(len as usize)
     }
 
-    /// A string shown to people: invalid UTF-8 is replaced.
+    /// A string shown to people: invalid UTF-8 is replaced (section 2.3). A replacement
+    /// character takes three bytes, so the result is cut to `max` bytes at a character
+    /// boundary, as [`put_string`] would cut it: what decodes encodes back to the same message.
     fn text(&mut self, max: usize) -> Result<String, DecodeError> {
-        Ok(String::from_utf8_lossy(self.bytes_of_string(max)?).into_owned())
+        let mut text = String::from_utf8_lossy(self.bytes_of_string(max)?).into_owned();
+        if text.len() > max {
+            let mut end = max;
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text.truncate(end);
+        }
+        Ok(text)
     }
 
     /// A string that must be valid UTF-8.
@@ -375,6 +414,15 @@ impl<'a> Fields<'a> {
             width_px: self.u16()?,
             height_px: self.u16()?,
         })
+    }
+
+    /// A u64 a pipe session appends to a message (7.14.2): None when the payload ends here.
+    /// Fewer than 8 bytes left are extra bytes of some later revision, ignored (3.3).
+    fn optional_u64(&mut self) -> Result<Option<u64>, DecodeError> {
+        if self.p.len() < 8 {
+            return Ok(None);
+        }
+        self.u64().map(Some)
     }
 
     /// `data…` that starts at `offset`: offset + length must not pass 2^64 - 1 (7.1).
@@ -428,7 +476,9 @@ impl Message {
             Message::Error { .. } => ERROR,
             Message::Attach { .. } => ATTACH,
             Message::Attached { .. } => ATTACHED,
-            Message::KeyConfirm => KEY_CONFIRM,
+            Message::KeyConfirm { .. } => KEY_CONFIRM,
+            Message::InputEof { .. } => INPUT_EOF,
+            Message::ErrorOutput { .. } => ERROR_OUTPUT,
             Message::Input { .. } => INPUT,
             Message::Output { .. } => OUTPUT,
             Message::Ack { .. } => ACK,
@@ -502,30 +552,50 @@ impl Message {
                 output_received,
                 size,
                 flags,
+                error_received,
             } => {
                 p.extend_from_slice(session);
                 p.extend_from_slice(proof);
                 p.extend_from_slice(&output_received.to_be_bytes());
                 put_size(&mut p, size);
                 varint::encode(*flags, &mut p);
+                if let Some(e) = error_received {
+                    p.extend_from_slice(&e.to_be_bytes());
+                }
             }
             Message::Attached {
                 input_received,
                 output_start,
                 next_key,
                 server_proof,
+                error_start,
             } => {
                 p.extend_from_slice(&input_received.to_be_bytes());
                 p.extend_from_slice(&output_start.to_be_bytes());
-                p.extend_from_slice(next_key);
+                p.extend_from_slice(&next_key.0);
                 p.extend_from_slice(server_proof);
+                if let Some(e) = error_start {
+                    p.extend_from_slice(&e.to_be_bytes());
+                }
             }
-            Message::KeyConfirm | Message::Detach | Message::Hangup | Message::Unknown { .. } => {}
-            Message::Input { offset, data } | Message::Output { offset, data } => {
+            Message::KeyConfirm { key_id } => p.extend_from_slice(key_id),
+            Message::Detach | Message::Hangup | Message::Unknown { .. } => {}
+            Message::Input { offset, data }
+            | Message::Output { offset, data }
+            | Message::ErrorOutput { offset, data } => {
                 p.extend_from_slice(&offset.to_be_bytes());
                 p.extend_from_slice(data);
             }
-            Message::Ack { received } => p.extend_from_slice(&received.to_be_bytes()),
+            Message::InputEof { offset } => p.extend_from_slice(&offset.to_be_bytes()),
+            Message::Ack {
+                received,
+                error_received,
+            } => {
+                p.extend_from_slice(&received.to_be_bytes());
+                if let Some(e) = error_received {
+                    p.extend_from_slice(&e.to_be_bytes());
+                }
+            }
             Message::OutputGap { from, to } => {
                 p.extend_from_slice(&from.to_be_bytes());
                 p.extend_from_slice(&to.to_be_bytes());
@@ -544,7 +614,11 @@ impl Message {
                 p.extend_from_slice(&rows.to_be_bytes());
                 p.extend_from_slice(data);
             }
-            Message::Exit { output_end, status } => {
+            Message::Exit {
+                output_end,
+                status,
+                error_end,
+            } => {
                 p.extend_from_slice(&output_end.to_be_bytes());
                 match status {
                     ExitStatus::Exited(code) => {
@@ -559,6 +633,9 @@ impl Message {
                         p.push(if *core_dumped { EXIT_CORE_DUMPED } else { 0 });
                         put_string(&mut p, signal, MAX_SIGNAL_LEN);
                     }
+                }
+                if let Some(e) = error_end {
+                    p.extend_from_slice(&e.to_be_bytes());
                 }
             }
             Message::OutputZstd { offset, frame } => {
@@ -620,7 +697,8 @@ impl Message {
                 let address = match f.u8()? {
                     0 => None,
                     4 => Some(IpAddr::V4(Ipv4Addr::from(f.array::<4>()?))),
-                    6 => Some(IpAddr::V6(Ipv6Addr::from(f.array::<16>()?))),
+                    // An IPv4-mapped address means the IPv4 address (5.6), as the encoder sends it
+                    6 => Some(canonical_ip(IpAddr::V6(Ipv6Addr::from(f.array::<16>()?)))),
                     _ => return Err(DecodeError("bad address family")),
                 };
                 Message::PathInfo {
@@ -643,7 +721,9 @@ impl Message {
                 let output_received = f.u64()?;
                 let size = f.size()?;
                 let flags = f.varint()?;
-                if output_received == LATEST && flags & ATTACH_FRESH == 0 {
+                let error_received = f.optional_u64()?;
+                let fresh = flags & ATTACH_FRESH != 0;
+                if (output_received == LATEST || error_received == Some(LATEST)) && !fresh {
                     return Err(DecodeError("LATEST without FRESH"));
                 }
                 Message::Attach {
@@ -652,15 +732,17 @@ impl Message {
                     output_received,
                     size,
                     flags,
+                    error_received,
                 }
             }
             ATTACHED => Message::Attached {
                 input_received: f.u64()?,
                 output_start: f.u64()?,
-                next_key: f.array()?,
+                next_key: SessionKey(f.array()?),
                 server_proof: f.array()?,
+                error_start: f.optional_u64()?,
             },
-            KEY_CONFIRM => Message::KeyConfirm,
+            KEY_CONFIRM => Message::KeyConfirm { key_id: f.array()? },
             INPUT => {
                 let offset = f.u64()?;
                 Message::Input {
@@ -675,7 +757,18 @@ impl Message {
                     data: f.data_at(offset)?,
                 }
             }
-            ACK => Message::Ack { received: f.u64()? },
+            ACK => Message::Ack {
+                received: f.u64()?,
+                error_received: f.optional_u64()?,
+            },
+            INPUT_EOF => Message::InputEof { offset: f.u64()? },
+            ERROR_OUTPUT => {
+                let offset = f.u64()?;
+                Message::ErrorOutput {
+                    offset,
+                    data: f.data_at(offset)?,
+                }
+            }
             OUTPUT_GAP => Message::OutputGap {
                 from: f.u64()?,
                 to: f.u64()?,
@@ -699,7 +792,9 @@ impl Message {
                 let kind = f.u8()?;
                 let code = f.u32()?;
                 let flags = f.u8()?;
-                let signal = f.text(MAX_SIGNAL_LEN)?;
+                // A signal name is read by programs (the exit status), not only by people:
+                // invalid UTF-8 is malformed, not replaced
+                let signal = f.strict(MAX_SIGNAL_LEN)?;
                 let status = match kind {
                     0 => ExitStatus::Exited(code),
                     1 => ExitStatus::Signaled {
@@ -708,7 +803,11 @@ impl Message {
                     },
                     _ => return Err(DecodeError("bad exit kind")),
                 };
-                Message::Exit { output_end, status }
+                Message::Exit {
+                    output_end,
+                    status,
+                    error_end: f.optional_u64()?,
+                }
             }
             DETACH => Message::Detach,
             HANGUP => Message::Hangup,

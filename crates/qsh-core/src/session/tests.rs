@@ -29,6 +29,27 @@ fn replay_resends_from_offset_and_drops_acked() {
     assert_eq!((r.base(), r.end()), (14, 14));
 }
 
+/// Review L3: a buffer started near the end of the offset space (a hostile server's `Input
+/// Received`) must neither overflow nor panic; bytes past 2^64 - 1 are not kept.
+#[test]
+fn replay_near_the_end_of_offsets_neither_overflows_nor_panics() {
+    let mut r = ReplayBuffer::starting_at(16, u64::MAX - 4);
+    assert_eq!(r.room(), 4);
+    r.push(b"0123456789");
+    assert_eq!((r.base(), r.end(), r.len()), (u64::MAX - 4, u64::MAX, 4));
+    assert_eq!(r.room(), 0);
+    r.push(b"more");
+    assert_eq!(r.end(), u64::MAX);
+    assert_eq!(r.read_from(0, 100), (u64::MAX - 4, b"0123".to_vec()));
+    assert_eq!(r.read_from(u64::MAX, 100), (u64::MAX, Vec::new()));
+    r.ack(u64::MAX);
+    assert!(r.is_empty());
+    // Pushing more than the capacity near the end
+    let mut r = ReplayBuffer::starting_at(4, u64::MAX - 10);
+    r.push(&[7; 100]);
+    assert_eq!((r.base(), r.end()), (u64::MAX - 4, u64::MAX));
+}
+
 #[test]
 fn inbound_skips_duplicates_and_takes_gaps() {
     let mut i = Inbound::default();

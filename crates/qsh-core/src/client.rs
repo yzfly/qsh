@@ -23,6 +23,7 @@ use crate::crypto::{self, Fingerprint, SessionKey};
 use crate::proto::bootstrap::{self, Credentials, Reply, Request};
 use crate::proto::limits::{ATTACH_TIMEOUT, RESEND_CHUNK};
 use crate::proto::message::{ATTACH_FRESH, MAX_CONTROL, MAX_HELLO, MAX_TERMINAL, PREFERRED_DATA};
+use crate::proto::varint;
 use crate::proto::{read_message, write_message, ErrorCode, ExitStatus, FramingError, Message, WindowSize};
 use crate::session::{Inbound, ReplayBuffer, INPUT_REPLAY};
 use crate::transport::quic::QuicClient;
@@ -73,8 +74,9 @@ pub struct ClientConfig {
     /// Run the bootstrap's ssh interactively (password and second factor prompts on the
     /// terminal); false adds `BatchMode=yes`.
     pub interactive: bool,
-    /// The input is a terminal. False for scripts: the remote pty then neither echoes nor
-    /// translates line ends, so output is byte for byte what the program wrote.
+    /// The input is a terminal. False for scripts: ask for a pipe session (protocol.md 7.14),
+    /// whose program has pipes instead of a terminal, so that input and output are carried
+    /// byte for byte and stderr apart, as with `ssh host command` without a pty.
     pub tty: bool,
 }
 
@@ -106,6 +108,9 @@ pub enum Input {
     Detach,
     /// End the session (`~.`).
     Hangup,
+    /// The local input reached its end: the program's stdin is closed (INPUT_EOF on a pipe
+    /// session; on a tty session the terminal's end-of-file character, `^D`, is typed).
+    Eof,
 }
 
 /// Things the terminal may want to tell the user.
@@ -127,6 +132,8 @@ pub struct Terminal {
     pub input: mpsc::Receiver<Input>,
     /// Output for the terminal, in order. When the receiver is gone the session detaches.
     pub output: mpsc::Sender<Vec<u8>>,
+    /// The program's stderr on a pipe session, in order; None: it goes to `output`.
+    pub errors: Option<mpsc::Sender<Vec<u8>>>,
     /// Optional notifications.
     pub events: Option<mpsc::UnboundedSender<Event>>,
 }
@@ -242,19 +249,47 @@ pub async fn bootstrap(ssh: &SshCommand, request: &Request, interactive: bool) -
     // ssh may exit before reading (no server, refused login): a broken pipe here is no error
     let _ = stdin.write_all(line.as_bytes()).await;
     drop(stdin);
-    let mut output = Vec::new();
-    (&mut stdout)
-        .take(bootstrap::MAX_REPLY_OUTPUT as u64)
-        .read_to_end(&mut output)
-        .await?;
-    let status = child.wait().await?;
+    // Section 10.4: read to the end (ssh blocks, and the bootstrap never finishes, when its
+    // stdout pipe is full), keeping only the last line that may be the reply
+    let mut scanner = bootstrap::ReplyScanner::default();
+    let mut buf = vec![0u8; 16384];
+    let read_all = async {
+        loop {
+            let n = stdout.read(&mut buf).await?;
+            if n == 0 {
+                return Ok::<(), io::Error>(());
+            }
+            scanner.feed(&buf[..n]);
+        }
+    };
+    tokio::pin!(read_all);
+    let mut exited = None;
+    tokio::select! {
+        r = &mut read_all => r?,
+        status = child.wait() => {
+            // ssh exited; a process it left behind may still hold its stdout open: what is
+            // already in the pipe is read, then no more is waited for
+            exited = Some(status?);
+            let _ = tokio::time::timeout(Duration::from_secs(1), &mut read_all).await;
+        }
+    }
+    zeroize::Zeroize::zeroize(&mut buf);
+    drop(stdout);
+    let status = match exited {
+        Some(status) => status,
+        None => child.wait().await?,
+    };
     match status.code() {
         Some(proto::EXIT_NO_SERVER) | Some(EXIT_COMMAND_NOT_FOUND) => return Err(ClientError::NoServer),
         Some(EXIT_CANNOT_EXECUTE) => return Err(ClientError::CannotExecute),
         Some(255) => return Err(ClientError::Ssh(255)),
         _ => {}
     }
-    match bootstrap::parse_reply(&output, request.op) {
+    let mut output = scanner.finish();
+    let reply = bootstrap::parse_reply(&output, request.op);
+    // The reply holds the session key
+    zeroize::Zeroize::zeroize(&mut output);
+    match reply {
         Ok(Reply::Error(e)) => Err(ClientError::Bootstrap(e.to_string())),
         Ok(reply) => Ok(reply),
         Err(e) => match status.code() {
@@ -273,6 +308,8 @@ pub struct Conn {
     rtt: Mutex<Option<Duration>>,
     observed: Mutex<Option<SocketAddr>>,
     goaway: AtomicBool,
+    /// The server sent GOAWAY (SHUTDOWN): it is stopping, and its sessions with it.
+    shutdown: AtomicBool,
     started: Instant,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
@@ -345,6 +382,7 @@ impl Conn {
             rtt: Mutex::new(None),
             observed: Mutex::new(None),
             goaway: AtomicBool::new(false),
+            shutdown: AtomicBool::new(false),
             started,
             tasks: Mutex::new(Vec::new()),
         });
@@ -369,6 +407,11 @@ impl Conn {
     /// True when the connection can carry new attachments.
     pub fn usable(&self) -> bool {
         !self.connection.is_closed() && !self.goaway.load(Ordering::SeqCst)
+    }
+
+    /// True once the server said it is stopping (GOAWAY with SHUTDOWN).
+    pub fn server_stopping(&self) -> bool {
+        self.shutdown.load(Ordering::SeqCst)
     }
 
     /// Close the connection (it is dead, or no longer needed).
@@ -423,6 +466,9 @@ async fn control_reader(conn: std::sync::Weak<Conn>, mut recv: BufReader<RecvStr
             Message::GoAway { code, .. } => {
                 log::debug(format_args!("GOAWAY {code}"));
                 conn.goaway.store(true, Ordering::SeqCst);
+                if code == ErrorCode::SHUTDOWN {
+                    conn.shutdown.store(true, Ordering::SeqCst);
+                }
             }
             Message::Error { code, message } => {
                 log::debug(format_args!("connection error from the server: {code} {message}"));
@@ -593,11 +639,126 @@ struct State {
     /// No stream state yet: the next ATTACH sets FRESH.
     fresh: bool,
     output: Inbound,
+    /// A pipe session (protocol.md 7.14), as the bootstrap reply said.
+    pipe: bool,
+    /// A pipe session's stderr as received.
+    errors: Inbound,
     input: ReplayBuffer,
+    /// The input end, once the local input reached it: INPUT_EOF at this offset (pipe
+    /// sessions), sent again on every attachment.
+    input_eof: Option<u64>,
+    /// The last byte of input, to end a tty session's input as a terminal would.
+    last_input: Option<u8>,
     size: WindowSize,
     /// The user asked to end the session; deliver HANGUP on the next attachment.
     hangup: bool,
     input_closed: bool,
+}
+
+impl State {
+    /// Take input from the terminal into the replay buffer: the bytes to send now, as INPUT
+    /// messages with their offsets, or INPUT_EOF. Nothing after the end of input.
+    fn take_input(&mut self, input: Input) -> Vec<Message> {
+        let data = match input {
+            Input::Data(data) if !data.is_empty() && !self.hangup && self.input_eof.is_none() => data,
+            Input::Eof if self.input_eof.is_none() && !self.hangup => {
+                if self.pipe {
+                    let end = self.input.end();
+                    self.input_eof = Some(end);
+                    return vec![Message::InputEof { offset: end }];
+                }
+                // A tty session: the line discipline ends the input at ^D at the start of a
+                // line; a partial line needs one more ^D to be passed on first
+                let eof = if matches!(self.last_input, None | Some(b'\n') | Some(b'\r')) {
+                    vec![4]
+                } else {
+                    vec![4, 4]
+                };
+                self.input_closed = true;
+                eof
+            }
+            _ => return Vec::new(),
+        };
+        self.last_input = data.last().copied();
+        let mut offset = self.input.end();
+        let room = self.input.room();
+        let data = &data[..data.len().min(usize::try_from(room).unwrap_or(usize::MAX))];
+        self.input.push(data);
+        data.chunks(PREFERRED_DATA)
+            .map(|chunk| {
+                let m = Message::Input {
+                    offset,
+                    data: chunk.to_vec(),
+                };
+                offset += chunk.len() as u64;
+                m
+            })
+            .collect()
+    }
+
+    /// The client's ACK: output received, and on a pipe session error output received.
+    fn ack(&self) -> Message {
+        Message::Ack {
+            received: self.output.received(),
+            error_received: self.pipe.then(|| self.errors.received()),
+        }
+    }
+}
+
+/// Offsets above this are refused from a server (protocol.md 7.3, client step 2): no session
+/// comes anywhere near 2^62 bytes, and staying below leaves room for every offset that follows.
+const MAX_OFFSET: u64 = varint::MAX;
+
+/// Section 7.3, client side, step 2 (and 7.14.6): whether the offsets of ATTACHED fit the
+/// client's state and can be used safely.
+fn offsets_consistent(state: &State, sent: (u64, u64), got: (u64, u64, Option<u64>)) -> bool {
+    let (output_received, error_received) = sent;
+    let (input_received, output_start, error_start) = got;
+    let error_start = match (state.pipe, error_start) {
+        (true, Some(e)) => e,
+        // A pipe session's ATTACHED carries Error Start; nothing else may
+        (false, None) => 0,
+        _ => return false,
+    };
+    if input_received > MAX_OFFSET || output_start > MAX_OFFSET || error_start > MAX_OFFSET {
+        return false;
+    }
+    if state.fresh {
+        return true;
+    }
+    output_start == output_received
+        && error_start == error_received
+        && state.input.base() <= input_received
+        && input_received <= state.input.end()
+}
+
+/// When a session gives up instead of trying again (section 11.2): one new set of credentials
+/// after AUTH_FAILED or a pin mismatch, one more attach after SEQUENCE_ERROR. Both chances come
+/// back once an attachment has worked for [`STABLE_AFTER`], so that an incident hours later is
+/// not met with "already tried".
+#[derive(Debug, Default)]
+struct Retries {
+    reissued: bool,
+    sequence_retry: bool,
+}
+
+impl Retries {
+    /// An attachment ended after `lasted`.
+    fn attachment_ended(&mut self, lasted: Duration) {
+        if lasted >= STABLE_AFTER {
+            *self = Retries::default();
+        }
+    }
+
+    /// May the session get new credentials over ssh now?
+    fn may_reissue(&mut self) -> bool {
+        !std::mem::replace(&mut self.reissued, true)
+    }
+
+    /// May the session attach once more after SEQUENCE_ERROR?
+    fn may_retry_sequence(&mut self) -> bool {
+        !std::mem::replace(&mut self.sequence_retry, true)
+    }
 }
 
 /// How one attachment ended.
@@ -648,6 +809,7 @@ impl Session {
         request.env = config.env.clone();
         request.name = config.name.clone();
         if !config.tty {
+            // A pipe session; the reply says whether the server made one (10.4)
             request.tty = Some(false);
         }
         let credentials = match bootstrap(&config.ssh, &request, config.interactive).await? {
@@ -676,8 +838,7 @@ impl Session {
     async fn run_attached(&self, mut state: State, mut terminal: Terminal) -> Result<Outcome, ClientError> {
         let mut backoff = BACKOFF_FIRST;
         let mut wait: Option<Duration> = None;
-        let mut reissued = false;
-        let mut sequence_retry = false;
+        let mut retries = Retries::default();
         loop {
             if let Some(d) = wait.take() {
                 if let Some(outcome) = offline(&mut state, &mut terminal, d).await {
@@ -688,9 +849,8 @@ impl Session {
                 Ok(c) => c,
                 Err(e) => {
                     log::debug(format_args!("no connection: {e}"));
-                    if e.pin_mismatch() && !reissued {
+                    if e.pin_mismatch() && retries.may_reissue() {
                         // The daemon's identity changed: a new pin over ssh, keeping the session
-                        reissued = true;
                         self.reissue(&mut state).await?;
                         continue;
                     }
@@ -704,9 +864,17 @@ impl Session {
                 }
             };
             let attached_at = Instant::now();
-            match self.attach(&conn, &mut state, &mut terminal).await? {
+            let end = self.attach(&conn, &mut state, &mut terminal).await?;
+            retries.attachment_ended(attached_at.elapsed());
+            match end {
                 End::Exited(status) => return Ok(Outcome::Exited(status)),
                 End::Detached => return Ok(Outcome::Detached),
+                End::Lost(_) if conn.server_stopping() => {
+                    // The daemon is stopping and its sessions with it (7.13): no reconnect, and
+                    // above all no ssh pipe, whose qsh-server would start a new daemon
+                    conn.close(ErrorCode::NO_ERROR, "");
+                    return Err(ClientError::SessionLost("the server stopped".into()));
+                }
                 End::Lost(why) => {
                     log::debug(format_args!("connection lost: {why}"));
                     conn.close(ErrorCode::NO_ERROR, "");
@@ -724,14 +892,14 @@ impl Session {
                         backoff = (backoff * 2).min(BACKOFF_MAX);
                     }
                 }
-                End::Fatal(ClientError::SessionLost(why)) if why == "AUTH_FAILED" && !reissued => {
+                End::Fatal(ClientError::SessionLost(why)) if why == "AUTH_FAILED" && retries.may_reissue() => {
                     // The key is not valid any more: new credentials over ssh (section 6.4)
-                    reissued = true;
                     self.reissue(&mut state).await?;
                 }
-                End::Fatal(ClientError::SessionLost(why)) if why == "SEQUENCE_ERROR" && !sequence_retry => {
+                End::Fatal(ClientError::SessionLost(why))
+                    if why == "SEQUENCE_ERROR" && retries.may_retry_sequence() =>
+                {
                     // Attach once more; then give up on the session (section 11.2)
-                    sequence_retry = true;
                 }
                 End::Fatal(e) => return Err(e),
             }
@@ -763,12 +931,14 @@ impl Session {
         let cb = conn.connection.channel_binding(&state.session, &conn.nonce)?;
         let key = state.key.clone();
         let output_received = if state.fresh { 0 } else { state.output.received() };
+        let error_received = if state.fresh { 0 } else { state.errors.received() };
         let attach = Message::Attach {
             session: state.session,
             proof: key.proof(&cb),
             output_received,
             size: state.size,
             flags: if state.fresh { ATTACH_FRESH } else { 0 },
+            error_received: state.pipe.then_some(error_received),
         };
         if let Err(e) = write_message(&mut send, &attach).await {
             return Ok(End::Lost(e.to_string()));
@@ -784,19 +954,20 @@ impl Session {
             }
         };
         conn.received();
-        let (input_received, output_start, next_key) = match reply {
+        let (input_received, output_start, error_start, next_key) = match reply {
             Message::Attached {
                 input_received,
                 output_start,
                 next_key,
                 server_proof,
+                error_start,
             } => {
                 if !key.verify_server(&cb, &server_proof) {
                     // Not the session's server: never trust this connection (section 6.3)
                     conn.close(ErrorCode::AUTH_FAILED, "");
                     return Ok(End::Fatal(ClientError::SessionLost("AUTH_FAILED".into())));
                 }
-                (input_received, output_start, next_key)
+                (input_received, output_start, error_start, next_key)
             }
             Message::Error { code, message } => return Ok(attach_error(code, message)),
             _ => {
@@ -805,17 +976,11 @@ impl Session {
             }
         };
         // Section 7.3, client side
-        if state.fresh {
-            let pending = state.input.read_from(0, usize::MAX).1;
-            state.input = ReplayBuffer::starting_at(INPUT_REPLAY * 2, input_received);
-            // Input typed while attaching follows from there
-            state.input.push(&pending);
-            state.output = Inbound::at(output_start);
-            state.fresh = false;
-        } else if output_start != output_received
-            || input_received < state.input.base()
-            || input_received > state.input.end()
-        {
+        if !offsets_consistent(
+            state,
+            (output_received, error_received),
+            (input_received, output_start, error_start),
+        ) {
             let error = Message::Error {
                 code: ErrorCode::SEQUENCE_ERROR,
                 message: String::new(),
@@ -825,11 +990,24 @@ impl Session {
                 "inconsistent offsets after attaching".into(),
             )));
         }
+        if state.fresh {
+            let pending = state.input.read_from(0, usize::MAX).1;
+            state.input = ReplayBuffer::starting_at(INPUT_REPLAY * 2, input_received);
+            // Input typed while attaching follows from there (and the end of input with it)
+            state.input.push(&pending);
+            if state.input_eof.is_some() {
+                state.input_eof = Some(state.input.end());
+            }
+            state.output = Inbound::at(output_start);
+            state.errors = Inbound::at(error_start.unwrap_or(0));
+            state.fresh = false;
+        }
         state.input.ack(input_received);
-        // M0 keeps credentials in this process's memory only, so the key is stored where
-        // the credentials live: confirm it (section 6.5)
-        state.key = SessionKey(next_key);
-        let mut first = vec![Message::KeyConfirm];
+        // This client keeps credentials in memory only, by design: its memory is where the
+        // credentials live, so the key is stored and confirmed at once (section 6.5)
+        let key_id = next_key.id();
+        state.key = next_key;
+        let mut first = vec![Message::KeyConfirm { key_id }];
         let (mut offset, pending) = state.input.read_from(input_received, usize::MAX);
         for chunk in pending.chunks(RESEND_CHUNK) {
             first.push(Message::Input {
@@ -837,6 +1015,10 @@ impl Session {
                 data: chunk.to_vec(),
             });
             offset += chunk.len() as u64;
+        }
+        if let Some(offset) = state.input_eof {
+            // Repeated on every attachment: that is how it survives a lost connection (7.14.4)
+            first.push(Message::InputEof { offset });
         }
         if state.hangup {
             first.push(Message::Hangup);
@@ -891,7 +1073,8 @@ impl Session {
         });
         let _reader = AbortOnDrop(reader);
 
-        let mut acked = state.output.received();
+        // What the last ACK said, for both output streams
+        let mut acked = (state.output.received(), state.errors.received());
         let mut ack_due: Option<Instant> = None;
         let mut last_ping = Instant::now();
         // Since when typed input waits for any answer, and whether it was PINGed already
@@ -910,35 +1093,56 @@ impl Session {
                         Some(Err(e)) => return Ok(End::Lost(format!("broken channel: {e}"))),
                         Some(Ok(m)) => m,
                     };
+                    let message_ty = MessageTy::of(&message);
                     match message {
-                        Message::Output { offset, data } => {
-                            if offset != state.output.received() || data.is_empty() {
+                        Message::Output { offset, data } | Message::ErrorOutput { offset, data } => {
+                            let error = state.pipe && matches!(message_ty, MessageTy::ErrorOutput);
+                            if message_ty == MessageTy::ErrorOutput && !state.pipe {
+                                // stderr exists only on a pipe session (7.14.3)
+                                return Ok(protocol_violation(&mut send).await);
+                            }
+                            let stream = if error { &mut state.errors } else { &mut state.output };
+                            if offset != stream.received() || data.is_empty() {
                                 return Ok(sequence_error(&mut send).await);
                             }
                             let n = data.len() as u64;
-                            if terminal.output.send(data).await.is_err() {
+                            let sink = match (&terminal.errors, error) {
+                                (Some(errors), true) => errors,
+                                _ => &terminal.output,
+                            };
+                            if sink.send(data).await.is_err() {
                                 // Nobody shows the output any more: leave the session running
                                 return Ok(detach(&mut send, &mut rx).await);
                             }
-                            state.output = Inbound::at(offset + n);
+                            // offset + n cannot overflow: the decoder refuses such messages
+                            *stream = Inbound::at(offset + n);
                             self.status.lock().unwrap().bytes_in += n;
-                            if state.output.received() - acked >= ACK_BYTES {
-                                ack(&mut send, state.output.received(), &mut acked).await;
+                            let unacked = (state.output.received() - acked.0) + (state.errors.received() - acked.1);
+                            if unacked >= ACK_BYTES {
+                                ack(&mut send, state, &mut acked).await;
                                 ack_due = None;
                             } else {
                                 ack_due.get_or_insert_with(|| Instant::now() + ACK_DELAY);
                             }
                         }
                         Message::OutputGap { from, to } => {
+                            if state.pipe {
+                                // A pipe session never skips output (7.14.5)
+                                return Ok(protocol_violation(&mut send).await);
+                            }
                             if from != state.output.received() || from >= to {
                                 return Ok(sequence_error(&mut send).await);
                             }
                             state.output = Inbound::at(to);
-                            self.status.lock().unwrap().skipped += to - from;
+                            {
+                                let mut status = self.status.lock().unwrap();
+                                status.skipped = status.skipped.saturating_add(to - from);
+                            }
                             notify(terminal, Event::OutputSkipped(to - from));
                         }
-                        Message::Ack { received } => {
-                            if received < state.input.base() || received > state.input.end() {
+                        Message::Ack { received, .. } => {
+                            // 7.5: beyond what was sent is an error, below the last is stale
+                            if received > state.input.end() {
                                 return Ok(sequence_error(&mut send).await);
                             }
                             state.input.ack(received);
@@ -947,11 +1151,13 @@ impl Session {
                                 input_pinged = false;
                             }
                         }
-                        Message::Exit { output_end, status } => {
-                            if output_end != state.output.received() {
+                        Message::Exit { output_end, status, error_end } => {
+                            // EXIT comes after all output (7.10): of both streams on a pipe session
+                            let errors_complete = !state.pipe || error_end == Some(state.errors.received());
+                            if output_end != state.output.received() || !errors_complete {
                                 return Ok(sequence_error(&mut send).await);
                             }
-                            let _ = write_message(&mut send, &Message::Ack { received: output_end }).await;
+                            let _ = write_message(&mut send, &state.ack()).await;
                             let _ = send.shutdown().await;
                             // The server finishes once it has our ACK and FIN: wait for that
                             // briefly, so they are not lost when this process exits right away
@@ -963,27 +1169,23 @@ impl Session {
                         }
                         Message::Error { code, message } => return Ok(attach_error(code, message)),
                         Message::Unknown { .. } => {}
-                        _ => {
-                            let error = Message::Error { code: ErrorCode::PROTOCOL_VIOLATION, message: String::new() };
-                            let _ = write_message(&mut send, &error).await;
-                            return Ok(End::Lost("unexpected message from the server".into()));
-                        }
+                        _ => return Ok(protocol_violation(&mut send).await),
                     }
                 }
                 input = terminal.input.recv(), if room && !state.input_closed => match input {
-                    Some(Input::Data(data)) => {
-                        if data.is_empty() || hangup_sent {
+                    Some(input @ (Input::Data(_) | Input::Eof)) => {
+                        let messages = state.take_input(input);
+                        if messages.is_empty() {
                             continue;
                         }
-                        let mut offset = state.input.end();
-                        state.input.push(&data);
                         let mut out = Vec::new();
-                        for chunk in data.chunks(PREFERRED_DATA) {
-                            out.extend(Message::Input { offset, data: chunk.to_vec() }.encode());
-                            offset += chunk.len() as u64;
+                        for m in &messages {
+                            if let Message::Input { data, .. } = m {
+                                self.status.lock().unwrap().bytes_out += data.len() as u64;
+                                unanswered.get_or_insert_with(Instant::now);
+                            }
+                            out.extend(m.encode());
                         }
-                        self.status.lock().unwrap().bytes_out += data.len() as u64;
-                        unanswered.get_or_insert_with(Instant::now);
                         if send.write_all(&out).await.is_err() || send.flush().await.is_err() {
                             return Ok(End::Lost("the channel broke".into()));
                         }
@@ -1009,7 +1211,7 @@ impl Session {
                 _ = tick.tick() => {
                     let now = Instant::now();
                     if ack_due.is_some_and(|t| now >= t) {
-                        ack(&mut send, state.output.received(), &mut acked).await;
+                        ack(&mut send, state, &mut acked).await;
                         ack_due = None;
                     }
                     if conn.connection.is_closed() {
@@ -1052,10 +1254,9 @@ async fn offline(state: &mut State, terminal: &mut Terminal, duration: Duration)
         tokio::select! {
             _ = tokio::time::sleep_until(deadline) => return None,
             input = terminal.input.recv(), if room && !state.input_closed => match input {
-                Some(Input::Data(data)) => {
-                    if !state.hangup {
-                        state.input.push(&data);
-                    }
+                // Kept, and sent after the next attach
+                Some(input @ (Input::Data(_) | Input::Eof)) => {
+                    let _ = state.take_input(input);
                 }
                 Some(Input::Resize(size)) => state.size = size,
                 Some(Input::Detach) => return Some(Outcome::Detached),
@@ -1067,11 +1268,37 @@ async fn offline(state: &mut State, terminal: &mut Terminal, duration: Duration)
     }
 }
 
-async fn ack(send: &mut SendStream, received: u64, acked: &mut u64) {
-    if received > *acked {
-        let _ = write_message(send, &Message::Ack { received }).await;
-        *acked = received;
+async fn ack(send: &mut SendStream, state: &State, acked: &mut (u64, u64)) {
+    let now = (state.output.received(), state.errors.received());
+    if now != *acked {
+        let _ = write_message(send, &state.ack()).await;
+        *acked = now;
     }
+}
+
+/// The kinds of message the client tells apart after matching on them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MessageTy {
+    ErrorOutput,
+    Other,
+}
+
+impl MessageTy {
+    fn of(m: &Message) -> MessageTy {
+        match m {
+            Message::ErrorOutput { .. } => MessageTy::ErrorOutput,
+            _ => MessageTy::Other,
+        }
+    }
+}
+
+async fn protocol_violation(send: &mut SendStream) -> End {
+    let error = Message::Error {
+        code: ErrorCode::PROTOCOL_VIOLATION,
+        message: String::new(),
+    };
+    let _ = write_message(send, &error).await;
+    End::Lost("unexpected message from the server".into())
 }
 
 async fn sequence_error(send: &mut SendStream) -> End {
@@ -1149,8 +1376,12 @@ fn state_from(c: &Credentials, host: String, ssh: &SshCommand, size: WindowSize)
         },
         fresh: true,
         output: Inbound::default(),
+        pipe: c.pipe(),
+        errors: Inbound::default(),
         // Twice the limit: input is taken while below it, and never dropped
         input: ReplayBuffer::new(INPUT_REPLAY * 2),
+        input_eof: None,
+        last_input: None,
         size,
         hangup: false,
         input_closed: false,
@@ -1198,5 +1429,140 @@ mod tests {
         }
         assert_eq!(host_of("user@example.org"), "example.org");
         assert_eq!(host_of("example.org"), "example.org");
+    }
+
+    fn state(pipe: bool) -> State {
+        let c: Credentials = serde_json::from_str(&format!(
+            r#"{{"qsh":1,"versions":[1],"session":"{}","key":"{}","cert_sha256":"{}","udp":1,"tcp":1{}}}"#,
+            "ab".repeat(16),
+            "cd".repeat(32),
+            "ef".repeat(32),
+            if pipe { r#","tty":false"# } else { "" }
+        ))
+        .unwrap();
+        state_from(&c, "h".into(), &SshCommand::new("h"), WindowSize::new(80, 24)).unwrap()
+    }
+
+    /// Review H2 (client side): the one more attach after SEQUENCE_ERROR, and the one reissue,
+    /// come back after an attachment that worked for a while.
+    #[test]
+    fn retries_come_back_after_a_stable_attachment() {
+        let mut r = Retries::default();
+        assert!(r.may_retry_sequence());
+        assert!(!r.may_retry_sequence());
+        assert!(r.may_reissue());
+        assert!(!r.may_reissue());
+        r.attachment_ended(Duration::from_secs(1));
+        assert!(!r.may_retry_sequence() && !r.may_reissue());
+        r.attachment_ended(STABLE_AFTER);
+        assert!(r.may_retry_sequence());
+        assert!(r.may_reissue());
+    }
+
+    /// Review L3: offsets from a hostile server that would overflow, or that the session's kind
+    /// does not have, are refused instead of panicking later.
+    #[test]
+    fn impossible_offsets_from_the_server_are_refused() {
+        let mut s = state(false);
+        assert!(offsets_consistent(&s, (0, 0), (0, 0, None)));
+        assert!(offsets_consistent(&s, (0, 0), (5, 1 << 40, None)));
+        for bad in [u64::MAX, u64::MAX - 1, MAX_OFFSET + 1] {
+            assert!(!offsets_consistent(&s, (0, 0), (bad, 0, None)), "{bad}");
+            assert!(!offsets_consistent(&s, (0, 0), (0, bad, None)), "{bad}");
+        }
+        // A tty session's ATTACHED has no Error Start; a pipe session's must have one
+        assert!(!offsets_consistent(&s, (0, 0), (0, 0, Some(0))));
+        let mut p = state(true);
+        assert!(!offsets_consistent(&p, (0, 0), (0, 0, None)));
+        assert!(offsets_consistent(&p, (0, 0), (0, 0, Some(7))));
+        // Not FRESH: what was sent must come back
+        s.fresh = false;
+        s.output = Inbound::at(10);
+        assert!(offsets_consistent(&s, (10, 0), (0, 10, None)));
+        assert!(!offsets_consistent(&s, (10, 0), (0, 11, None)));
+        assert!(!offsets_consistent(&s, (10, 0), (1, 10, None)));
+        p.fresh = false;
+        assert!(offsets_consistent(&p, (0, 3), (0, 0, Some(3))));
+        assert!(!offsets_consistent(&p, (0, 3), (0, 0, Some(4))));
+    }
+
+    #[test]
+    fn the_end_of_input_is_input_eof_on_a_pipe_session_and_ctrl_d_on_a_tty() {
+        let mut p = state(true);
+        let m = p.take_input(Input::Data(b"abc".to_vec()));
+        assert_eq!(
+            m,
+            vec![Message::Input {
+                offset: 0,
+                data: b"abc".to_vec()
+            }]
+        );
+        assert_eq!(p.take_input(Input::Eof), vec![Message::InputEof { offset: 3 }]);
+        // Nothing after the end
+        assert!(p.take_input(Input::Data(b"x".to_vec())).is_empty());
+        assert!(p.take_input(Input::Eof).is_empty());
+        assert_eq!(
+            p.ack(),
+            Message::Ack {
+                received: 0,
+                error_received: Some(0)
+            }
+        );
+        let mut t = state(false);
+        assert_eq!(
+            t.take_input(Input::Eof),
+            vec![Message::Input {
+                offset: 0,
+                data: vec![4]
+            }]
+        );
+        let mut t = state(false);
+        t.take_input(Input::Data(b"partial".to_vec()));
+        assert_eq!(
+            t.take_input(Input::Eof),
+            vec![Message::Input {
+                offset: 7,
+                data: vec![4, 4]
+            }]
+        );
+        assert!(t.input_closed);
+        assert_eq!(
+            t.ack(),
+            Message::Ack {
+                received: 0,
+                error_received: None
+            }
+        );
+    }
+
+    /// Review L4: a bootstrap whose shell start-up files print more than 1 MiB (here 3 MiB on
+    /// one line, then the reply) neither hangs nor fails: everything is read, little is kept.
+    #[tokio::test]
+    async fn a_bootstrap_with_huge_noise_is_read_to_the_end() {
+        let dir = std::env::temp_dir().join(format!("qsh-client-boot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("ssh");
+        let reply = format!(
+            r#"{{"qsh":1,"versions":[1],"session":"{}","key":"{}","cert_sha256":"{}","udp":1,"tcp":1}}"#,
+            "ab".repeat(16),
+            "cd".repeat(32),
+            "ef".repeat(32)
+        );
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\ncat >/dev/null\nhead -c 3145728 /dev/zero | tr '\\0' x\necho\necho '{reply}'\n"),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut ssh = SshCommand::new("host");
+        ssh.program = script.clone().into();
+        let request = Request::new_session(80, 24);
+        let result = tokio::time::timeout(Duration::from_secs(30), bootstrap(&ssh, &request, false))
+            .await
+            .expect("the bootstrap must not hang");
+        assert!(matches!(result, Ok(Reply::Credentials(_))), "{result:?}");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -303,6 +303,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-rustls",
+ "zeroize",
 ]
 
 [[package]]

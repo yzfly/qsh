@@ -65,9 +65,16 @@ impl fmt::Debug for Fingerprint {
     }
 }
 
-/// A secret session key. Its `Debug` output does not show it.
+/// A secret session key. Its `Debug` output does not show it, and its bytes are wiped from
+/// memory when it is dropped.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SessionKey(pub [u8; KEY_LEN]);
+
+impl Drop for SessionKey {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0);
+    }
+}
 
 impl SessionKey {
     /// A new random key.
@@ -98,6 +105,14 @@ impl SessionKey {
     /// Check a proof in constant time.
     pub fn verify(&self, binding: &[u8], proof: &[u8]) -> bool {
         hmac::verify(&hmac::Key::new(hmac::HMAC_SHA256, &self.0), binding, proof).is_ok()
+    }
+
+    /// The key ID that KEY_CONFIRM carries (section 6.5): the first 8 bytes of SHA-256(key).
+    pub fn id(&self) -> [u8; 8] {
+        let digest = sha256(&self.0);
+        let mut id = [0u8; 8];
+        id.copy_from_slice(&digest[..8]);
+        id
     }
 
     /// Lower-case hex, as in the bootstrap reply.
@@ -244,19 +259,64 @@ pub fn server_tls(identity: &Identity) -> io::Result<rustls::ServerConfig> {
 /// The client's TLS configuration: TLS 1.3 only, ALPN `qsh/1`, accepting exactly the
 /// certificate with `fingerprint`.
 pub fn client_tls(fingerprint: Fingerprint) -> io::Result<rustls::ClientConfig> {
+    Ok(pinned_client_tls(fingerprint)?.0)
+}
+
+/// [`client_tls`], and a [`PinCheck`] that tells whether a failed handshake failed because the
+/// server's certificate did not match the pin.
+pub fn pinned_client_tls(fingerprint: Fingerprint) -> io::Result<(rustls::ClientConfig, PinCheck)> {
     let provider = provider();
+    let check = PinCheck::default();
     let mut config = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(io::Error::other)?
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(PinnedCert { fingerprint, provider }))
+        .with_custom_certificate_verifier(Arc::new(PinnedCert {
+            fingerprint,
+            provider,
+            mismatch: check.clone(),
+        }))
         .with_no_client_auth();
     config.alpn_protocols = vec![ALPN.to_vec()];
     // Section 9: no SNI, no resumption, no early data; every handshake checks the pin
     config.enable_sni = false;
     config.resumption = rustls::client::Resumption::disabled();
     config.enable_early_data = false;
-    Ok(config)
+    Ok((config, check))
+}
+
+/// Set when a handshake was aborted because the server's certificate did not match the pin.
+#[derive(Debug, Clone, Default)]
+pub struct PinCheck(Arc<std::sync::atomic::AtomicBool>);
+
+impl PinCheck {
+    /// True once a certificate did not match.
+    pub fn mismatched(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The error for a failed handshake: a pin mismatch (whose text contains [`PIN_MISMATCH`]),
+    /// or `error` as it is.
+    pub fn error(&self, error: io::Error) -> io::Error {
+        if self.mismatched() {
+            io::Error::new(io::ErrorKind::PermissionDenied, format!("the server {PIN_MISMATCH}"))
+        } else {
+            error
+        }
+    }
+}
+
+/// Check the protocol a handshake negotiated: exactly `qsh/1` (protocol.md 9.1). Some TLS
+/// libraries complete a handshake without ALPN; qsh does not talk on such a connection.
+pub fn check_alpn(negotiated: Option<&[u8]>) -> io::Result<()> {
+    if negotiated == Some(ALPN) {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("the peer did not negotiate ALPN {}", String::from_utf8_lossy(ALPN)),
+        ))
+    }
 }
 
 /// The name passed to TLS connects. It is not sent (no SNI) and not checked (pinning).
@@ -307,14 +367,19 @@ pub fn quic_server(identity: &Identity) -> io::Result<quinn::ServerConfig> {
 
 /// The client's QUIC configuration, pinned to `fingerprint`.
 pub fn quic_client(fingerprint: Fingerprint) -> io::Result<quinn::ClientConfig> {
-    let crypto =
-        quinn::crypto::rustls::QuicClientConfig::try_from(client_tls(fingerprint)?).map_err(io::Error::other)?;
+    Ok(pinned_quic_client(fingerprint)?.0)
+}
+
+/// [`quic_client`] with its [`PinCheck`].
+pub fn pinned_quic_client(fingerprint: Fingerprint) -> io::Result<(quinn::ClientConfig, PinCheck)> {
+    let (tls, check) = pinned_client_tls(fingerprint)?;
+    let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls).map_err(io::Error::other)?;
     let mut config = quinn::ClientConfig::new(Arc::new(crypto));
     let mut transport = transport();
     // qsh/1 has no server-initiated channels
     transport.max_concurrent_bidi_streams(0u32.into());
     config.transport_config(Arc::new(transport));
-    Ok(config)
+    Ok((config, check))
 }
 
 /// Accept exactly the certificate with the pinned fingerprint, and still verify the handshake
@@ -323,6 +388,7 @@ pub fn quic_client(fingerprint: Fingerprint) -> io::Result<quinn::ClientConfig> 
 struct PinnedCert {
     fingerprint: Fingerprint,
     provider: Arc<CryptoProvider>,
+    mismatch: PinCheck,
 }
 
 impl ServerCertVerifier for PinnedCert {
@@ -337,7 +403,13 @@ impl ServerCertVerifier for PinnedCert {
         if constant_time_eq(&sha256(end_entity.as_ref()), &self.fingerprint.0) {
             Ok(ServerCertVerified::assertion())
         } else {
-            Err(rustls::Error::General(format!("the server {PIN_MISMATCH}")))
+            self.mismatch.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            // Section 9.4: abort with bad_certificate. rustls sends that alert for these
+            // certificate errors; NotValidForName is the closest in meaning ("not the server
+            // this connection is for"). The caller tells a pin mismatch apart by the PinCheck.
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::NotValidForName,
+            ))
         }
     }
 
@@ -415,6 +487,13 @@ mod tests {
         );
     }
 
+    /// protocol.md A.6
+    #[test]
+    fn key_id_test_vector() {
+        let k2 = SessionKey::from_hex("202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f").unwrap();
+        assert_eq!(hex(&k2.id()), "72dbb7336c767800");
+    }
+
     #[test]
     fn identity_persists() {
         let dir = std::env::temp_dir().join(format!("qsh-crypto-{}", std::process::id()));
@@ -425,7 +504,9 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
-    /// A TLS handshake succeeds against the pinned certificate and fails against another.
+    /// A TLS handshake succeeds against the pinned certificate and fails against another, with
+    /// the alert bad_certificate (section 9.4; review: it was internal_error) and an error that
+    /// says pin mismatch.
     #[tokio::test]
     async fn pinning_accepts_only_the_pinned_certificate() {
         let identity = Identity::generate().unwrap();
@@ -433,15 +514,33 @@ mod tests {
         for (pin, ok) in [(identity.fingerprint(), true), (other.fingerprint(), false)] {
             let (client, server) = tokio::io::duplex(64 * 1024);
             let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_tls(&identity).unwrap()));
-            let connector = tokio_rustls::TlsConnector::from(Arc::new(client_tls(pin).unwrap()));
+            let (config, check) = pinned_client_tls(pin).unwrap();
+            let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
             let server = tokio::spawn(async move { acceptor.accept(server).await.map(|_| ()) });
             let client = connector.connect(server_name(), client).await;
             assert_eq!(client.is_ok(), ok);
+            assert_eq!(check.mismatched(), !ok);
             if ok {
                 let stream = client.unwrap();
                 assert_eq!(stream.get_ref().1.alpn_protocol(), Some(ALPN));
+                check_alpn(stream.get_ref().1.alpn_protocol()).unwrap();
                 server.await.unwrap().unwrap();
+            } else {
+                let e = check.error(client.unwrap_err());
+                assert!(e.to_string().contains(PIN_MISMATCH), "{e}");
+                let server_error = server.await.unwrap().unwrap_err();
+                let alert = server_error
+                    .get_ref()
+                    .and_then(|e| e.downcast_ref::<rustls::Error>())
+                    .cloned();
+                assert_eq!(
+                    alert,
+                    Some(rustls::Error::AlertReceived(rustls::AlertDescription::BadCertificate)),
+                    "{server_error}"
+                );
             }
         }
+        assert!(check_alpn(None).is_err());
+        assert!(check_alpn(Some(b"qsh/2")).is_err());
     }
 }

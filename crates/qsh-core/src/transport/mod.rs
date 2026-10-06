@@ -23,6 +23,7 @@ use tokio::net::TcpStream;
 
 use crate::crypto;
 use crate::mux::{Mux, MuxRecv, MuxSend, Role};
+use crate::proto::limits::MAX_PREAUTH_BYTES;
 use crate::proto::{ErrorCode, EXPORTER_LABEL};
 
 /// Which transport a connection uses.
@@ -115,12 +116,42 @@ enum Binding {
     Pipe,
 }
 
+/// The stream bytes an unauthenticated QUIC peer may still send (protocol.md 6.6), shared by
+/// the streams of its connection. Over the mux layer the mux counts frame bytes itself.
+#[derive(Debug)]
+pub struct Budget {
+    remaining: Mutex<Option<u64>>,
+    connection: quinn::Connection,
+}
+
+impl Budget {
+    /// Count `n` bytes read; false (and the connection closed) when that is more than allowed.
+    fn charge(&self, n: usize) -> bool {
+        let mut remaining = self.remaining.lock().unwrap();
+        let Some(left) = remaining.as_mut() else {
+            return true;
+        };
+        if n as u64 > *left {
+            *left = 0;
+            self.connection.close(
+                quic_code(ErrorCode::LIMIT_EXCEEDED),
+                b"too much data before authentication",
+            );
+            return false;
+        }
+        *left -= n as u64;
+        true
+    }
+}
+
 /// A qsh connection over any transport.
 pub struct Connection {
     transport: Transport,
     streams: Streams,
     binding: Binding,
     remote: Option<SocketAddr>,
+    /// The daemon's pre-authentication budget of a QUIC connection.
+    budget: Option<Arc<Budget>>,
     /// Keeps the ssh process of a pipe connection.
     _child: Option<tokio::process::Child>,
 }
@@ -146,8 +177,8 @@ pub enum SendStream {
 /// The receiving half of a stream.
 #[derive(Debug)]
 pub enum RecvStream {
-    /// A QUIC stream.
-    Quic(quinn::RecvStream),
+    /// A QUIC stream, and the connection's pre-authentication budget on the daemon.
+    Quic(quinn::RecvStream, Option<Arc<Budget>>),
     /// A mux stream.
     Mux(MuxRecv),
 }
@@ -168,7 +199,7 @@ impl RecvStream {
     /// Abort the stream with `code` (QUIC: STOP_SENDING; mux: RESET).
     pub fn stop(&mut self, code: ErrorCode) {
         match self {
-            RecvStream::Quic(s) => {
+            RecvStream::Quic(s, _) => {
                 let _ = s.stop(quic_code(code));
             }
             RecvStream::Mux(s) => s.reset(code),
@@ -206,7 +237,20 @@ impl AsyncWrite for SendStream {
 impl AsyncRead for RecvStream {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
-            RecvStream::Quic(s) => Pin::new(s).poll_read(cx, buf),
+            RecvStream::Quic(s, budget) => {
+                let before = buf.filled().len();
+                let result = Pin::new(s).poll_read(cx, buf);
+                let n = buf.filled().len() - before;
+                if let Some(budget) = budget {
+                    if n > 0 && !budget.charge(n) {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "too much data before authentication",
+                        )));
+                    }
+                }
+                result
+            }
             RecvStream::Mux(s) => Pin::new(s).poll_read(cx, buf),
         }
     }
@@ -228,7 +272,19 @@ fn exporter_of<T: TlsIo>(tls: SharedTls<T>) -> Exporter {
 }
 
 impl Connection {
-    /// A QUIC connection (either side).
+    /// The daemon's side of a QUIC connection: until [`Connection::set_preauth_limit`] lifts it,
+    /// the peer may send at most `MAX_PREAUTH_BYTES` of stream data (section 6.6).
+    pub fn quic_server(connection: quinn::Connection) -> Connection {
+        let budget = Arc::new(Budget {
+            remaining: Mutex::new(Some(MAX_PREAUTH_BYTES)),
+            connection: connection.clone(),
+        });
+        let mut c = Connection::quic(connection);
+        c.budget = Some(budget);
+        c
+    }
+
+    /// A QUIC connection (the client's side, or a daemon without pre-authentication limits).
     pub fn quic(connection: quinn::Connection) -> Connection {
         let remote = Some(connection.remote_address());
         let c = connection.clone();
@@ -243,6 +299,7 @@ impl Connection {
             streams: Streams::Quic(connection),
             binding: Binding::Exporter(exporter),
             remote,
+            budget: None,
             _child: None,
         }
     }
@@ -251,32 +308,36 @@ impl Connection {
     pub fn tls_client(tls: tokio_rustls::client::TlsStream<TcpStream>) -> Connection {
         let remote = tls.get_ref().0.peer_addr().ok();
         let shared = SharedTls(Arc::new(Mutex::new(tls)));
-        let mux = Mux::new(Role::Client, shared.clone(), shared.clone());
+        let mux = Mux::new(Role::Client, shared.clone(), shared.clone(), None);
         Connection {
             transport: Transport::Tls,
             streams: Streams::Mux(mux),
             binding: Binding::Exporter(exporter_of(shared)),
             remote,
+            budget: None,
             _child: None,
         }
     }
 
-    /// The daemon's side of a TLS connection.
+    /// The daemon's side of a TLS connection, with the pre-authentication byte budget from the
+    /// first byte (section 6.6).
     pub fn tls_server(tls: tokio_rustls::server::TlsStream<TcpStream>) -> Connection {
         let remote = tls.get_ref().0.peer_addr().ok();
         let shared = SharedTls(Arc::new(Mutex::new(tls)));
-        let mux = Mux::new(Role::Server, shared.clone(), shared.clone());
+        let mux = Mux::new(Role::Server, shared.clone(), shared.clone(), Some(MAX_PREAUTH_BYTES));
         Connection {
             transport: Transport::Tls,
             streams: Streams::Mux(mux),
             binding: Binding::Exporter(exporter_of(shared)),
             remote,
+            budget: None,
             _child: None,
         }
     }
 
     /// An ssh pipe over any byte stream (after the preface), on either side. `child` is the
-    /// ssh process on the client side, kept as long as the connection.
+    /// ssh process on the client side, kept as long as the connection. The daemon's side
+    /// starts with the pre-authentication byte budget (section 6.6).
     pub fn pipe<R, W>(
         role: Role,
         reader: R,
@@ -288,12 +349,14 @@ impl Connection {
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        let mux = Mux::new(role, reader, writer);
+        let budget = (role == Role::Server).then_some(MAX_PREAUTH_BYTES);
+        let mux = Mux::new(role, reader, writer, budget);
         Connection {
             transport: Transport::Ssh,
             streams: Streams::Mux(mux),
             binding: Binding::Pipe,
             remote,
+            budget: None,
             _child: child,
         }
     }
@@ -333,7 +396,11 @@ impl Connection {
         match &self.streams {
             Streams::Quic(c) => {
                 let (send, recv) = c.open_bi().await.map_err(io::Error::other)?;
-                Ok((stream_id(&send), SendStream::Quic(send), RecvStream::Quic(recv)))
+                Ok((
+                    stream_id(&send),
+                    SendStream::Quic(send),
+                    RecvStream::Quic(recv, self.budget.clone()),
+                ))
             }
             Streams::Mux(m) => {
                 let (id, send, recv) = m.open().await?;
@@ -347,7 +414,11 @@ impl Connection {
         match &self.streams {
             Streams::Quic(c) => {
                 let (send, recv) = c.accept_bi().await.ok()?;
-                Some((stream_id(&send), SendStream::Quic(send), RecvStream::Quic(recv)))
+                Some((
+                    stream_id(&send),
+                    SendStream::Quic(send),
+                    RecvStream::Quic(recv, self.budget.clone()),
+                ))
             }
             Streams::Mux(m) => {
                 let (id, send, recv) = m.accept().await?;
@@ -366,12 +437,16 @@ impl Connection {
     }
 
     /// Before authentication the peer may send at most `bytes` (section 6.6); None lifts the
-    /// limit. Over QUIC this sets the connection's receive window instead.
+    /// limit. Over QUIC the connection's receive window stays small until the limit is lifted.
     pub fn set_preauth_limit(&self, bytes: Option<u64>) {
         match &self.streams {
             Streams::Quic(c) => {
-                let window = bytes.unwrap_or(8 << 20);
-                c.set_receive_window(quinn::VarInt::from_u64(window).unwrap_or(quinn::VarInt::MAX));
+                if let Some(budget) = &self.budget {
+                    *budget.remaining.lock().unwrap() = bytes;
+                }
+                if bytes.is_none() {
+                    c.set_receive_window(quinn::VarInt::from_u32(8 << 20));
+                }
             }
             Streams::Mux(m) => m.set_byte_budget(bytes),
         }

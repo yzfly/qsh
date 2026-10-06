@@ -32,6 +32,10 @@ pub const MAX_STREAMS: usize = 128;
 const SEND_QUEUE: usize = 64 * 1024;
 /// Connection credit returned in batches of at least this much.
 const CONN_CREDIT_BATCH: u64 = 32 * 1024;
+/// RESET frames queued at most: a peer that keeps provoking them while not reading what we
+/// send must not make the queue grow without end. (WINDOW and CONN_WINDOW are not queued but
+/// coalesced, one pending increment per stream.)
+const MAX_QUEUED_RESETS: usize = 1024;
 
 const T_DATA: u8 = 0x00;
 const T_FIN: u8 = 0x01;
@@ -217,6 +221,8 @@ struct StreamState {
     recv_total: u64,
     /// Consumed by the application and not yet credited back.
     recv_unreturned: u64,
+    /// Credit granted and not yet sent in a WINDOW frame.
+    window_pending: u64,
     reader: Option<Waker>,
     reader_gone: bool,
     // Sending
@@ -254,9 +260,13 @@ impl StreamState {
         self.reset.is_some() || (self.fin_sent && self.recv_fin)
     }
 
-    /// Closed, and the application holds neither half: the entry can go.
-    fn finished(&self) -> bool {
-        self.closed() && self.reader_gone && self.writer_gone
+    /// Closed, and the application holds neither half: the entry can go. A stream of the
+    /// peer also goes once we finished or reset it and hold neither half, even if the peer
+    /// never sends its FIN: nothing more can come of it, and a peer must not be able to keep
+    /// state alive here by never finishing (its late frames for the stream are ignored).
+    fn finished(&self, peer_stream: bool) -> bool {
+        let done_here = self.reset.is_some() || self.fin_sent;
+        self.reader_gone && self.writer_gone && (self.closed() || (peer_stream && done_here))
     }
 }
 
@@ -270,8 +280,16 @@ struct State {
     accept: VecDeque<u64>,
     acceptor: Option<Waker>,
     open_waiters: Vec<Waker>,
-    /// Frames to send before any DATA.
+    /// RESET frames to send before any DATA (at most [`MAX_QUEUED_RESETS`]).
     control: VecDeque<Frame>,
+    /// Streams with credit to grant in a WINDOW frame (`window_pending`).
+    windows: BTreeSet<u64>,
+    /// Connection credit to grant in a CONN_WINDOW frame.
+    conn_window_pending: u64,
+    /// Streams opened by the peer are accepted (server); otherwise (client: qsh/1 has no
+    /// server-initiated channels, protocol.md 4.3) they are reset with UNKNOWN_CHANNEL at once,
+    /// without buffering anything for them.
+    accept_peer_streams: bool,
     /// Streams with data or a FIN to send.
     ready: BTreeSet<u64>,
     /// Round-robin position among ready streams (other than 0).
@@ -321,16 +339,36 @@ impl State {
     /// After a stream's state changed: wake those waiting to open one once it closed, and
     /// forget it once nobody holds it either.
     fn cleanup(&mut self, id: u64) {
+        let peer_stream = !self.role.owns(id);
         let Some(s) = self.streams.get(&id) else { return };
         if s.closed() {
             for w in self.open_waiters.drain(..) {
                 w.wake();
             }
         }
-        if s.finished() {
+        if s.finished(peer_stream) {
             self.streams.remove(&id);
             self.ready.remove(&id);
+            self.windows.remove(&id);
         }
+    }
+
+    /// Grant the peer `increment` more bytes on stream `id`, in the next WINDOW frame.
+    fn grant(&mut self, id: u64, increment: u64) {
+        if let Some(s) = self.streams.get_mut(&id) {
+            s.recv_allowed += increment;
+            s.window_pending += increment;
+            self.windows.insert(id);
+        }
+    }
+
+    /// Queue a RESET; false when too many are queued already (the connection then fails).
+    fn queue_reset(&mut self, id: u64, code: ErrorCode) -> bool {
+        if self.control.len() >= MAX_QUEUED_RESETS {
+            return false;
+        }
+        self.control.push_back(Frame::Reset { stream: id, code });
+        true
     }
 }
 
@@ -364,7 +402,11 @@ struct ConnError(ErrorCode, &'static str);
 impl Mux {
     /// Start multiplexing over `reader` and `writer` (spawns two tasks on the current tokio
     /// runtime). They end, and the transport is closed, when the connection ends.
-    pub fn new<R, W>(role: Role, reader: R, writer: W) -> Mux
+    ///
+    /// `byte_budget` limits the bytes the peer may send from the very first one (a daemon's
+    /// connection before authentication, section 6.6), as [`Mux::set_byte_budget`] does later.
+    /// A client (`Role::Client`) resets every stream the server opens with UNKNOWN_CHANNEL.
+    pub fn new<R, W>(role: Role, reader: R, writer: W, byte_budget: Option<u64>) -> Mux
     where
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
@@ -379,13 +421,16 @@ impl Mux {
                 acceptor: None,
                 open_waiters: Vec::new(),
                 control: VecDeque::new(),
+                windows: BTreeSet::new(),
+                conn_window_pending: 0,
+                accept_peer_streams: role == Role::Server,
                 ready: BTreeSet::new(),
                 last_sent: 0,
                 conn_send_credit: CONN_WINDOW,
                 conn_recv_allowed: CONN_WINDOW,
                 conn_recv_total: 0,
                 conn_recv_unreturned: 0,
-                byte_budget: None,
+                byte_budget,
                 closed: None,
                 close_code: None,
             }),
@@ -604,7 +649,7 @@ fn handle_frame(inner: &Inner, frame: Frame) -> Result<(), ConnError> {
             if st.conn_recv_unreturned >= CONN_CREDIT_BATCH {
                 let increment = std::mem::take(&mut st.conn_recv_unreturned);
                 st.conn_recv_allowed += increment;
-                st.control.push_back(Frame::ConnWindow { increment });
+                st.conn_window_pending += increment;
                 inner.kick();
             }
             if !role.owns(id) && !st.streams.contains_key(&id) {
@@ -615,10 +660,18 @@ fn handle_frame(inner: &Inner, frame: Frame) -> Result<(), ConnError> {
                 if id != st.next_remote {
                     return Err(ConnError(ErrorCode::PROTOCOL_VIOLATION, "stream ids out of order"));
                 }
+                st.next_remote += 4;
+                if !st.accept_peer_streams {
+                    // Not a channel we know (4.3): refused at once, nothing kept
+                    if !st.queue_reset(id, ErrorCode::UNKNOWN_CHANNEL) {
+                        return Err(ConnError(ErrorCode::LIMIT_EXCEEDED, "too many streams refused"));
+                    }
+                    inner.kick();
+                    return Ok(());
+                }
                 if st.open_count(role.peer()) >= MAX_STREAMS {
                     return Err(ConnError(ErrorCode::STREAM_LIMIT, "too many streams"));
                 }
-                st.next_remote += 4;
                 st.streams.insert(id, StreamState::new());
                 st.accept.push_back(id);
                 if let Some(w) = st.acceptor.take() {
@@ -640,11 +693,8 @@ fn handle_frame(inner: &Inner, frame: Frame) -> Result<(), ConnError> {
             }
             if s.reader_gone {
                 // Nobody reads: discard, and give the credit back so the peer is not stuck
-                s.recv_allowed += len;
-                st.control.push_back(Frame::Window {
-                    stream: id,
-                    increment: len,
-                });
+                // (one WINDOW for all of it, however many frames came)
+                st.grant(id, len);
                 inner.kick();
             } else {
                 s.recv.extend(&data);
@@ -751,6 +801,18 @@ fn collect(st: &mut State, out: &mut Vec<u8>) {
     while let Some(frame) = st.control.pop_front() {
         frame.encode(out);
     }
+    if st.conn_window_pending > 0 {
+        let increment = std::mem::take(&mut st.conn_window_pending);
+        Frame::ConnWindow { increment }.encode(out);
+    }
+    for id in std::mem::take(&mut st.windows) {
+        if let Some(s) = st.streams.get_mut(&id) {
+            let increment = std::mem::take(&mut s.window_pending);
+            if increment > 0 && s.reset.is_none() {
+                Frame::Window { stream: id, increment }.encode(out);
+            }
+        }
+    }
     let mut finished = Vec::new();
     while out.len() < 64 * 1024 {
         // Stream 0 first, then round-robin after the last stream served
@@ -854,7 +916,10 @@ fn reset(inner: &Inner, id: u64, code: ErrorCode) {
     s.send.clear();
     s.wake();
     st.ready.remove(&id);
-    st.control.push_back(Frame::Reset { stream: id, code });
+    if !st.queue_reset(id, code) {
+        // Far too many queued: the peer reads nothing we send; give up on the connection
+        st.close_code.get_or_insert(ErrorCode::LIMIT_EXCEEDED);
+    }
     drop(st);
     inner.kick();
 }
@@ -895,11 +960,7 @@ impl AsyncRead for MuxRecv {
         s.recv_unreturned += n as u64;
         if s.recv_unreturned >= STREAM_WINDOW / 2 && !s.recv_fin {
             let increment = std::mem::take(&mut s.recv_unreturned);
-            s.recv_allowed += increment;
-            st.control.push_back(Frame::Window {
-                stream: self.id,
-                increment,
-            });
+            st.grant(self.id, increment);
             drop(st);
             self.inner.kick();
         }
@@ -997,11 +1058,7 @@ impl Drop for MuxRecv {
             s.recv.clear();
             s.recv_unreturned = 0;
             if unread > 0 && !s.recv_fin && s.reset.is_none() {
-                s.recv_allowed += unread;
-                st.control.push_back(Frame::Window {
-                    stream: id,
-                    increment: unread,
-                });
+                st.grant(id, unread);
                 drop(st);
                 self.inner.kick();
                 st = self.inner.state.lock().unwrap();

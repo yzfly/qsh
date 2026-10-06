@@ -50,11 +50,14 @@ impl SessionTable {
         all
     }
 
-    /// Hang up every session (the daemon stops).
-    pub fn hang_up_all(&self) {
-        for s in self.sessions.lock().unwrap().drain().map(|(_, s)| s) {
+    /// Hang up and remove every session (the daemon stops); the sessions, whose attachments
+    /// are still ending.
+    pub fn hang_up_all(&self) -> Vec<Arc<PtySession>> {
+        let sessions: Vec<_> = self.sessions.lock().unwrap().drain().map(|(_, s)| s).collect();
+        for s in &sessions {
             s.hang_up();
         }
+        sessions
     }
 
     /// Forget sessions whose program exited `exited_ttl` ago, and close sessions nobody was

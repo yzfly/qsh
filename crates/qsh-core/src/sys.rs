@@ -123,10 +123,21 @@ fn open_max() -> RawFd {
 /// default disposition and unblocked: the daemon ignores SIGHUP, and an ignored signal would
 /// otherwise stay ignored in the session's programs (a hangup would not end them).
 pub fn spawn_on_pty(command: &mut Command) {
+    spawn_session(command, true);
+}
+
+/// Make `command` start like [`spawn_on_pty`], but without a controlling terminal: the program
+/// of a pipe session, whose stdin, stdout and stderr are pipes.
+pub fn spawn_with_pipes(command: &mut Command) {
+    spawn_session(command, false);
+}
+
+fn spawn_session(command: &mut Command, controlling_tty: bool) {
     let max = open_max();
+    let nofile = ORIGINAL_NOFILE.get().copied();
     // SAFETY: the closure runs between fork and exec and calls only async-signal-safe
-    // functions (signal, sigemptyset, sigprocmask, setsid, ioctl, fcntl) on local data,
-    // allocating nothing.
+    // functions (signal, sigemptyset, sigprocmask, setsid, ioctl, fcntl, setrlimit) on local
+    // data, allocating nothing.
     unsafe {
         command.pre_exec(move || {
             for signal in 1..32 {
@@ -140,14 +151,240 @@ pub fn spawn_on_pty(command: &mut Command) {
             if libc::setsid() < 0 {
                 return Err(io::Error::last_os_error());
             }
-            if libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
+            if controlling_tty && libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
                 return Err(io::Error::last_os_error());
+            }
+            // The daemon raised its own descriptor limit (raise_nofile_limit); programs get the
+            // limit the daemon started with, as select()-based ones expect
+            if let Some(limit) = nofile {
+                libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
             }
             for fd in 3..max {
                 libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
             }
             Ok(())
         });
+    }
+}
+
+/// The descriptor limit the process started with, before [`raise_nofile_limit`].
+static ORIGINAL_NOFILE: std::sync::OnceLock<libc::rlimit> = std::sync::OnceLock::new();
+
+/// Raise the soft limit of open descriptors to the hard limit (protocol.md 6.6: the daemon's
+/// own connection limits, not the descriptor table, should decide when connections are
+/// refused). Programs started afterwards with [`spawn_on_pty`] or [`spawn_with_pipes`] get the
+/// original limit back. Returns the new soft limit.
+// rlim_t is u32 on some 32-bit targets: the casts are not always no-ops
+#[allow(clippy::unnecessary_cast)]
+pub fn raise_nofile_limit() -> io::Result<u64> {
+    // SAFETY: rlimit is plain old data; all zeroes is a valid value.
+    let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+    // SAFETY: getrlimit writes one rlimit into the pointer, valid across the call.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let _ = ORIGINAL_NOFILE.set(limit);
+    let mut raised = limit;
+    raised.rlim_cur = limit.rlim_max;
+    // macOS refuses RLIM_INFINITY and values above OPEN_MAX (10240, <sys/syslimits.h>) for
+    // the soft limit
+    #[cfg(target_vendor = "apple")]
+    {
+        raised.rlim_cur = raised.rlim_cur.min(10240);
+    }
+    if raised.rlim_cur > limit.rlim_cur {
+        // SAFETY: setrlimit reads one rlimit from the pointer, valid across the call.
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        return Ok(raised.rlim_cur as u64);
+    }
+    Ok(limit.rlim_cur as u64)
+}
+
+/// Make `fd` non-blocking (for [`wait_fd`] loops).
+pub fn set_nonblocking(fd: &impl AsRawFd) -> io::Result<()> {
+    let fd = fd.as_raw_fd();
+    // SAFETY: fcntl F_GETFL / F_SETFL on a descriptor have no memory effects.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags < 0 || libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// A way to wake every thread waiting in [`wait_fd`]: a pipe whose write end is closed by
+/// [`Cancel::cancel`] (or when the `Cancel` is dropped), which makes its read end readable for
+/// good.
+#[derive(Debug)]
+pub struct Cancel {
+    read: OwnedFd,
+    write: std::sync::Mutex<Option<OwnedFd>>,
+}
+
+impl Cancel {
+    /// A new, not yet cancelled, cancel pipe.
+    pub fn new() -> io::Result<Cancel> {
+        let mut fds = [-1 as libc::c_int; 2];
+        // SAFETY: pipe writes two descriptors into the array, which lives across the call.
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: pipe succeeded: both are open descriptors this process now owns.
+        let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        set_cloexec(read.as_raw_fd())?;
+        set_cloexec(write.as_raw_fd())?;
+        Ok(Cancel {
+            read,
+            write: std::sync::Mutex::new(Some(write)),
+        })
+    }
+
+    /// Wake every waiter, now and from now on.
+    pub fn cancel(&self) {
+        self.write.lock().unwrap().take();
+    }
+
+    /// True once cancelled.
+    pub fn is_cancelled(&self) -> bool {
+        self.write.lock().unwrap().is_none()
+    }
+}
+
+/// What [`wait_fd`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ready {
+    /// The descriptor is ready (or failed, or reached its end: the next read or write says).
+    Fd,
+    /// The [`Cancel`] was cancelled.
+    Cancelled,
+    /// The timeout passed.
+    TimedOut,
+}
+
+/// Wait until `fd` is readable (or writable, with `write`), `cancel` is cancelled, or
+/// `timeout` passed. Used with non-blocking descriptors, so that a thread blocked on a
+/// session's terminal or pipe can always be told to let go of it.
+pub fn wait_fd(
+    fd: &impl AsRawFd,
+    write: bool,
+    cancel: &Cancel,
+    timeout: Option<std::time::Duration>,
+) -> io::Result<Ready> {
+    wait_raw(fd.as_raw_fd(), write, cancel.read.as_raw_fd(), timeout)
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn wait_raw(fd: RawFd, write: bool, cancel: RawFd, timeout: Option<std::time::Duration>) -> io::Result<Ready> {
+    let events = if write { libc::POLLOUT } else { libc::POLLIN };
+    let mut fds = [
+        libc::pollfd { fd, events, revents: 0 },
+        libc::pollfd {
+            fd: cancel,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    let ms = timeout.map_or(-1, |t| t.as_millis().min(i32::MAX as u128) as libc::c_int);
+    loop {
+        // SAFETY: poll reads and writes the two pollfd entries of the array, valid for the call.
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, ms) };
+        if n < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e);
+        }
+        if fds[1].revents != 0 {
+            return Ok(Ready::Cancelled);
+        }
+        if fds[0].revents != 0 {
+            return Ok(Ready::Fd);
+        }
+        return Ok(Ready::TimedOut);
+    }
+}
+
+/// macOS: poll() and kqueue do not work on terminal devices, select() does. Descriptors beyond
+/// FD_SETSIZE cannot be put in an fd_set; for those, short sleeps stand in for the wait (the
+/// callers retry their non-blocking reads and writes).
+#[cfg(target_vendor = "apple")]
+fn wait_raw(fd: RawFd, write: bool, cancel: RawFd, timeout: Option<std::time::Duration>) -> io::Result<Ready> {
+    let limit = libc::FD_SETSIZE as RawFd;
+    if fd >= limit || cancel >= limit {
+        let nap = std::time::Duration::from_millis(20);
+        std::thread::sleep(timeout.map_or(nap, |t| t.min(nap)));
+        return Ok(Ready::Fd);
+    }
+    loop {
+        // SAFETY: fd_set is plain old data; all zeroes is an empty set.
+        let mut readable: libc::fd_set = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
+        let mut writable: libc::fd_set = unsafe { std::mem::zeroed() };
+        // SAFETY: both descriptors are below FD_SETSIZE (checked above); the sets are local.
+        unsafe {
+            libc::FD_SET(cancel, &mut readable);
+            if write {
+                libc::FD_SET(fd, &mut writable);
+            } else {
+                libc::FD_SET(fd, &mut readable);
+            }
+        }
+        let mut tv = timeout.map(|t| libc::timeval {
+            tv_sec: t.as_secs() as libc::time_t,
+            tv_usec: t.subsec_micros() as libc::suseconds_t,
+        });
+        let tvp = tv.as_mut().map_or(std::ptr::null_mut(), |t| t as *mut libc::timeval);
+        // SAFETY: select reads and writes the local sets and timeval, valid for the call.
+        let n = unsafe {
+            libc::select(
+                fd.max(cancel) + 1,
+                &mut readable,
+                &mut writable,
+                std::ptr::null_mut(),
+                tvp,
+            )
+        };
+        if n < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e);
+        }
+        // SAFETY: FD_ISSET only reads the local sets, with descriptors below FD_SETSIZE.
+        unsafe {
+            if libc::FD_ISSET(cancel, &readable) {
+                return Ok(Ready::Cancelled);
+            }
+            if libc::FD_ISSET(fd, &readable) || libc::FD_ISSET(fd, &writable) {
+                return Ok(Ready::Fd);
+            }
+        }
+        return Ok(Ready::TimedOut);
+    }
+}
+
+/// Wait until child process `pid` has ended, without reaping it: its pid (and so its process
+/// group id) stays reserved until the caller reaps it, so the process group can still be
+/// signalled safely in between.
+pub fn wait_exit_no_reap(pid: u32) -> io::Result<()> {
+    let id = libc::id_t::from(pid);
+    loop {
+        // SAFETY: siginfo_t is plain old data; all zeroes is a valid value.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: waitid writes one siginfo_t into the pointer, valid across the call.
+        let r = unsafe { libc::waitid(libc::P_PID, id, &mut info, libc::WEXITED | libc::WNOWAIT) };
+        if r == 0 {
+            return Ok(());
+        }
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::Interrupted {
+            return Err(e);
+        }
     }
 }
 
@@ -174,25 +411,6 @@ pub fn spawn_detached(command: &mut Command) {
             Ok(())
         });
     }
-}
-
-/// Make the terminal on `fd` a plain byte pipe for a program whose client is not a terminal:
-/// no echo of input and no `\n` to `\r\n` translation of output. Line editing stays on, so
-/// Ctrl-D still means end of input.
-pub fn plain_terminal(fd: &impl AsRawFd) -> io::Result<()> {
-    // SAFETY: termios is plain old data; all zeroes is a valid value.
-    let mut t: libc::termios = unsafe { std::mem::zeroed() };
-    // SAFETY: tcgetattr fills the termios the pointer refers to, valid across the call.
-    if unsafe { libc::tcgetattr(fd.as_raw_fd(), &mut t) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    t.c_lflag &= !(libc::ECHO | libc::ECHOE | libc::ECHOK | libc::ECHONL | libc::ECHOCTL);
-    t.c_oflag &= !libc::ONLCR;
-    // SAFETY: tcsetattr reads the termios the pointer refers to.
-    if unsafe { libc::tcsetattr(fd.as_raw_fd(), libc::TCSANOW, &t) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
 }
 
 /// Signals qsh sends.
@@ -398,8 +616,40 @@ fn udp_dual_stack(port: u16) -> io::Result<std::net::UdpSocket> {
     Ok(socket)
 }
 
+/// The terminal mode of stdin before [`RawMode::enable`], for [`restore_terminal`].
+static SAVED_TERMIOS: std::sync::Mutex<Option<libc::termios>> = std::sync::Mutex::new(None);
+
+/// Put stdin's terminal back into the mode it had before [`RawMode::enable`], if raw mode is on.
+/// For the paths on which [`RawMode`]'s drop never runs: a panic (release builds abort), and
+/// signals that end the process. Safe to call more than once.
+pub fn restore_terminal() {
+    let saved = match SAVED_TERMIOS.try_lock() {
+        Ok(mut guard) => guard.take(),
+        // Poisoned by a panic while it was held: the value is still good
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner().take(),
+        // Held right now by another thread: it is restoring or saving; leave it alone
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    };
+    if let Some(original) = saved {
+        // SAFETY: tcsetattr reads the saved termios the pointer refers to.
+        unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSADRAIN, &original) };
+    }
+}
+
+/// True when the terminal on `fd` echoes input and edits lines (canonical mode): not raw.
+pub fn terminal_is_cooked(fd: &impl AsRawFd) -> Option<bool> {
+    // SAFETY: termios is plain old data; all zeroes is a valid value.
+    let mut t: libc::termios = unsafe { std::mem::zeroed() };
+    // SAFETY: tcgetattr fills the termios the pointer refers to, valid across the call.
+    if unsafe { libc::tcgetattr(fd.as_raw_fd(), &mut t) } != 0 {
+        return None;
+    }
+    Some(t.c_lflag & libc::ICANON != 0 && t.c_lflag & libc::ECHO != 0)
+}
+
 /// The terminal on stdin in raw mode (no echo, no line editing, no signals from keys) for as
-/// long as this value lives; the previous mode comes back when it is dropped.
+/// long as this value lives; the previous mode comes back when it is dropped (and from
+/// [`restore_terminal`], for exits that skip drops).
 #[derive(Debug)]
 pub struct RawMode {
     original: Option<libc::termios>,
@@ -418,8 +668,10 @@ impl RawMode {
         let mut raw = original;
         // SAFETY: cfmakeraw only modifies the termios the pointer refers to.
         unsafe { libc::cfmakeraw(&mut raw) };
+        *SAVED_TERMIOS.lock().unwrap_or_else(|e| e.into_inner()) = Some(original);
         // SAFETY: tcsetattr reads the termios the pointer refers to.
         if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
+            SAVED_TERMIOS.lock().unwrap_or_else(|e| e.into_inner()).take();
             return RawMode { original: None };
         }
         RawMode {
@@ -435,9 +687,8 @@ impl RawMode {
 
 impl Drop for RawMode {
     fn drop(&mut self) {
-        if let Some(original) = &self.original {
-            // SAFETY: tcsetattr reads the saved termios the pointer refers to.
-            unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSADRAIN, original) };
+        if self.original.is_some() {
+            restore_terminal();
         }
     }
 }
@@ -472,6 +723,39 @@ mod tests {
         drop(a);
         assert!(try_lock(&b).unwrap());
         let _ = std::fs::remove_file(dir);
+    }
+
+    #[test]
+    fn cancel_wakes_a_waiting_reader() {
+        let (master, _slave) = openpty(80, 24).unwrap();
+        set_nonblocking(&master).unwrap();
+        let cancel = std::sync::Arc::new(Cancel::new().unwrap());
+        assert_eq!(
+            wait_fd(&master, false, &cancel, Some(std::time::Duration::from_millis(50))).unwrap(),
+            Ready::TimedOut
+        );
+        let c = cancel.clone();
+        let waiter = std::thread::spawn(move || wait_fd(&master, false, &c, None).unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        cancel.cancel();
+        assert_eq!(waiter.join().unwrap(), Ready::Cancelled);
+        assert!(cancel.is_cancelled());
+    }
+
+    #[test]
+    #[allow(clippy::unnecessary_cast)]
+    fn nofile_limit_is_raised_and_given_back_to_programs() {
+        let raised = raise_nofile_limit().unwrap();
+        let original = ORIGINAL_NOFILE.get().unwrap().rlim_cur as u64;
+        assert!(raised >= original);
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "ulimit -n"]).stdout(std::process::Stdio::piped());
+        spawn_with_pipes(&mut cmd);
+        let out = cmd.output().unwrap();
+        let shown = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if original != libc::RLIM_INFINITY as u64 {
+            assert_eq!(shown, original.to_string());
+        }
     }
 
     #[test]

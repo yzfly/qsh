@@ -136,7 +136,21 @@ async fn daemon(paths: Paths, mut launcher: DaemonLauncher, args: DaemonArgs) ->
     if args.on_demand {
         config.idle_exit = Some(ON_DEMAND_IDLE_EXIT);
     }
-    match Daemon::run(config).await {
+    // SIGTERM (service managers) and SIGINT stop the daemon as `qsh-server stop` does: every
+    // session is ended and each attached client gets its final message (protocol.md 7.13)
+    let stop = async {
+        use tokio::signal::unix::{signal, SignalKind};
+        match (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) {
+            (Ok(mut term), Ok(mut int)) => {
+                tokio::select! {
+                    _ = term.recv() => {}
+                    _ = int.recv() => {}
+                }
+            }
+            _ => std::future::pending::<()>().await,
+        }
+    };
+    match Daemon::run_until(config, stop).await {
         Ok(()) => 0,
         Err(StartError::AlreadyRunning) => {
             eprintln!("qsh-server: a daemon is already running for this user");

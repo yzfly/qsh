@@ -185,19 +185,56 @@ impl Drop for World {
     }
 }
 
+/// Every process: (pid, parent pid, state, command line), from `ps`, which Linux and macOS
+/// both have (macOS has no /proc).
+fn process_table() -> Vec<(i32, i32, String, String)> {
+    let Ok(out) = Command::new("ps")
+        .args(["-A", "-o", "pid=,ppid=,stat=,command="])
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.parse().ok()?;
+            let ppid = fields.next()?.parse().ok()?;
+            let stat = fields.next()?.to_string();
+            let command = fields.collect::<Vec<_>>().join(" ");
+            Some((pid, ppid, stat, command))
+        })
+        .collect()
+}
+
+/// The process exists and is not a zombie.
 pub fn alive(pid: i32) -> bool {
-    Path::new(&format!("/proc/{pid}")).exists()
-        && !fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| s.contains(") Z "))
+    let Ok(out) = Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return false;
+    };
+    let stat = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    !stat.is_empty() && !stat.starts_with('Z')
 }
 
 pub fn kill(pid: i32) {
+    signal(pid, "-9");
+}
+
+/// `kill <signal> <pid>`.
+pub fn signal(pid: i32, signal: &str) {
     let _ = Command::new("kill")
-        .args(["-9", &pid.to_string()])
+        .args([signal, &pid.to_string()])
         .stderr(Stdio::null())
         .status();
 }
 
 /// Processes working in `dir` (sessions start in HOME).
+#[cfg(target_os = "linux")]
 pub fn processes_in(dir: &Path) -> Vec<i32> {
     let Ok(entries) = fs::read_dir("/proc") else {
         return Vec::new();
@@ -209,18 +246,39 @@ pub fn processes_in(dir: &Path) -> Vec<i32> {
         .collect()
 }
 
-/// Descendants of `ancestor` whose command line contains `needle`.
-pub fn descendants(ancestor: u32, needle: &str) -> Vec<i32> {
-    let Ok(entries) = fs::read_dir("/proc") else {
+/// Processes working in `dir` (sessions start in HOME), from `lsof` where there is no /proc.
+#[cfg(not(target_os = "linux"))]
+pub fn processes_in(dir: &Path) -> Vec<i32> {
+    let Ok(out) = Command::new("lsof")
+        .args(["-a", "-d", "cwd", "-F", "pn"])
+        .stderr(Stdio::null())
+        .output()
+    else {
         return Vec::new();
     };
-    let parent_of = |pid: i32| -> Option<i32> {
-        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-        stat.rsplit(") ").next()?.split(' ').nth(1)?.parse().ok()
-    };
-    entries
-        .filter_map(|e| e.ok()?.file_name().to_str()?.parse::<i32>().ok())
-        .filter(|pid| {
+    // macOS: /tmp is a link to /private/tmp, and lsof shows the real path
+    let real = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let mut found = Vec::new();
+    let mut pid = None;
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        if let Some(p) = line.strip_prefix('p') {
+            pid = p.parse::<i32>().ok();
+        } else if let Some(name) = line.strip_prefix('n') {
+            if Path::new(name).starts_with(&real) || Path::new(name).starts_with(dir) {
+                found.extend(pid.filter(|p| alive(*p)));
+            }
+        }
+    }
+    found
+}
+
+/// Descendants of `ancestor` whose command line contains `needle`.
+pub fn descendants(ancestor: u32, needle: &str) -> Vec<i32> {
+    let table = process_table();
+    let parent_of = |pid: i32| table.iter().find(|p| p.0 == pid).map(|p| p.1);
+    table
+        .iter()
+        .filter(|(pid, _, stat, command)| {
             let mut p = *pid;
             let mut descends = false;
             while let Some(parent) = parent_of(p).filter(|p| *p > 1) {
@@ -230,10 +288,9 @@ pub fn descendants(ancestor: u32, needle: &str) -> Vec<i32> {
                 }
                 p = parent;
             }
-            let cmdline = fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
-            // Arguments are separated by NUL bytes
-            descends && String::from_utf8_lossy(&cmdline).replace('\0', " ").contains(needle)
+            descends && !stat.starts_with('Z') && command.contains(needle)
         })
+        .map(|p| p.0)
         .collect()
 }
 
@@ -263,6 +320,8 @@ pub struct Tty {
     pub child: Child,
     pub master: fs::File,
     pub out: Arc<Mutex<Vec<u8>>>,
+    /// The terminal itself, to look at its modes.
+    pub slave: fs::File,
 }
 
 impl Tty {
@@ -272,7 +331,7 @@ impl Tty {
         command
             .stdin(slave.try_clone().unwrap())
             .stdout(slave.try_clone().unwrap())
-            .stderr(slave);
+            .stderr(slave.try_clone().unwrap());
         let child = command.spawn().unwrap();
         let master = fs::File::from(master);
         let mut reader = master.try_clone().unwrap();
@@ -287,7 +346,17 @@ impl Tty {
                 sink.lock().unwrap().extend_from_slice(&buf[..n]);
             }
         });
-        Tty { child, master, out }
+        Tty {
+            child,
+            master,
+            out,
+            slave,
+        }
+    }
+
+    /// True when the terminal is in its normal mode (echo, line editing), false in raw mode.
+    pub fn cooked(&self) -> bool {
+        qsh_core::sys::terminal_is_cooked(&self.slave).expect("a terminal")
     }
 
     pub fn text(&self) -> String {

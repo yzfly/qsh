@@ -11,7 +11,10 @@ fn pair() -> (Mux, Mux) {
     let (a, b) = tokio::io::duplex(256 * 1024);
     let (ar, aw) = tokio::io::split(a);
     let (br, bw) = tokio::io::split(b);
-    (Mux::new(Role::Client, ar, aw), Mux::new(Role::Server, br, bw))
+    (
+        Mux::new(Role::Client, ar, aw, None),
+        Mux::new(Role::Server, br, bw, None),
+    )
 }
 
 #[test]
@@ -193,7 +196,7 @@ async fn closing_ends_every_stream() {
 async fn peer_sends(frames: &[Frame]) -> Mux {
     let (a, b) = tokio::io::duplex(1 << 20);
     let (ar, aw) = tokio::io::split(a);
-    let server = Mux::new(Role::Server, ar, aw);
+    let server = Mux::new(Role::Server, ar, aw, None);
     let (_br, mut bw) = tokio::io::split(b);
     let mut out = Vec::new();
     for f in frames {
@@ -228,7 +231,7 @@ async fn protocol_errors_close_the_connection() {
     // The pre-authentication budget
     let (a, b) = tokio::io::duplex(1 << 20);
     let (ar, aw) = tokio::io::split(a);
-    let server = Mux::new(Role::Server, ar, aw);
+    let server = Mux::new(Role::Server, ar, aw, None);
     server.set_byte_budget(Some(100));
     let (_br, mut bw) = tokio::io::split(b);
     let mut out = Vec::new();
@@ -291,4 +294,167 @@ async fn property_interleaved_streams_arrive_intact() {
             w.await.unwrap();
         }
     }
+}
+
+/// Review L6: the pre-authentication budget of a daemon's connection applies from the first byte,
+/// not from whenever the code that serves the connection gets to set it.
+#[tokio::test]
+async fn the_daemon_budget_applies_from_the_first_byte() {
+    let (a, b) = tokio::io::duplex(1 << 20);
+    let (_br, mut bw) = tokio::io::split(b);
+    // Everything is already there when the connection starts
+    let mut out = Vec::new();
+    for _ in 0..2 {
+        Frame::Data {
+            stream: 0,
+            data: vec![0; MAX_DATA],
+        }
+        .encode(&mut out);
+    }
+    bw.write_all(&out).await.unwrap();
+    let (ar, aw) = tokio::io::split(a);
+    let server = crate::transport::Connection::pipe(Role::Server, ar, aw, None, None);
+    tokio::time::timeout(Duration::from_secs(5), server.closed())
+        .await
+        .expect("closed for exceeding MAX_PREAUTH_BYTES");
+    std::mem::forget(bw);
+}
+
+/// Raw frames written by the test's `peer`, and every frame the mux under test sent back.
+async fn frames_from(mux_out: &mut (impl tokio::io::AsyncRead + Unpin), wait: Duration) -> Vec<Frame> {
+    let mut buf = Vec::new();
+    let _ = tokio::time::timeout(wait, async {
+        let mut chunk = [0u8; 4096];
+        loop {
+            match mux_out.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            }
+        }
+    })
+    .await;
+    let mut frames = Vec::new();
+    let mut at = 0;
+    while let Ok(Some((f, n))) = Frame::decode(&buf[at..]) {
+        frames.push(f);
+        at += n;
+    }
+    frames
+}
+
+/// Review L7 / protocol.md 4.3: a client resets the streams a server opens with UNKNOWN_CHANNEL
+/// and keeps nothing of them, so a hostile server cannot make it buffer 128 × 256 KiB.
+#[tokio::test]
+async fn a_client_refuses_streams_the_server_opens() {
+    let (a, b) = tokio::io::duplex(1 << 20);
+    let (ar, aw) = tokio::io::split(a);
+    let client = Mux::new(Role::Client, ar, aw, None);
+    let (mut br, mut bw) = tokio::io::split(b);
+    let mut out = Vec::new();
+    for stream in [1u64, 5, 9] {
+        for _ in 0..4 {
+            Frame::Data {
+                stream,
+                data: vec![7; MAX_DATA],
+            }
+            .encode(&mut out);
+        }
+    }
+    bw.write_all(&out).await.unwrap();
+    let frames = frames_from(&mut br, Duration::from_millis(500)).await;
+    for stream in [1u64, 5, 9] {
+        assert!(
+            frames.contains(&Frame::Reset {
+                stream,
+                code: ErrorCode::UNKNOWN_CHANNEL
+            }),
+            "{frames:?}"
+        );
+    }
+    {
+        let st = client.inner.state.lock().unwrap();
+        assert!(st.streams.is_empty() && st.accept.is_empty(), "{:?}", st.streams.keys());
+    }
+    assert!(!client.is_closed());
+    // The client's own streams still work
+    let (id, _send, _recv) = client.open().await.unwrap();
+    assert_eq!(id, 0);
+    std::mem::forget(bw);
+}
+
+/// Review L7: credit for data nobody reads is given back in one WINDOW, not one per frame, so a
+/// peer that does not read what the mux sends cannot make its queue of frames grow.
+#[tokio::test]
+async fn credit_for_discarded_data_is_coalesced() {
+    // A tiny pipe: the mux's writes block as soon as the peer stops reading
+    let (a, b) = tokio::io::duplex(64);
+    let (ar, aw) = tokio::io::split(a);
+    let server = Mux::new(Role::Server, ar, aw, None);
+    let (_br, mut bw) = tokio::io::split(b);
+    let mut out = Vec::new();
+    Frame::Data {
+        stream: 0,
+        data: vec![1],
+    }
+    .encode(&mut out);
+    bw.write_all(&out).await.unwrap();
+    let (_, send, recv) = server.accept().await.unwrap();
+    drop(recv);
+    let frames = 5000u64;
+    let writer = tokio::spawn(async move {
+        let mut out = Vec::new();
+        for _ in 0..frames {
+            Frame::Data {
+                stream: 0,
+                data: vec![2],
+            }
+            .encode(&mut out);
+        }
+        bw.write_all(&out).await.unwrap();
+        bw
+    });
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let (received, queued) = {
+            let st = server.inner.state.lock().unwrap();
+            (st.conn_recv_total, st.control.len())
+        };
+        if received == frames + 1 {
+            // Before: one queued WINDOW per discarded frame
+            assert_eq!(queued, 0, "{queued} frames queued");
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "received {received}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    drop(send);
+    std::mem::forget(writer.await.unwrap());
+}
+
+/// Review L7: a stream of the peer that the daemon finished and let go of is forgotten even if
+/// the peer never finishes its side.
+#[tokio::test]
+async fn peer_streams_that_never_finish_are_forgotten() {
+    let (client, server) = pair();
+    let (_, mut send, _recv) = client.open().await.unwrap();
+    send.write_all(b"hello").await.unwrap();
+    send.flush().await.unwrap();
+    let (_, mut s_send, mut s_recv) = server.accept().await.unwrap();
+    let mut buf = [0u8; 5];
+    s_recv.read_exact(&mut buf).await.unwrap();
+    s_send.write_all(b"bye").await.unwrap();
+    s_send.shutdown().await.unwrap();
+    drop(s_send);
+    drop(s_recv);
+    // The client keeps its halves and never finishes
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !server.inner.state.lock().unwrap().streams.is_empty() {
+        assert!(tokio::time::Instant::now() < deadline, "the stream is still kept");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // Later data of the client on it is ignored, and the connection goes on
+    send.write_all(b"late").await.unwrap();
+    send.flush().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!server.is_closed());
 }

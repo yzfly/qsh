@@ -8,6 +8,10 @@ use std::collections::VecDeque;
 /// Offsets are positions in the whole stream since the session started. When more than the
 /// capacity is unacknowledged the oldest bytes are dropped: a peer that missed them gets the
 /// rest after a gap.
+///
+/// Offsets never pass 2^64 - 1 (protocol.md 7.1): bytes that would go beyond it are not kept,
+/// so `base + len` always fits in a u64, whatever offset the buffer was started at (a hostile
+/// peer chooses it, for instance with `Input Received` in ATTACHED).
 #[derive(Debug, Clone)]
 pub struct ReplayBuffer {
     buf: VecDeque<u8>,
@@ -37,12 +41,23 @@ impl ReplayBuffer {
 
     /// The offset after the last byte pushed: where the next byte goes.
     pub fn end(&self) -> u64 {
-        self.base + self.buf.len() as u64
+        // Never overflows: push keeps base + len within u64
+        self.base.saturating_add(self.buf.len() as u64)
+    }
+
+    /// How many more bytes the stream can take before its offsets would pass 2^64 - 1.
+    pub fn room(&self) -> u64 {
+        u64::MAX - self.end()
     }
 
     /// The offset of the oldest byte still held.
     pub fn base(&self) -> u64 {
         self.base
+    }
+
+    /// The most bytes held.
+    pub fn capacity(&self) -> usize {
+        self.capacity
     }
 
     /// Bytes held.
@@ -55,8 +70,10 @@ impl ReplayBuffer {
         self.buf.is_empty()
     }
 
-    /// Append bytes to the stream; drops the oldest beyond the capacity.
+    /// Append bytes to the stream; drops the oldest beyond the capacity. Bytes beyond offset
+    /// 2^64 - 1 are not kept (see [`ReplayBuffer::room`]).
     pub fn push(&mut self, bytes: &[u8]) {
+        let bytes = &bytes[..bytes.len().min(usize::try_from(self.room()).unwrap_or(usize::MAX))];
         if bytes.len() >= self.capacity {
             // Only the tail survives: skip copying what would be dropped at once
             let dropped = self.buf.len() as u64 + (bytes.len() - self.capacity) as u64;

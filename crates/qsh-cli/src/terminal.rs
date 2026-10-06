@@ -1,6 +1,6 @@
 //! A session on this process's terminal: raw mode, window size changes, escapes and the
-//! status line; or, when stdin is not a terminal (a script), a plain byte pipe that ends the
-//! remote program's input at end of file.
+//! status line; or, when stdin is not a terminal (a script), a pipe session: stdin, stdout and
+//! stderr carried byte for byte, the program's input closed at end of file, as with ssh.
 
 use std::io::Write as _;
 use std::sync::{Arc, Mutex};
@@ -71,31 +71,22 @@ pub fn status_line(destination: &str, status: &Status) -> String {
 }
 
 /// Read stdin and turn it into session input: through the escape filter on a terminal; as
-/// is otherwise, ending the remote program's input with Ctrl-D at end of file.
+/// is otherwise, with the end of input at end of file.
 async fn read_input(tx: mpsc::Sender<Input>, tty: bool, destination: String, status: Arc<Mutex<Status>>) {
     let mut stdin = tokio::io::stdin();
     let mut buf = vec![0u8; 16384];
     let mut filter = EscapeFilter::new();
-    let mut last: Option<u8> = None;
     loop {
         let n = match stdin.read(&mut buf).await {
             Ok(0) | Err(_) => {
                 if !tty {
-                    // The pty is in line mode: ^D at the start of a line is end of input, and
-                    // a partial line needs one more to be flushed first
-                    let eof = if matches!(last, None | Some(b'\n')) {
-                        vec![4]
-                    } else {
-                        vec![4, 4]
-                    };
-                    let _ = tx.send(Input::Data(eof)).await;
+                    let _ = tx.send(Input::Eof).await;
                 }
                 return;
             }
             Ok(n) => n,
         };
         if !tty {
-            last = Some(buf[n - 1]);
             if tx.send(Input::Data(buf[..n].to_vec())).await.is_err() {
                 return;
             }
@@ -127,6 +118,7 @@ async fn read_input(tx: mpsc::Sender<Input>, tty: bool, destination: String, sta
 /// Run a session described by `config` on this terminal and return the exit status for
 /// `qsh`. `config.tty` and `config.size` are set here from the terminal.
 pub async fn run(mut config: ClientConfig, verbose: bool) -> i32 {
+    restore_on_exit();
     let tty = sys::is_tty(&std::io::stdin());
     config.tty = tty;
     config.interactive = tty || sys::is_tty(&std::io::stderr());
@@ -136,6 +128,7 @@ pub async fn run(mut config: ClientConfig, verbose: bool) -> i32 {
 
     let (input_tx, input) = mpsc::channel::<Input>(256);
     let (output, mut output_rx) = mpsc::channel::<Vec<u8>>(256);
+    let (errors, mut errors_rx) = mpsc::channel::<Vec<u8>>(256);
     let (events_tx, mut events) = mpsc::unbounded_channel::<Event>();
     let session = Session::new(config);
     let status = session.status();
@@ -143,6 +136,8 @@ pub async fn run(mut config: ClientConfig, verbose: bool) -> i32 {
         let terminal = Terminal {
             input,
             output,
+            // A pipe session's stderr goes to ours, as with ssh
+            errors: Some(errors),
             events: Some(events_tx),
         };
         session.run(terminal).await
@@ -151,6 +146,14 @@ pub async fn run(mut config: ClientConfig, verbose: bool) -> i32 {
         let mut stdout = tokio::io::stdout();
         while let Some(bytes) = output_rx.recv().await {
             if stdout.write_all(&bytes).await.is_err() || stdout.flush().await.is_err() {
+                break;
+            }
+        }
+    });
+    let error_writer = tokio::spawn(async move {
+        let mut stderr = tokio::io::stderr();
+        while let Some(bytes) = errors_rx.recv().await {
+            if stderr.write_all(&bytes).await.is_err() || stderr.flush().await.is_err() {
                 break;
             }
         }
@@ -209,8 +212,9 @@ pub async fn run(mut config: ClientConfig, verbose: bool) -> i32 {
             }
         }
     };
-    // The session ended: its output channel closed, let the writer finish
+    // The session ended: its output channels closed, let the writers finish
     let _ = tokio::time::timeout(Duration::from_secs(2), writer).await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), error_writer).await;
     // Let the closing connection's last packets (QUIC CONNECTION_CLOSE) leave
     tokio::time::sleep(Duration::from_millis(50)).await;
     drop(raw);
@@ -238,6 +242,32 @@ pub async fn run(mut config: ClientConfig, verbose: bool) -> i32 {
             eprintln!("qsh: {e}");
             client::EXIT_ERROR
         }
+    }
+}
+
+/// The terminal's mode comes back however qsh ends: a panic (release builds abort, so no drop
+/// runs) or a signal that ends it (SIGTERM, SIGHUP, SIGQUIT, SIGINT). The process then exits
+/// with 128 + the signal, as if it had died of it.
+fn restore_on_exit() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        sys::restore_terminal();
+        previous(info);
+    }));
+    use tokio::signal::unix::{signal, SignalKind};
+    for (kind, number) in [
+        (SignalKind::terminate(), 15),
+        (SignalKind::hangup(), 1),
+        (SignalKind::quit(), 3),
+        (SignalKind::interrupt(), 2),
+    ] {
+        let Ok(mut stream) = signal(kind) else { continue };
+        tokio::spawn(async move {
+            if stream.recv().await.is_some() {
+                sys::restore_terminal();
+                std::process::exit(128 + number);
+            }
+        });
     }
 }
 

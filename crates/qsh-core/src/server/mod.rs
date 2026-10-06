@@ -12,6 +12,7 @@
 //! that is free on both UDP and TCP, so every user of a shared host gets one of their own.
 
 mod control;
+mod gate;
 pub mod pty;
 mod serve;
 mod table;
@@ -33,6 +34,7 @@ use crate::proto::ErrorCode;
 use crate::sys;
 
 pub use control::{bootstrap, connect_or_start, pipe, request_status, request_stop, DaemonLauncher};
+pub use gate::Limits as PreauthLimits;
 pub use table::SessionTable;
 
 /// The default port range of the daemon: the first port free on both UDP and TCP is used.
@@ -65,6 +67,8 @@ pub struct ServerConfig {
     pub shell: Option<PathBuf>,
     /// Output kept per session for clients that come back (at least 1 MiB).
     pub output_replay: usize,
+    /// Limits on unauthenticated connections (protocol.md 6.6).
+    pub preauth: PreauthLimits,
 }
 
 impl ServerConfig {
@@ -78,6 +82,7 @@ impl ServerConfig {
             exited_ttl: EXITED_TTL,
             shell: None,
             output_replay: crate::session::OUTPUT_REPLAY,
+            preauth: PreauthLimits::default(),
         }
     }
 }
@@ -98,6 +103,8 @@ pub(crate) struct Shared {
     pub config: ServerConfig,
     /// Control streams of open connections, for GOAWAY on shutdown.
     pub connections: serve::Registry,
+    /// Admission of unauthenticated connections (protocol.md 6.6).
+    pub gate: Arc<gate::Gate>,
     pub sessions: SessionTable,
     pub port: u16,
     pub fingerprint: Fingerprint,
@@ -152,6 +159,16 @@ impl Daemon {
     /// [`ServerConfig::idle_exit`], until it had no sessions for that long. Must be called
     /// inside a multi-threaded tokio runtime.
     pub async fn run(config: ServerConfig) -> Result<(), StartError> {
+        Daemon::run_until(config, std::future::pending()).await
+    }
+
+    /// [`Daemon::run`], and stop also when `stop` completes (for example on SIGTERM). Stopping
+    /// follows protocol.md 7.13: no new connections or bootstraps, every session hung up, each
+    /// attachment's final EXIT or ERROR (SESSION_ENDED), GOAWAY (SHUTDOWN), then the close.
+    pub async fn run_until(
+        config: ServerConfig,
+        stop: impl std::future::Future<Output = ()> + Send,
+    ) -> Result<(), StartError> {
         let paths = config.paths.clone();
         paths.ensure_runtime()?;
         paths.ensure_state()?;
@@ -168,12 +185,18 @@ impl Daemon {
         let socket = paths.control_socket();
         let _ = std::fs::remove_file(&socket);
 
+        // Section 6.6: the connection limits, not the descriptor table, decide
+        if let Err(e) = sys::raise_nofile_limit() {
+            crate::log::info(format_args!("cannot raise the limit of open files: {e}"));
+        }
         let identity = Identity::load_or_create(&paths.identity_dir())?;
         let (port, udp, tcp) = bind_ports(&config.ports).await?;
         let account = pty::account(&paths.home, config.shell.as_deref());
+        let gate = Arc::new(gate::Gate::new(config.preauth));
         let shared = Arc::new(Shared {
             config,
             connections: serve::Registry::default(),
+            gate,
             sessions: SessionTable::default(),
             port,
             fingerprint: identity.fingerprint(),
@@ -200,19 +223,30 @@ impl Daemon {
             tokio::spawn(control::accept(shared.clone(), control)),
             tokio::spawn(table::collect_garbage(shared.clone())),
         ];
-        shared.shutdown.notified().await;
+        tokio::select! {
+            _ = shared.shutdown.notified() => {}
+            _ = stop => crate::log::info(format_args!("stopping on a signal")),
+        }
+        // 1. No new connections or bootstrap requests
         for task in tasks {
             task.abort();
         }
         let _ = std::fs::remove_file(&socket);
-        // Tell connected clients (GOAWAY SHUTDOWN, section 5.7), end the sessions (attached
-        // clients get EXIT or SESSION_ENDED, 7.13), then close
-        serve::goaway_all(&shared).await;
-        shared.sessions.hang_up_all();
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // 2. Every session hung up at once, so the 2 s waits for the programs overlap
+        let sessions = shared.sessions.hang_up_all();
+        // 3. Each attachment sends its final EXIT or ERROR (SESSION_ENDED) and ends
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while sessions.iter().any(|s| s.attached() > 0) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // 4. GOAWAY (SHUTDOWN) on every connection; 5. close after a moment for delivery
+        serve::goaway_all(&shared);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        serve::close_all(&shared);
         endpoint.close(quinn::VarInt::from_u32(ErrorCode::SHUTDOWN.0 as u32), b"daemon stopped");
         // Give QUIC a moment to send the close to connected clients
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(sessions);
         drop(lock);
         Ok(())
     }

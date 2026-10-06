@@ -38,6 +38,24 @@ use crate::sys;
 /// Version of the control socket requests.
 const CONTROL_VERSION: u64 = 1;
 
+/// Every exchange on the control socket has a deadline: a daemon that hangs (or something
+/// else answering on the socket) must not hang `qsh-server bootstrap`, and with it the client's
+/// ssh, forever.
+#[cfg(not(test))]
+const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Run `f` within [`EXCHANGE_TIMEOUT`], as an io::Error when it takes longer.
+async fn timed<T>(what: &str, f: impl std::future::Future<Output = io::Result<T>>) -> io::Result<T> {
+    tokio::time::timeout(EXCHANGE_TIMEOUT, f).await.map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("{what}: no answer within {EXCHANGE_TIMEOUT:?}"),
+        )
+    })?
+}
+
 pub(crate) async fn accept(shared: Arc<Shared>, listener: UnixListener) {
     loop {
         let stream = match listener.accept().await {
@@ -65,7 +83,7 @@ pub(crate) async fn accept(shared: Arc<Shared>, listener: UnixListener) {
 async fn handle(shared: Arc<Shared>, stream: UnixStream) -> io::Result<()> {
     let (r, mut w) = stream.into_split();
     let mut reader = BufReader::new(r);
-    let line = read_line(&mut reader, MAX_REQUEST + 4096).await?;
+    let line = timed("the request", read_line(&mut reader, MAX_REQUEST + 4096)).await?;
     if line.is_empty() {
         // A liveness check that connected and left
         return Ok(());
@@ -77,7 +95,7 @@ async fn handle(shared: Arc<Shared>, stream: UnixStream) -> io::Result<()> {
                 Ok(r) => bootstrap_op(&shared, &r),
                 Err(e) => error_value(ErrorKind::BadRequest, format!("bad request: {e}")),
             };
-            write_json(&mut w, &reply).await?;
+            timed("the reply", write_json(&mut w, &reply)).await?;
         }
         Some("pipe") => {
             w.write_all(b"ok\n").await?;
@@ -129,15 +147,16 @@ fn bootstrap_op(shared: &Shared, request: &Request) -> Value {
                 term: request.term.clone(),
                 env: request.accepted_env(),
                 name: request.name.clone(),
-                plain: request.tty == Some(false),
+                pipe: request.tty == Some(false),
             };
             let id = SessionId::generate();
             let key = SessionKey::generate();
             match PtySession::start(id, key.clone(), &spawn, &shared.account, shared.config.output_replay) {
                 Ok(session) => {
                     log::debug(format_args!("session {} started", &id.to_hex()[..8]));
+                    let pipe = session.pipe;
                     shared.sessions.insert(session);
-                    credentials(shared, &id, &key)
+                    credentials(shared, &id, &key, pipe)
                 }
                 Err(e) => error_value(ErrorKind::Internal, format!("cannot start the session: {e}")),
             }
@@ -156,7 +175,7 @@ fn bootstrap_op(shared: &Shared, request: &Request) -> Value {
             // The attachment that used the old keys ends (SESSION_TAKEN_OVER)
             session.generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             session.changed.notify_waiters();
-            credentials(shared, &session.id, &key)
+            credentials(shared, &session.id, &key, session.pipe)
         }
         Op::List => {
             let sessions: Vec<SessionInfo> = shared
@@ -170,6 +189,7 @@ fn bootstrap_op(shared: &Shared, request: &Request) -> Value {
                     created: s.started.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
                     attached: s.attached() > 0,
                     exited: s.exit_status().is_some(),
+                    tty: s.pipe.then_some(false),
                 })
                 .collect();
             json!({ "qsh": BOOTSTRAP_VERSION, "sessions": sessions })
@@ -181,7 +201,7 @@ fn bootstrap_op(shared: &Shared, request: &Request) -> Value {
     }
 }
 
-fn credentials(shared: &Shared, id: &SessionId, key: &SessionKey) -> Value {
+fn credentials(shared: &Shared, id: &SessionId, key: &SessionKey, pipe: bool) -> Value {
     serde_json::to_value(Credentials {
         qsh: BOOTSTRAP_VERSION,
         versions: vec![u64::from(crate::proto::VERSION)],
@@ -193,6 +213,7 @@ fn credentials(shared: &Shared, id: &SessionId, key: &SessionKey) -> Value {
         caps: Vec::new(),
         server: format!("qsh-server/{}", env!("CARGO_PKG_VERSION")),
         ssh_addr: None,
+        tty: pipe.then_some(false),
     })
     .unwrap_or(Value::Null)
 }
@@ -231,6 +252,7 @@ fn status(shared: &Shared) -> Value {
             "pipe_connections": load(&stats.pipe_connections),
             "channels": load(&stats.channels),
             "attach_failures": load(&stats.attach_failures),
+            "unauthenticated": shared.gate.pending(),
         },
     })
 }
@@ -293,25 +315,33 @@ impl DaemonLauncher {
 }
 
 /// Connect to the daemon's control socket, starting the daemon with `launcher` if none runs.
+///
+/// The runtime directory is created if missing and checked before every connection, and the
+/// daemon must run as this user ([`Paths::connect_private`]): a socket that someone else could
+/// have put there is never used.
 pub async fn connect_or_start(paths: &Paths, launcher: &DaemonLauncher) -> io::Result<UnixStream> {
     let socket = paths.control_socket();
-    if let Ok(stream) = UnixStream::connect(&socket).await {
+    paths.ensure_runtime()?;
+    if let Some(stream) = paths.connect_private(&socket).await? {
         return Ok(stream);
     }
-    paths.ensure_runtime()?;
     launcher.start(paths)?;
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        match UnixStream::connect(&socket).await {
-            Ok(stream) => return Ok(stream),
-            Err(e) if Instant::now() >= deadline => {
-                return Err(io::Error::new(
-                    e.kind(),
-                    format!("the daemon did not start (see {}): {e}", paths.daemon_log().display()),
-                ))
-            }
-            Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+        if let Some(stream) = paths.connect_private(&socket).await? {
+            return Ok(stream);
         }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "the daemon did not start (see {}): nothing listens on {}",
+                    paths.daemon_log().display(),
+                    socket.display()
+                ),
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -335,8 +365,12 @@ where
             Ok(r) => r,
             Err(e) => {
                 // An unknown op is "unsupported", anything else "bad-request"
+                let known = |op: &str| serde_json::from_value::<Op>(json!(op)).is_ok();
                 let kind = match serde_json::from_slice::<Value>(&line) {
-                    Ok(v) if v["op"].is_string() && v["qsh"].as_u64() == Some(BOOTSTRAP_VERSION) => {
+                    Ok(v)
+                        if v["op"].as_str().is_some_and(|op| !known(op))
+                            && v["qsh"].as_u64() == Some(BOOTSTRAP_VERSION) =>
+                    {
                         ErrorKind::Unsupported
                     }
                     _ => ErrorKind::BadRequest,
@@ -350,12 +384,15 @@ where
         let exchange = async {
             let stream = connect_or_start(paths, launcher).await?;
             let (r, mut w) = stream.into_split();
-            write_json(
-                &mut w,
-                &json!({ "v": CONTROL_VERSION, "op": "bootstrap", "request": request }),
-            )
+            let line = timed("the daemon", async {
+                write_json(
+                    &mut w,
+                    &json!({ "v": CONTROL_VERSION, "op": "bootstrap", "request": request }),
+                )
+                .await?;
+                read_line(&mut BufReader::new(r), 1 << 20).await
+            })
             .await?;
-            let line = read_line(&mut BufReader::new(r), 1 << 20).await?;
             serde_json::from_slice::<Value>(&line).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
         };
         match exchange.await {
@@ -396,9 +433,12 @@ where
     let stream = connect_or_start(paths, launcher).await?;
     let (r, mut w) = stream.into_split();
     let client = std::env::var("SSH_CONNECTION").unwrap_or_default();
-    write_json(&mut w, &json!({ "v": CONTROL_VERSION, "op": "pipe", "client": client })).await?;
     let mut reader = BufReader::new(r);
-    let ok = read_line(&mut reader, 64).await?;
+    let ok = timed("the daemon", async {
+        write_json(&mut w, &json!({ "v": CONTROL_VERSION, "op": "pipe", "client": client })).await?;
+        read_line(&mut reader, 64).await
+    })
+    .await?;
     if ok != b"ok" {
         return Err(io::Error::other("the daemon refused the pipe"));
     }
@@ -428,14 +468,15 @@ where
 }
 
 async fn request(paths: &Paths, op: &str) -> io::Result<Option<Value>> {
-    let Ok(stream) = UnixStream::connect(paths.control_socket()).await else {
+    let Some(stream) = paths.connect_private(&paths.control_socket()).await? else {
         return Ok(None);
     };
     let (r, mut w) = stream.into_split();
-    write_json(&mut w, &json!({ "v": CONTROL_VERSION, "op": op })).await?;
-    let line = tokio::time::timeout(Duration::from_secs(5), read_line(&mut BufReader::new(r), 1 << 20))
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "the daemon does not answer"))??;
+    let line = timed("the daemon", async {
+        write_json(&mut w, &json!({ "v": CONTROL_VERSION, "op": op })).await?;
+        read_line(&mut BufReader::new(r), 1 << 20).await
+    })
+    .await?;
     Ok(Some(
         serde_json::from_slice(&line).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
     ))
@@ -460,4 +501,48 @@ pub async fn request_stop(paths: &Paths) -> io::Result<bool> {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Review M1: a daemon (or anything on its socket) that accepts and never answers made
+    /// `qsh-server bootstrap` hang; every exchange has a deadline now.
+    #[tokio::test]
+    async fn a_daemon_that_never_answers_does_not_hang_the_bootstrap() {
+        let dir = std::env::temp_dir().join(format!("qsh-control-mute-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let paths = Paths::under(&dir);
+        paths.ensure_runtime().unwrap();
+        let listener = UnixListener::bind(paths.control_socket()).unwrap();
+        let mute = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((s, _)) = listener.accept().await {
+                held.push(s);
+            }
+        });
+        let launcher = DaemonLauncher {
+            program: "/bin/false".into(),
+            args: vec![],
+        };
+        let mut out = Vec::new();
+        let request = b"{\"qsh\":1,\"versions\":[1],\"cols\":80,\"rows\":24}\n";
+        let ok = tokio::time::timeout(
+            Duration::from_secs(10),
+            bootstrap(&paths, &launcher, &request[..], &mut out),
+        )
+        .await
+        .expect("no hang")
+        .unwrap();
+        assert!(!ok);
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("\"daemon\"") && text.contains("no answer"), "{text}");
+        let status = tokio::time::timeout(Duration::from_secs(10), request_status(&paths))
+            .await
+            .expect("no hang");
+        assert!(status.is_err());
+        mute.abort();
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

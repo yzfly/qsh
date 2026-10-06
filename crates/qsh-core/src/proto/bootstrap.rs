@@ -70,9 +70,8 @@ pub struct Request {
     /// The client implementation, informative.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client: Option<String>,
-    /// False when the client's input is not a terminal (a script): the session's pty then
-    /// neither echoes input nor turns `\n` into `\r\n` (`new`). Absent means true. An
-    /// extension of qsh-core: servers that do not know it ignore it.
+    /// False: a pipe session (section 7.14), whose program has pipes for stdin, stdout and
+    /// stderr instead of a pseudo-terminal (`new`). Absent or true: a tty session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tty: Option<bool>,
 }
@@ -126,7 +125,13 @@ impl Request {
                 if !self.versions.contains(&u64::from(super::VERSION)) {
                     return Err(ErrorReply::new(ErrorKind::Unsupported, "no common protocol version"));
                 }
-                if !size_ok(self.cols) || !size_ok(self.rows) {
+                // REQUIRED for a new tty session; a pipe session has no terminal (10.3)
+                let sizes_needed = self.op == Op::New && self.tty != Some(false);
+                let size_valid = |v: Option<u64>| v.is_none() || size_ok(v);
+                if (sizes_needed && (!size_ok(self.cols) || !size_ok(self.rows)))
+                    || !size_valid(self.cols)
+                    || !size_valid(self.rows)
+                {
                     return Err(ErrorReply::new(
                         ErrorKind::BadRequest,
                         "cols and rows must be 1 to 65535",
@@ -167,8 +172,9 @@ pub fn accepted_env_name(name: &str) -> bool {
         || (name.starts_with("LC_") && name.len() > 3 && !name.contains('='))
 }
 
-/// The reply to `new` and `attach` (section 10.4). Unknown members are ignored.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// The reply to `new` and `attach` (section 10.4). Unknown members are ignored. The key is
+/// secret: `Debug` does not show it, and it is wiped from memory on drop.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Credentials {
     /// 1.
     pub qsh: u64,
@@ -193,6 +199,41 @@ pub struct Credentials {
     /// The server address of the ssh connection, from `SSH_CONNECTION`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh_addr: Option<String>,
+    /// False for a pipe session (section 7.14); absent or true for a tty session. Authoritative:
+    /// the client uses the pipe-session layouts if and only if this is false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tty: Option<bool>,
+}
+
+impl Credentials {
+    /// True for a pipe session.
+    pub fn pipe(&self) -> bool {
+        self.tty == Some(false)
+    }
+}
+
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credentials")
+            .field("qsh", &self.qsh)
+            .field("versions", &self.versions)
+            .field("session", &self.session)
+            .field("key", &"..")
+            .field("cert_sha256", &self.cert_sha256)
+            .field("udp", &self.udp)
+            .field("tcp", &self.tcp)
+            .field("caps", &self.caps)
+            .field("server", &self.server)
+            .field("ssh_addr", &self.ssh_addr)
+            .field("tty", &self.tty)
+            .finish()
+    }
+}
+
+impl Drop for Credentials {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.key);
+    }
 }
 
 /// One session in the reply to `list`.
@@ -212,6 +253,9 @@ pub struct SessionInfo {
     pub attached: bool,
     /// The program has exited.
     pub exited: bool,
+    /// False for a pipe session; absent for a tty session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tty: Option<bool>,
 }
 
 /// The bootstrap error codes (section 10.4).
@@ -296,6 +340,80 @@ impl std::fmt::Display for ReplyError {
 
 impl std::error::Error for ReplyError {}
 
+/// Longest line of `qsh-server bootstrap`'s stdout a client looks at (section 10.4).
+pub const MAX_REPLY_LINE: usize = 65536;
+
+/// Finds the reply in `qsh-server bootstrap`'s stdout as it arrives, in bounded memory
+/// (section 10.4): the last line, of at most [`MAX_REPLY_LINE`] bytes, that parses as a JSON
+/// object with a member `qsh`. Shell start-up files may print anything around it, of any
+/// length; all of it has to be read (ssh blocks on a full pipe) and none of it kept.
+#[derive(Default)]
+pub struct ReplyScanner {
+    line: Vec<u8>,
+    /// The current line is too long to be the reply: skipped up to its end.
+    skipping: bool,
+    candidate: Vec<u8>,
+}
+
+impl std::fmt::Debug for ReplyScanner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ReplyScanner(..)")
+    }
+}
+
+impl ReplyScanner {
+    /// Take the next bytes of stdout.
+    pub fn feed(&mut self, mut bytes: &[u8]) {
+        while !bytes.is_empty() {
+            let (part, rest, ended) = match bytes.iter().position(|b| *b == b'\n') {
+                Some(i) => (&bytes[..i], &bytes[i + 1..], true),
+                None => (bytes, &[][..], false),
+            };
+            if !self.skipping {
+                if self.line.len() + part.len() > MAX_REPLY_LINE {
+                    self.skipping = true;
+                    zeroize::Zeroize::zeroize(&mut self.line);
+                    self.line.clear();
+                } else {
+                    self.line.extend_from_slice(part);
+                }
+            }
+            if ended {
+                self.end_line();
+            }
+            bytes = rest;
+        }
+    }
+
+    fn end_line(&mut self) {
+        if !self.skipping {
+            let is_reply =
+                serde_json::from_slice::<Value>(&self.line).is_ok_and(|v| v.is_object() && v.get("qsh").is_some());
+            if is_reply {
+                zeroize::Zeroize::zeroize(&mut self.candidate);
+                self.candidate = std::mem::take(&mut self.line);
+            }
+        }
+        zeroize::Zeroize::zeroize(&mut self.line);
+        self.line.clear();
+        self.skipping = false;
+    }
+
+    /// The end of stdout: the reply line found, if any, for [`parse_reply`].
+    pub fn finish(mut self) -> Vec<u8> {
+        self.end_line();
+        std::mem::take(&mut self.candidate)
+    }
+}
+
+impl Drop for ReplyScanner {
+    fn drop(&mut self) {
+        // The reply holds the session key
+        zeroize::Zeroize::zeroize(&mut self.line);
+        zeroize::Zeroize::zeroize(&mut self.candidate);
+    }
+}
+
 /// Find the reply in the bootstrap's stdout: the last line that parses as a JSON object with a
 /// member `qsh` (shell start-up files sometimes print other lines), then check it.
 pub fn parse_reply(output: &[u8], op: Op) -> Result<Reply, ReplyError> {
@@ -358,6 +476,12 @@ mod tests {
         assert!(r.validate().is_ok());
         let r: Request = serde_json::from_str(r#"{"qsh":1,"versions":[1],"cols":0,"rows":24}"#).unwrap();
         assert_eq!(r.validate().unwrap_err().error, ErrorKind::BadRequest);
+        // A pipe session needs no size, a tty session does
+        let r: Request = serde_json::from_str(r#"{"qsh":1,"versions":[1],"tty":false}"#).unwrap();
+        assert!(r.validate().is_ok());
+        let r: Request = serde_json::from_str(r#"{"qsh":1,"versions":[1],"tty":true}"#).unwrap();
+        assert_eq!(r.validate().unwrap_err().error, ErrorKind::BadRequest);
+        assert!(serde_json::from_str::<Request>(r#"{"qsh":1,"versions":[1],"tty":"no"}"#).is_err());
         let r: Request = serde_json::from_str(r#"{"qsh":1,"versions":[2],"cols":1,"rows":1}"#).unwrap();
         assert_eq!(r.validate().unwrap_err().error, ErrorKind::Unsupported);
         let r: Request = serde_json::from_str(r#"{"qsh":2}"#).unwrap();
@@ -371,6 +495,52 @@ mod tests {
         r.env.insert("PATH".into(), "/evil".into());
         r.env.insert("LANGUAGE".into(), "x".repeat(257));
         assert_eq!(r.accepted_env(), vec![("LANG".into(), "C.UTF-8".into())]);
+    }
+
+    /// Review L8: the session key never shows in debug output (logs, panics).
+    #[test]
+    fn credentials_debug_hides_the_key() {
+        let out = br#"{"qsh":1,"versions":[1],"session":"00112233445566778899aabbccddeeff","key":"5ec7e75ec7e75ec7e75ec7e75ec7e75ec7e75ec7e75ec7e75ec7e75ec7e75ec7","cert_sha256":"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f","udp":1,"tcp":1}"#;
+        let reply = parse_reply(out, Op::New).unwrap();
+        let text = format!("{reply:?}");
+        assert!(text.contains("00112233445566778899aabbccddeeff"), "{text}");
+        assert!(!text.contains("5ec7e7"), "{text}");
+        let attached = crate::proto::Message::Attached {
+            input_received: 0,
+            output_start: 0,
+            next_key: crate::crypto::SessionKey([0x5e; 32]),
+            server_proof: [0; 32],
+            error_start: None,
+        };
+        assert!(!format!("{attached:?}").contains("94, 94"), "{attached:?}");
+    }
+
+    /// Section 10.4: any amount of output around the reply, in any chunks, in bounded memory.
+    #[test]
+    fn the_scanner_keeps_only_the_last_reply_line() {
+        let reply = br#"{"qsh":1,"versions":[1],"session":"00112233445566778899aabbccddeeff","key":"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f","cert_sha256":"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f","udp":1,"tcp":1}"#;
+        let mut out = Vec::new();
+        out.extend(std::iter::repeat_n(b'x', 3 << 20));
+        out.extend_from_slice(b"\n{\"qsh\":0}\n");
+        out.extend_from_slice(reply);
+        out.extend_from_slice(b"\nbye\n");
+        out.extend(std::iter::repeat_n(b'{', 100_000));
+        for chunk in [1usize, 7, 4096, 1 << 20] {
+            let mut scanner = ReplyScanner::default();
+            for part in out.chunks(chunk) {
+                scanner.feed(part);
+                assert!(scanner.line.len() <= MAX_REPLY_LINE && scanner.candidate.len() <= MAX_REPLY_LINE);
+            }
+            let line = scanner.finish();
+            assert!(
+                matches!(parse_reply(&line, Op::New), Ok(Reply::Credentials(_))),
+                "{chunk}"
+            );
+        }
+        // Without a final newline
+        let mut scanner = ReplyScanner::default();
+        scanner.feed(reply);
+        assert!(parse_reply(&scanner.finish(), Op::New).is_ok());
     }
 
     #[test]

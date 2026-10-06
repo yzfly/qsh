@@ -14,6 +14,9 @@ pub use replay::ReplayBuffer;
 /// Output the server keeps for a client that comes back: 8 MiB.
 pub const OUTPUT_REPLAY: usize = 8 << 20;
 
+/// Error output (stderr of a pipe session) the server keeps: 1 MiB.
+pub const ERROR_REPLAY: usize = 1 << 20;
+
 /// Input the client keeps until the server acknowledges it: 1 MiB.
 pub const INPUT_REPLAY: usize = 1 << 20;
 

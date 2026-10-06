@@ -174,3 +174,92 @@ fn detach_keeps_the_session_and_hangup_ends_it() {
         true,
     );
 }
+
+/// Review M3: without a terminal, `qsh host cmd` is a pipe session: every byte value, long
+/// lines and control characters arrive exactly, as with ssh.
+#[test]
+fn a_pipe_session_is_byte_exact() {
+    let world = World::new("bytes");
+    let mut data: Vec<u8> = (0..=255u8).cycle().take(256 * 1200).collect();
+    // A 1 MiB line, and what a terminal would have turned into signals and line edits
+    data.extend(std::iter::repeat_n(b'a', 1 << 20));
+    data.extend_from_slice(b"\r\n\x03\x04\x13\x11\x1a\x1c\x7f\n");
+    let mut child = world
+        .qsh(&["srv", "--", "cat"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let input = data.clone();
+    let feeder = std::thread::spawn(move || stdin.write_all(&input).unwrap());
+    let out = child.wait_with_output().unwrap();
+    feeder.join().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.stdout.len(), data.len());
+    assert!(out.stdout == data, "the bytes differ");
+}
+
+/// Pipe sessions keep stderr apart (to qsh's stderr), and deliver the end of input.
+#[test]
+fn a_pipe_session_keeps_stderr_apart_and_ends_input() {
+    let world = World::new("stderr");
+    let out = world
+        .qsh(&["srv", "--", "echo out; echo err >&2; exit 3"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "out\n");
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "err\n");
+    assert_eq!(out.status.code(), Some(3));
+    // printf x | qsh host -- 'cat; echo done >&2'
+    let mut child = world
+        .qsh(&["srv", "--", "cat; echo done >&2"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"x").unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.stdout, b"x");
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "done\n");
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// Review L1: stopping the daemon (`qsh-server stop`, or SIGTERM from a service manager) ends
+/// each session with its exit status at the client, and the client does not start a new daemon
+/// through the ssh pipe afterwards.
+#[test]
+fn stopping_the_daemon_ends_sessions_cleanly_and_for_good() {
+    for how in ["stop", "TERM"] {
+        let world = World::new(&format!("stop-{how}"));
+        let mut tty = Tty::spawn(world.qsh(&["srv", "echo ready; exec sleep 1000"]));
+        tty.wait_for("ready", Duration::from_secs(20));
+        let pid = world.status().unwrap()["pid"].as_u64().unwrap() as i32;
+        if how == "stop" {
+            assert!(world.command(QSH_SERVER, &["stop"]).status().unwrap().success());
+        } else {
+            signal(pid, "-TERM");
+        }
+        // The program got SIGHUP, and its status came back
+        assert_eq!(tty.exit_code(Duration::from_secs(15)), 129, "{how}: {:?}", tty.text());
+        wait_until(Duration::from_secs(5), || !alive(pid), "the daemon to exit", true);
+        // Nothing started a new one
+        std::thread::sleep(Duration::from_secs(1));
+        assert!(world.status().is_none(), "{how}: a daemon was started again");
+    }
+}
+
+/// Review L2: a qsh ended by a signal puts the terminal back into its normal mode.
+#[test]
+fn the_terminal_mode_comes_back_when_qsh_is_killed() {
+    let world = World::new("termios");
+    let mut tty = Tty::spawn(world.qsh(&["srv", "echo ready; exec sleep 1000"]));
+    tty.wait_for("ready", Duration::from_secs(20));
+    assert!(!tty.cooked(), "raw while connected");
+    signal(tty.child.id() as i32, "-TERM");
+    assert_eq!(tty.exit_code(Duration::from_secs(10)), 143);
+    assert!(tty.cooked(), "the terminal was left in raw mode");
+}

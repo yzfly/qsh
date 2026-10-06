@@ -1,8 +1,8 @@
 //! Serving qsh/1 connections on the daemon: the control stream (protocol.md section 5),
-//! authentication (section 6) and terminal channels (section 7), on any transport.
+//! authentication (section 6) and terminal channels (sections 7 and 7.14), on any transport.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -11,7 +11,8 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
-use super::pty::{Keys, PtySession, SessionId};
+use super::gate::Ticket;
+use super::pty::{Keys, PtySession, SessionId, Stream};
 use super::{count, Shared};
 use crate::crypto::{self, SessionKey};
 use crate::log;
@@ -20,85 +21,124 @@ use crate::proto::limits::*;
 use crate::proto::message::{
     canonical_ip, ATTACH_FRESH, LATEST, MAX_ATTACH, MAX_CONTROL, MAX_HELLO, MAX_TERMINAL, PREFERRED_DATA,
 };
-use crate::proto::{read_message, ErrorCode, FramingError, Message, IMPLEMENTATION, VERSION};
+use crate::proto::{read_message, ErrorCode, ExitStatus, FramingError, Message, IMPLEMENTATION, VERSION};
 use crate::transport::{tls, Connection, RecvStream, SendStream, Transport};
 
-/// Output sent but not acknowledged on one attachment, at most (section 7.6).
+/// Output sent but not acknowledged on one attachment, at most, per output stream (7.6).
 const PACING_WINDOW: u64 = 512 * 1024;
-/// Unauthenticated connections the daemon holds at once (section 6.6).
-const MAX_UNAUTHENTICATED: usize = 64;
 /// An authenticated connection that received nothing for this long is gone (clients PING
 /// every 15 s).
 const SILENT_CONNECTION: Duration = Duration::from_secs(90);
+/// How long a hung up session's program has to end before the attachment gets SESSION_ENDED
+/// instead of EXIT (7.11).
+const HANGUP_WAIT: Duration = Duration::from_secs(2);
+/// Output messages sent after a hangup at most; the rest is announced as skipped (7.11).
+const HANGUP_MESSAGES: usize = 64;
 
-/// Open connections, for GOAWAY on shutdown, and the count of unauthenticated ones.
+/// Open connections, for GOAWAY and the close on shutdown.
 #[derive(Debug, Default)]
 pub(crate) struct Registry {
     next: AtomicU64,
     control: Mutex<HashMap<u64, mpsc::UnboundedSender<Control>>>,
-    unauthenticated: AtomicUsize,
 }
 
-/// Tell every connection the daemon stops (GOAWAY SHUTDOWN), then give them a moment.
-pub(crate) async fn goaway_all(shared: &Shared) {
-    let senders: Vec<_> = shared.connections.control.lock().unwrap().values().cloned().collect();
-    for tx in &senders {
-        let _ = tx.send(Control::Close(
-            ErrorCode::SHUTDOWN,
-            "the server is stopping".into(),
-            true,
-        ));
+impl Registry {
+    fn broadcast(&self, command: impl Fn() -> Control) {
+        for tx in self.control.lock().unwrap().values() {
+            let _ = tx.send(command());
+        }
     }
-    if !senders.is_empty() {
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
+}
+
+/// Shutdown, step 4 (7.13): GOAWAY (SHUTDOWN) on every connection.
+pub(crate) fn goaway_all(shared: &Shared) {
+    shared.connections.broadcast(|| {
+        Control::Send(Message::GoAway {
+            code: ErrorCode::SHUTDOWN,
+            message: "the server is stopping".into(),
+        })
+    });
+}
+
+/// Shutdown, step 5: close every connection.
+pub(crate) fn close_all(shared: &Shared) {
+    shared.connections.broadcast(|| Control::Shutdown);
 }
 
 pub(crate) async fn accept_quic(shared: Arc<Shared>, endpoint: quinn::Endpoint) {
     while let Some(incoming) = endpoint.accept().await {
-        if shared.connections.unauthenticated.load(Ordering::SeqCst) >= MAX_UNAUTHENTICATED {
-            incoming.refuse();
+        // Section 6.6 and 9.1: counted from here, before any handshake state exists; while
+        // more than half the places are taken, every new peer proves its address first
+        if shared.gate.crowded() && !incoming.remote_address_validated() {
+            if incoming.may_retry() {
+                let _ = incoming.retry();
+            } else {
+                incoming.refuse();
+            }
             continue;
         }
+        let accepted = Instant::now();
+        let ticket = match shared.gate.admit(Some(incoming.remote_address().ip())) {
+            Ok(ticket) => ticket,
+            Err(_) => {
+                incoming.refuse();
+                continue;
+            }
+        };
         let shared = shared.clone();
         tokio::spawn(async move {
-            let Ok(Ok(connection)) = tokio::time::timeout(HELLO_TIMEOUT, incoming).await else {
+            let Ok(connecting) = incoming.accept() else { return };
+            let Ok(Ok(connection)) = tokio::time::timeout(HELLO_TIMEOUT, connecting).await else {
                 return;
             };
+            if crate::transport::quic::check_alpn(&connection).is_err() {
+                connection.close(quinn::VarInt::from_u32(ErrorCode::PROTOCOL_VIOLATION.0 as u32), b"");
+                return;
+            }
             count(&shared.stats.quic_connections);
-            serve_connection(shared, Connection::quic(connection)).await;
+            serve_connection(shared, Connection::quic_server(connection), Some(ticket), accepted).await;
         });
     }
 }
 
 pub(crate) async fn accept_tls(shared: Arc<Shared>, listener: TcpListener, acceptor: tls::Acceptor) {
     loop {
-        let Ok((tcp, _)) = listener.accept().await else {
+        let Ok((tcp, peer)) = listener.accept().await else {
             // Out of file descriptors and the like: wait instead of spinning
             tokio::time::sleep(Duration::from_millis(100)).await;
             continue;
         };
-        if shared.connections.unauthenticated.load(Ordering::SeqCst) >= MAX_UNAUTHENTICATED {
+        let accepted = Instant::now();
+        // Refused: closed at once, before any TLS (6.6)
+        let Ok(ticket) = shared.gate.admit(Some(peer.ip())) else {
+            drop(tcp);
             continue;
-        }
+        };
         let shared = shared.clone();
         let acceptor = acceptor.clone();
         tokio::spawn(async move {
-            if let Ok(stream) = acceptor.accept(tcp).await {
+            let handshake = tokio::time::timeout(HELLO_TIMEOUT, acceptor.accept(tcp)).await;
+            if let Ok(Ok(stream)) = handshake {
                 count(&shared.stats.tls_connections);
-                serve_connection(shared, Connection::tls_server(stream)).await;
+                serve_connection(shared, Connection::tls_server(stream), Some(ticket), accepted).await;
             }
         });
     }
 }
 
-/// The ssh pipe: a connection over the control socket, after `ok`.
+/// The ssh pipe: a connection over the control socket, after `ok`. It counts towards the
+/// daemon's unauthenticated connections, but has no network source (6.6).
 pub(crate) async fn pipe_connection<R, W>(shared: Arc<Shared>, reader: R, writer: W, client: Option<SocketAddr>)
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    serve_connection(shared, Connection::pipe(Role::Server, reader, writer, client, None)).await;
+    let accepted = Instant::now();
+    let Ok(ticket) = shared.gate.admit(None) else {
+        return;
+    };
+    let connection = Connection::pipe(Role::Server, reader, writer, client, None);
+    serve_connection(shared, connection, Some(ticket), accepted).await;
 }
 
 /// Commands for a connection's control stream writer.
@@ -106,8 +146,12 @@ where
 enum Control {
     /// Send a message.
     Send(Message),
-    /// Send ERROR (or GOAWAY when the flag is set) with the code, then close the connection.
-    Close(ErrorCode, String, bool),
+    /// Send ERROR with the code, then close the connection.
+    Close(ErrorCode, String),
+    /// Send GOAWAY with the code, then close the connection (IDLE).
+    GoAwayClose(ErrorCode),
+    /// Close the connection (SHUTDOWN), after GOAWAY was sent.
+    Shutdown,
 }
 
 /// What the tasks of one connection share.
@@ -117,16 +161,21 @@ struct Conn {
     control: mpsc::UnboundedSender<Control>,
     nonce: [u8; 32],
     established: Instant,
+    /// The connection's place among the unauthenticated ones, until it authenticates.
+    ticket: Mutex<Option<Ticket>>,
     authenticated: AtomicBool,
     /// Attachments on this connection right now.
     attachments: AtomicUsize,
+    /// Failed ATTACHes (AUTH_FAILED) on this connection.
     failures: AtomicUsize,
     last_rx: Mutex<Instant>,
+    /// The peer's address, for the failure limit per source (none for the ssh pipe).
+    source: Option<IpAddr>,
 }
 
 impl Conn {
     fn close(&self, code: ErrorCode, why: &str) {
-        let _ = self.control.send(Control::Close(code, why.to_string(), false));
+        let _ = self.control.send(Control::Close(code, why.to_string()));
     }
 
     fn received(&self) {
@@ -135,24 +184,18 @@ impl Conn {
 
     fn authenticate(&self) {
         if !self.authenticated.swap(true, Ordering::SeqCst) {
-            self.shared.connections.unauthenticated.fetch_sub(1, Ordering::SeqCst);
-            // Lift the pre-authentication limits (section 6.6, 9.1)
+            // Its place goes to others, and the pre-authentication limits are lifted (6.6, 9.1)
+            self.ticket.lock().unwrap().take();
             self.connection.set_preauth_limit(None);
         }
     }
 }
 
-async fn serve_connection(shared: Arc<Shared>, connection: Connection) {
-    let registry = &shared.connections;
-    registry.unauthenticated.fetch_add(1, Ordering::SeqCst);
-    if connection.transport() != Transport::Quic {
-        // Over QUIC the small connection receive window does this (crypto::quic_server)
-        connection.set_preauth_limit(Some(MAX_PREAUTH_BYTES));
-    }
+async fn serve_connection(shared: Arc<Shared>, connection: Connection, ticket: Option<Ticket>, accepted: Instant) {
     let transport = connection.transport();
 
-    // The control stream: stream 0, CLIENT_HELLO first
-    let hello = tokio::time::timeout(HELLO_TIMEOUT, async {
+    // The control stream: stream 0, CLIENT_HELLO first, within HELLO_TIMEOUT of acceptance
+    let hello = tokio::time::timeout(HELLO_TIMEOUT.saturating_sub(accepted.elapsed()), async {
         let (id, send, recv) = connection.accept().await.ok_or(ErrorCode::NO_ERROR)?;
         if id != 0 {
             return Err(ErrorCode::PROTOCOL_VIOLATION);
@@ -169,12 +212,10 @@ async fn serve_connection(shared: Arc<Shared>, connection: Connection) {
     let (mut ctl_send, ctl_recv, versions) = match hello {
         Ok(Ok(h)) => h,
         Ok(Err(code)) => {
-            registry.unauthenticated.fetch_sub(1, Ordering::SeqCst);
             connection.close(code, "");
             return;
         }
         Err(_) => {
-            registry.unauthenticated.fetch_sub(1, Ordering::SeqCst);
             connection.close(ErrorCode::TIMEOUT, "no hello");
             return;
         }
@@ -189,7 +230,6 @@ async fn serve_connection(shared: Arc<Shared>, connection: Connection) {
             }],
         )
         .await;
-        registry.unauthenticated.fetch_sub(1, Ordering::SeqCst);
         connection.close(ErrorCode::UNSUPPORTED_VERSION, "");
         return;
     }
@@ -207,10 +247,10 @@ async fn serve_connection(shared: Arc<Shared>, connection: Connection) {
         path_info(0, remote),
     ];
     if write(&mut ctl_send, &first).await.is_err() {
-        registry.unauthenticated.fetch_sub(1, Ordering::SeqCst);
         return;
     }
 
+    let registry = &shared.connections;
     let (control_tx, control_rx) = mpsc::unbounded_channel();
     let key = registry.next.fetch_add(1, Ordering::Relaxed);
     registry.control.lock().unwrap().insert(key, control_tx.clone());
@@ -220,10 +260,12 @@ async fn serve_connection(shared: Arc<Shared>, connection: Connection) {
         control: control_tx,
         nonce,
         established,
+        ticket: Mutex::new(ticket),
         authenticated: AtomicBool::new(false),
         attachments: AtomicUsize::new(0),
         failures: AtomicUsize::new(0),
         last_rx: Mutex::new(Instant::now()),
+        source: (transport != Transport::Ssh).then(|| remote.map(|a| a.ip())).flatten(),
     });
     log::debug(format_args!("{transport} connection from {remote:?}"));
 
@@ -237,9 +279,7 @@ async fn serve_connection(shared: Arc<Shared>, connection: Connection) {
     }
     writer.abort();
     registry.control.lock().unwrap().remove(&key);
-    if !conn.authenticated.load(Ordering::SeqCst) {
-        registry.unauthenticated.fetch_sub(1, Ordering::SeqCst);
-    }
+    conn.ticket.lock().unwrap().take();
     log::debug(format_args!("{transport} connection from {remote:?} closed"));
 }
 
@@ -263,29 +303,29 @@ async fn write<W: AsyncWrite + Unpin>(w: &mut W, messages: &[Message]) -> std::i
 
 async fn control_writer(conn: Arc<Conn>, mut send: SendStream, mut rx: mpsc::UnboundedReceiver<Control>) {
     while let Some(command) = rx.recv().await {
-        match command {
+        let (code, why, last) = match command {
             Control::Send(m) => {
                 if write(&mut send, &[m]).await.is_err() {
                     break;
                 }
+                continue;
             }
-            Control::Close(code, why, goaway) => {
-                let m = if goaway {
-                    Message::GoAway {
-                        code,
-                        message: why.clone(),
-                    }
-                } else {
-                    Message::Error {
-                        code,
-                        message: why.clone(),
-                    }
-                };
-                let _ = tokio::time::timeout(Duration::from_secs(1), write(&mut send, &[m])).await;
-                conn.connection.close(code, &why);
-                break;
-            }
+            Control::Close(code, why) => (code, why.clone(), Some(Message::Error { code, message: why })),
+            Control::GoAwayClose(code) => (
+                code,
+                String::new(),
+                Some(Message::GoAway {
+                    code,
+                    message: String::new(),
+                }),
+            ),
+            Control::Shutdown => (ErrorCode::SHUTDOWN, "the server is stopping".to_string(), None),
+        };
+        if let Some(m) = last {
+            let _ = tokio::time::timeout(Duration::from_secs(1), write(&mut send, &[m])).await;
         }
+        conn.connection.close(code, &why);
+        break;
     }
 }
 
@@ -349,7 +389,7 @@ async fn watchdog(conn: Arc<Conn>, mut remote: Option<SocketAddr>) {
         if conn.attachments.load(Ordering::SeqCst) > 0 {
             idle_since = Instant::now();
         } else if idle_since.elapsed() > IDLE_CONNECTION {
-            let _ = conn.control.send(Control::Close(ErrorCode::IDLE, String::new(), true));
+            let _ = conn.control.send(Control::GoAwayClose(ErrorCode::IDLE));
             return;
         }
         if conn.last_rx.lock().unwrap().elapsed() > SILENT_CONNECTION && conn.connection.transport() != Transport::Quic
@@ -381,6 +421,38 @@ async fn stream_error(send: &mut SendStream, code: ErrorCode, why: &str) {
     let _ = send.shutdown().await;
 }
 
+/// Where an attachment starts.
+struct Attachment {
+    generation: u64,
+    /// Output start offset.
+    start: u64,
+    /// Error output start offset (pipe sessions).
+    error_start: u64,
+    /// The input offset the next INPUT must have.
+    next_input: u64,
+    /// Make the program redraw (LATEST).
+    redraw: bool,
+}
+
+/// Where a stream starts on a new attachment (7.3 step 1, 7.14.5): `received`, or the end for
+/// LATEST; past the end is a SEQUENCE_ERROR. A pipe session never skips: below its `base`
+/// starts at `base` for a FRESH client, and is a SEQUENCE_ERROR otherwise.
+fn start_offset(session: &PtySession, stream: Stream, received: u64, fresh: bool) -> Result<u64, ErrorCode> {
+    let buffer = session.buffer(stream).lock().unwrap();
+    let start = if received == LATEST { buffer.end() } else { received };
+    if start > buffer.end() {
+        return Err(ErrorCode::SEQUENCE_ERROR);
+    }
+    if session.pipe && start < buffer.base() {
+        return if fresh {
+            Ok(buffer.base())
+        } else {
+            Err(ErrorCode::SEQUENCE_ERROR)
+        };
+    }
+    Ok(start)
+}
+
 /// One channel stream: ATTACH first, then the terminal channel.
 async fn channel(conn: Arc<Conn>, id: u64, mut send: SendStream, recv: RecvStream) {
     let mut recv = BufReader::new(recv);
@@ -406,6 +478,7 @@ async fn channel(conn: Arc<Conn>, id: u64, mut send: SendStream, recv: RecvStrea
         output_received,
         size,
         flags,
+        error_received,
     } = first
     else {
         if !conn.authenticated.load(Ordering::SeqCst) {
@@ -419,9 +492,10 @@ async fn channel(conn: Arc<Conn>, id: u64, mut send: SendStream, recv: RecvStrea
         return stream_error(&mut send, code, "").await;
     };
 
-    // Sections 6.4, 6.5 and 7.3, atomic with respect to other attaches of the session
+    // Sections 6.4, 6.5, 7.3 and 7.14.5, atomic with respect to other attaches of the session
     let shared = conn.shared.clone();
     let session = shared.sessions.get(&SessionId(session_id)).filter(|s| !s.is_removed());
+    let fresh = flags & ATTACH_FRESH != 0;
     let attach = session.as_ref().ok_or(ErrorCode::SESSION_UNKNOWN).and_then(|s| {
         let cb = conn
             .connection
@@ -436,15 +510,17 @@ async fn channel(conn: Arc<Conn>, id: u64, mut send: SendStream, recv: RecvStrea
         } else {
             return Err(ErrorCode::AUTH_FAILED);
         };
-        let end = s.output.lock().unwrap().end();
-        let start = if output_received == LATEST && flags & ATTACH_FRESH != 0 {
-            end
-        } else {
-            output_received
+        // Before the key is rotated: offsets the session cannot serve
+        let error_received = match (s.pipe, error_received) {
+            (true, None) => return Err(ErrorCode::FRAME_ERROR),
+            (_, e) => e.unwrap_or(0),
         };
-        if start > end {
-            return Err(ErrorCode::SEQUENCE_ERROR);
-        }
+        let start = start_offset(s, Stream::Output, output_received, fresh)?;
+        let error_start = if s.pipe {
+            start_offset(s, Stream::Error, error_received, fresh)?
+        } else {
+            0
+        };
         if pending_ok {
             // The client got the pending key last time, though its KEY_CONFIRM was lost
             keys.current = matched.clone();
@@ -455,26 +531,42 @@ async fn channel(conn: Arc<Conn>, id: u64, mut send: SendStream, recv: RecvStrea
         // `received` value is taken (it checks the generation under the same lock)
         let input = s.input_received.lock().unwrap();
         let generation = s.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        let input_received = input.received();
+        let input_received = input.inbound.received();
         drop(input);
         s.changed.notify_waiters();
         let attached = Message::Attached {
             input_received,
             output_start: start,
-            next_key: next.0,
+            next_key: next,
             server_proof: matched.server_proof(&cb),
+            error_start: s.pipe.then_some(error_start),
         };
-        Ok((attached, generation, start, input_received))
+        Ok((
+            attached,
+            Attachment {
+                generation,
+                start,
+                error_start,
+                next_input: input_received,
+                redraw: output_received == LATEST,
+            },
+        ))
     });
-    let (attached, generation, start, input_received) = match attach {
+    let (attached, attachment) = match attach {
         Ok(a) => a,
         Err(code) => {
             count(&shared.stats.attach_failures);
-            let failures = conn.failures.fetch_add(1, Ordering::SeqCst) + 1;
-            // Slow down guessing (6.4)
+            // Slow down guessing (6.4); this holds back only this stream
             tokio::time::sleep(FAILURE_DELAY).await;
-            if failures >= MAX_ATTACH_FAILURES {
-                return conn.close(ErrorCode::LIMIT_EXCEEDED, "too many failed attaches");
+            if code == ErrorCode::AUTH_FAILED {
+                // Only a wrong proof is a failed ATTACH (6.4, 6.6)
+                if let Some(source) = conn.source {
+                    shared.gate.failed(source);
+                }
+                let failures = conn.failures.fetch_add(1, Ordering::SeqCst) + 1;
+                if failures >= MAX_ATTACH_FAILURES && conn.attachments.load(Ordering::SeqCst) == 0 {
+                    return conn.close(ErrorCode::LIMIT_EXCEEDED, "too many failed attaches");
+                }
             }
             return stream_error(&mut send, code, "").await;
         }
@@ -488,13 +580,6 @@ async fn channel(conn: Arc<Conn>, id: u64, mut send: SendStream, recv: RecvStrea
         &SessionId(session_id).to_hex()[..8],
         conn.connection.transport()
     ));
-    let redraw = output_received == LATEST;
-    let attachment = Attachment {
-        generation,
-        start,
-        next_input: input_received,
-        redraw,
-    };
     let outcome = terminal(&conn, &session, attachment, attached, size, &mut send, recv).await;
     conn.attachments.fetch_sub(1, Ordering::SeqCst);
     match outcome {
@@ -514,17 +599,6 @@ async fn channel(conn: Arc<Conn>, id: u64, mut send: SendStream, recv: RecvStrea
     let _ = id;
 }
 
-/// Where an attachment starts.
-struct Attachment {
-    generation: u64,
-    /// Output start offset.
-    start: u64,
-    /// The input offset the next INPUT must have.
-    next_input: u64,
-    /// Make the program redraw (LATEST).
-    redraw: bool,
-}
-
 /// How an attachment ended.
 enum Outcome {
     /// Finish the stream; the session keeps running.
@@ -534,6 +608,87 @@ enum Outcome {
     /// The session is over: finish the stream (after ERROR with the code, if any) and remove
     /// the session.
     Remove(Option<ErrorCode>),
+}
+
+/// One output stream of an attachment (7.5, 7.6).
+struct Out {
+    stream: Stream,
+    /// `sent_end`: just after the last byte sent or skipped.
+    sent: u64,
+    /// The highest acknowledgement accepted on this attachment.
+    last_ack: u64,
+    /// The `To` of the latest OUTPUT_GAP: skipped bytes are not in flight.
+    gap_to: u64,
+}
+
+impl Out {
+    fn new(stream: Stream, start: u64) -> Out {
+        Out {
+            stream,
+            sent: start,
+            last_ack: start,
+            gap_to: start,
+        }
+    }
+
+    fn in_flight(&self) -> u64 {
+        self.sent - self.last_ack.max(self.gap_to)
+    }
+
+    /// An acknowledgement of this stream (7.5): beyond what was sent is a SEQUENCE_ERROR, below
+    /// the last one is stale and ignored.
+    fn ack(&mut self, session: &PtySession, received: u64) -> Result<(), ErrorCode> {
+        if received > self.sent {
+            return Err(ErrorCode::SEQUENCE_ERROR);
+        }
+        if received > self.last_ack {
+            self.last_ack = received;
+            session.ack(self.stream, received);
+        }
+        Ok(())
+    }
+
+    fn message(&self, offset: u64, data: Vec<u8>) -> Message {
+        match self.stream {
+            Stream::Output => Message::Output { offset, data },
+            Stream::Error => Message::ErrorOutput { offset, data },
+        }
+    }
+
+    /// Up to `max` bytes of output from where this stream is, as messages: OUTPUT_GAP first if
+    /// they fell out of the replay buffer. None when there is nothing to send; otherwise
+    /// whether there was a gap.
+    fn next(&mut self, session: &PtySession, max: usize, batch: &mut Vec<Message>) -> Option<bool> {
+        let (start, bytes) = session.buffer(self.stream).lock().unwrap().read_from(self.sent, max);
+        if bytes.is_empty() {
+            return None;
+        }
+        let gap = start > self.sent;
+        if gap {
+            // The client missed output that fell out of the replay buffer (7.7; tty sessions
+            // only, a pipe session never drops unacknowledged output)
+            batch.push(Message::OutputGap {
+                from: self.sent,
+                to: start,
+            });
+            self.gap_to = start;
+        }
+        self.sent = start + bytes.len() as u64;
+        batch.push(self.message(start, bytes));
+        Some(gap)
+    }
+
+    fn end(&self, session: &PtySession) -> u64 {
+        session.buffer(self.stream).lock().unwrap().end()
+    }
+}
+
+fn exit_message(session: &PtySession, outs: &[Out], status: ExitStatus) -> Message {
+    Message::Exit {
+        output_end: outs[0].sent,
+        status,
+        error_end: session.pipe.then(|| outs[1].sent),
+    }
 }
 
 async fn terminal(
@@ -548,21 +703,27 @@ async fn terminal(
     let Attachment {
         generation,
         start,
+        error_start,
         mut next_input,
         redraw,
     } = attachment;
     if write(send, &[attached]).await.is_err() {
         return Outcome::Finished;
     }
-    session.resize(size.cols, size.rows);
-    session.output.lock().unwrap().ack(start);
+    let pipe = session.pipe;
+    if !pipe {
+        session.resize(size.cols, size.rows);
+    }
+    session.ack(Stream::Output, start);
+    let mut outs = vec![Out::new(Stream::Output, start)];
+    if pipe {
+        session.ack(Stream::Error, error_start);
+        outs.push(Out::new(Stream::Error, error_start));
+    }
     if redraw {
         session.redraw();
     }
-    let mut sent = start;
-    let mut client_acked = start;
     let mut exit_sent = false;
-    let mut confirmed = false;
 
     // Messages are read by a task so that a partly read message is never lost to select!
     let (tx, mut rx) = mpsc::channel::<Result<Message, FramingError>>(64);
@@ -592,39 +753,28 @@ async fn terminal(
         let changed = session.changed.notified();
         tokio::pin!(changed);
         changed.as_mut().enable();
-        if session.is_removed() && session.exit_status().is_none() {
-            return Outcome::Error(ErrorCode::SESSION_ENDED);
+        if session.is_removed() && !exit_sent {
+            // Hung up by `qsh kill`, a TTL or the daemon stopping (7.11)
+            return ending(session, &mut outs, send).await;
         }
 
-        // Output, paced: at most PACING_WINDOW unacknowledged on the way (7.6)
+        // Output, paced: at most PACING_WINDOW in flight per stream (7.6)
         let mut batch = Vec::new();
         let mut redraw = false;
-        while !exit_sent && sent - client_acked < PACING_WINDOW {
-            let room = (PACING_WINDOW - (sent - client_acked)) as usize;
-            let (start, bytes) = session.output.lock().unwrap().read_from(sent, room.min(PREFERRED_DATA));
-            if bytes.is_empty() {
-                break;
-            }
-            if start > sent {
-                // The client missed output that fell out of the replay buffer (7.7)
-                batch.push(Message::OutputGap { from: sent, to: start });
-                client_acked = client_acked.max(start);
-                redraw = true;
-            }
-            sent = start + bytes.len() as u64;
-            batch.push(Message::Output {
-                offset: start,
-                data: bytes,
-            });
-        }
         if !exit_sent {
+            for out in outs.iter_mut() {
+                while out.in_flight() < PACING_WINDOW {
+                    let room = (PACING_WINDOW - out.in_flight()) as usize;
+                    match out.next(session, room.min(PREFERRED_DATA), &mut batch) {
+                        Some(gap) => redraw |= gap,
+                        None => break,
+                    }
+                }
+            }
             if let Some(status) = session.exit_status() {
-                let end = session.output.lock().unwrap().end();
-                if sent == end {
-                    batch.push(Message::Exit {
-                        output_end: end,
-                        status,
-                    });
+                // EXIT comes after all output (7.10)
+                if outs.iter().all(|o| o.sent == o.end(session)) {
+                    batch.push(exit_message(session, &outs, status));
                     exit_sent = true;
                 }
             }
@@ -652,8 +802,8 @@ async fn terminal(
                 None => {
                     // The stream ended without DETACH or HANGUP: like DETACH. After EXIT and the
                     // final ACK, the session is over.
-                    let end = session.output.lock().unwrap().end();
-                    return if exit_sent && client_acked == end {
+                    let all_acked = outs.iter().all(|o| o.last_ack == o.end(session));
+                    return if exit_sent && all_acked {
                         Outcome::Remove(None)
                     } else {
                         Outcome::Finished
@@ -680,46 +830,96 @@ async fn terminal(
                         }
                         tokio::time::sleep(Duration::from_millis(20)).await;
                     }
-                    let mut inbound = session.input_received.lock().unwrap();
+                    let mut input = session.input_received.lock().unwrap();
                     // Taken over meanwhile: input not yet accepted is dropped, the client resends
                     if session.current_generation() != generation {
                         return Outcome::Error(ErrorCode::SESSION_TAKEN_OVER);
                     }
-                    match inbound.accept(offset, &data) {
+                    // INPUT after the input was closed (7.14.4)
+                    if input.eof.is_some() {
+                        return Outcome::Error(ErrorCode::SEQUENCE_ERROR);
+                    }
+                    match input.inbound.accept(offset, &data) {
                         crate::session::Accepted::New(bytes) => session.write_input(bytes.to_vec()),
                         _ => return Outcome::Error(ErrorCode::SEQUENCE_ERROR),
                     }
-                    next_input = inbound.received();
+                    next_input = input.inbound.received();
                     input_arrived = true;
                 }
-                Message::Ack { received } => {
-                    if received < client_acked || received > sent {
-                        return Outcome::Error(ErrorCode::SEQUENCE_ERROR);
+                Message::InputEof { offset } => {
+                    if !pipe {
+                        return Outcome::Error(ErrorCode::PROTOCOL_VIOLATION);
                     }
-                    client_acked = received;
-                    session.output.lock().unwrap().ack(received);
-                }
-                Message::Resize(size) => session.resize(size.cols, size.rows),
-                Message::KeyConfirm => {
-                    if !confirmed {
-                        confirmed = true;
-                        let mut keys = session.keys.lock().unwrap();
-                        if let Some(pending) = keys.pending.take() {
-                            *keys = Keys {
-                                current: pending,
-                                pending: None,
-                            };
+                    let mut input = session.input_received.lock().unwrap();
+                    if session.current_generation() != generation {
+                        return Outcome::Error(ErrorCode::SESSION_TAKEN_OVER);
+                    }
+                    match input.eof {
+                        // Repeated after a reconnect: ignored
+                        Some(at) if at == offset => {}
+                        Some(_) => return Outcome::Error(ErrorCode::SEQUENCE_ERROR),
+                        None if offset != input.inbound.received() => return Outcome::Error(ErrorCode::SEQUENCE_ERROR),
+                        None => {
+                            input.eof = Some(offset);
+                            session.close_input();
                         }
+                    }
+                }
+                Message::Ack {
+                    received,
+                    error_received,
+                } => {
+                    if let Err(code) = outs[0].ack(session, received) {
+                        return Outcome::Error(code);
+                    }
+                    if pipe {
+                        // The appended field is required on a pipe session (7.14.2)
+                        let Some(error_received) = error_received else {
+                            return Outcome::Error(ErrorCode::FRAME_ERROR);
+                        };
+                        if let Err(code) = outs[1].ack(session, error_received) {
+                            return Outcome::Error(code);
+                        }
+                    }
+                }
+                // A pipe session has no terminal: RESIZE is ignored (7.14.5)
+                Message::Resize(size) => {
+                    if !pipe {
+                        session.resize(size.cols, size.rows)
+                    }
+                }
+                Message::KeyConfirm { key_id } => {
+                    // Promote the pending key only if this is the key the client confirms,
+                    // on the session's current attachment (6.5); anything else is ignored
+                    let mut keys = session.keys.lock().unwrap();
+                    let current = session.current_generation() == generation;
+                    let matches = keys
+                        .pending
+                        .as_ref()
+                        .is_some_and(|pending| crypto::constant_time_eq(&pending.id(), &key_id));
+                    if current && matches {
+                        let pending = keys.pending.take().expect("checked");
+                        *keys = Keys {
+                            current: pending,
+                            pending: None,
+                        };
                     }
                 }
                 Message::Detach => {
                     // All input before it was processed: acknowledge it and finish (7.11)
-                    let _ = write(send, &[Message::Ack { received: next_input }]).await;
+                    let _ = write(
+                        send,
+                        &[Message::Ack {
+                            received: next_input,
+                            error_received: None,
+                        }],
+                    )
+                    .await;
                     return Outcome::Finished;
                 }
                 Message::Hangup => {
                     session.hang_up();
-                    return hang_up(session, sent, send).await;
+                    return ending(session, &mut outs, send).await;
                 }
                 Message::Error { .. } => return Outcome::Finished,
                 Message::Unknown { .. } => {}
@@ -730,50 +930,69 @@ async fn terminal(
                 Err(_) => break,
             }
         }
-        if input_arrived && write(send, &[Message::Ack { received: next_input }]).await.is_err() {
+        if input_arrived
+            && write(
+                send,
+                &[Message::Ack {
+                    received: next_input,
+                    error_received: None,
+                }],
+            )
+            .await
+            .is_err()
+        {
             return Outcome::Finished;
         }
     }
 }
 
-/// After HANGUP: send the remaining output and EXIT if the program ends within 2 s, then
-/// remove the session (7.11).
-async fn hang_up(session: &Arc<PtySession>, mut sent: u64, send: &mut SendStream) -> Outcome {
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while session.exit_status().is_none() && Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(50)).await;
+/// The end of an attachment of a hung up session (7.11, steps 2 and 3): wait up to 2 s for the
+/// program to end; then exactly one final message: EXIT after the remaining output, or ERROR
+/// (SESSION_ENDED). Remaining output beyond [`HANGUP_MESSAGES`] messages is not sent: on a tty
+/// session it is announced with OUTPUT_GAP before EXIT, on a pipe session (which never skips)
+/// the attachment ends with SESSION_ENDED instead.
+async fn ending(session: &Arc<PtySession>, outs: &mut [Out], send: &mut SendStream) -> Outcome {
+    let deadline = tokio::time::Instant::now() + HANGUP_WAIT;
+    while session.exit_status().is_none() && tokio::time::Instant::now() < deadline {
+        let changed = session.changed.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        if session.exit_status().is_some() {
+            break;
+        }
+        let _ = tokio::time::timeout_at(deadline, changed).await;
     }
-    // Not ended within 2 s: SESSION_ENDED without an exit status (7.11)
     let Some(status) = session.exit_status() else {
         return Outcome::Remove(Some(ErrorCode::SESSION_ENDED));
     };
     let mut batch = Vec::new();
-    loop {
-        let (start, bytes) = session.output.lock().unwrap().read_from(sent, PREFERRED_DATA);
-        if bytes.is_empty() {
-            break;
-        }
-        if start > sent {
-            batch.push(Message::OutputGap { from: sent, to: start });
-        }
-        sent = start + bytes.len() as u64;
-        batch.push(Message::Output {
-            offset: start,
-            data: bytes,
-        });
-        if batch.len() > 64 {
-            // A lot of output is not worth waiting for after a hangup
-            break;
+    for out in outs.iter_mut() {
+        while batch.len() < HANGUP_MESSAGES {
+            if out.next(session, PREFERRED_DATA, &mut batch).is_none() {
+                break;
+            }
         }
     }
-    if session.output.lock().unwrap().end() == sent {
-        batch.push(Message::Exit {
-            output_end: sent,
-            status,
-        });
+    let complete = outs.iter().all(|o| o.sent == o.end(session));
+    let mut outcome = Outcome::Remove(None);
+    if !complete {
+        if session.pipe {
+            outcome = Outcome::Remove(Some(ErrorCode::SESSION_ENDED));
+        } else {
+            let out = &mut outs[0];
+            let end = out.end(session);
+            batch.push(Message::OutputGap {
+                from: out.sent,
+                to: end,
+            });
+            out.sent = end;
+        }
+    }
+    if matches!(outcome, Outcome::Remove(None)) {
+        batch.push(exit_message(session, outs, status));
     }
     let _ = tokio::time::timeout(Duration::from_secs(2), write(send, &batch)).await;
-    Outcome::Remove(None)
+    outcome
 }
 
 struct AbortOnDrop(tokio::task::JoinHandle<()>);

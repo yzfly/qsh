@@ -28,7 +28,7 @@ _qsh() {
 '--help[Print help (see more with '\''--help'\'')]' \
 '-V[Print version]' \
 '--version[Print version]' \
-':destination -- \[user@\]host, or a host alias from ~/.ssh/config:_default' \
+':destination -- `\[user@\]host`, or a host alias from ~/.ssh/config:_default' \
 '*::command -- Command to run instead of a login shell:_default' \
 && ret=0
 }

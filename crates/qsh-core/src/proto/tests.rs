@@ -59,12 +59,14 @@ fn samples() -> Vec<Message> {
                 height_px: 480,
             },
             flags: ATTACH_ACCEPT_SNAPSHOT,
+            error_received: None,
         },
         Message::Attached {
             input_received: 5,
             output_start: 7,
-            next_key: [3; 32],
+            next_key: crate::crypto::SessionKey([3; 32]),
             server_proof: [4; 32],
+            error_start: None,
         },
         Message::Attach {
             session: [1; 16],
@@ -72,8 +74,9 @@ fn samples() -> Vec<Message> {
             output_received: LATEST,
             size: WindowSize::new(1, 1),
             flags: ATTACH_FRESH,
+            error_received: None,
         },
-        Message::KeyConfirm,
+        Message::KeyConfirm { key_id: [5; 8] },
         Message::Input {
             offset: 0,
             data: b"ls\r".to_vec(),
@@ -82,7 +85,10 @@ fn samples() -> Vec<Message> {
             offset: u64::MAX - 2,
             data: b"ab".to_vec(),
         },
-        Message::Ack { received: 12345 },
+        Message::Ack {
+            received: 12345,
+            error_received: None,
+        },
         Message::OutputGap { from: 1, to: 9 },
         Message::Resize(WindowSize::new(120, 40)),
         Message::Snapshot {
@@ -95,6 +101,7 @@ fn samples() -> Vec<Message> {
         Message::Exit {
             output_end: 77,
             status: ExitStatus::Exited(3),
+            error_end: None,
         },
         Message::Exit {
             output_end: 0,
@@ -102,6 +109,48 @@ fn samples() -> Vec<Message> {
                 signal: "TERM".into(),
                 core_dumped: true,
             },
+            error_end: None,
+        },
+        // Pipe sessions (7.14)
+        Message::Attach {
+            session: [1; 16],
+            proof: [2; 32],
+            output_received: 10,
+            size: WindowSize::default(),
+            flags: 0,
+            error_received: Some(20),
+        },
+        Message::Attach {
+            session: [1; 16],
+            proof: [2; 32],
+            output_received: 0,
+            size: WindowSize::default(),
+            flags: ATTACH_FRESH,
+            error_received: Some(LATEST),
+        },
+        Message::Attached {
+            input_received: 5,
+            output_start: 7,
+            next_key: crate::crypto::SessionKey([3; 32]),
+            server_proof: [4; 32],
+            error_start: Some(9),
+        },
+        Message::Ack {
+            received: 1,
+            error_received: Some(2),
+        },
+        Message::Exit {
+            output_end: 8192,
+            status: ExitStatus::Signaled {
+                signal: "PIPE".into(),
+                core_dumped: false,
+            },
+            error_end: Some(105),
+        },
+        Message::InputEof { offset: 300 },
+        Message::ErrorOutput {
+            offset: 100,
+            data: b"oops\n".to_vec(),
         },
         Message::Detach,
         Message::Hangup,
@@ -133,9 +182,19 @@ fn every_message_round_trips() {
 #[test]
 fn trailing_bytes_are_ignored_for_fixed_layouts() {
     // 3.3: a later revision may append fields
-    let mut p = Message::Ack { received: 4 }.payload();
+    let mut p = Message::Ack {
+        received: 4,
+        error_received: None,
+    }
+    .payload();
     p.extend_from_slice(b"future");
-    assert_eq!(Message::decode(types::ACK, &p).unwrap(), Message::Ack { received: 4 });
+    assert_eq!(
+        Message::decode(types::ACK, &p).unwrap(),
+        Message::Ack {
+            received: 4,
+            error_received: None,
+        }
+    );
     // but data… takes everything
     let mut p = Message::Input {
         offset: 0,
@@ -194,16 +253,32 @@ fn malformed_payloads_are_frame_errors() {
         output_received: LATEST,
         size: WindowSize::new(1, 1),
         flags: ATTACH_FRESH,
+        error_received: None,
     }
     .payload();
     *p.last_mut().unwrap() = 0;
     assert!(Message::decode(types::ATTACH, &p).is_err());
     // Address family
     assert!(Message::decode(types::PATH_INFO, &[0, 5, 0, 0]).is_err());
+    // KEY_CONFIRM without its key id; LATEST stderr without FRESH
+    assert!(Message::decode(types::KEY_CONFIRM, &[0; 7]).is_err());
+    let mut p = Message::Attach {
+        session: [0; 16],
+        proof: [0; 32],
+        output_received: 0,
+        size: WindowSize::new(1, 1),
+        flags: 0,
+        error_received: Some(LATEST),
+    }
+    .payload();
+    assert!(Message::decode(types::ATTACH, &p).is_err());
+    p.truncate(p.len() - 8);
+    assert!(Message::decode(types::ATTACH, &p).is_ok());
     // Exit kind
     let mut p = Message::Exit {
         output_end: 0,
         status: ExitStatus::Exited(0),
+        error_end: None,
     }
     .payload();
     p[8] = 2;
@@ -235,6 +310,7 @@ fn appendix_a_encodings() {
         output_received: 4096,
         size: WindowSize::new(120, 40),
         flags: 0,
+        error_received: None,
     };
     let expected = "10404100112233445566778899aabbccddeeff0c95bd8bdd96004ec3f84f7bcc9526ee33491925dae778d32b6b81a42c38fe930000000000001000007800280000000000";
     assert_eq!(crate::crypto::hex(&attach.encode()), expected);
@@ -321,7 +397,11 @@ async fn reading_from_a_stream() {
     }
     assert!(read_message(&mut r, MAX_TERMINAL).await.unwrap().is_none());
     // Truncated inside a message
-    let one = Message::Ack { received: 1 }.encode();
+    let one = Message::Ack {
+        received: 1,
+        error_received: None,
+    }
+    .encode();
     let mut r = &one[..one.len() - 1];
     assert!(matches!(
         read_message(&mut r, MAX_TERMINAL).await,
@@ -338,4 +418,122 @@ async fn reading_from_a_stream() {
         read_message(&mut r, MAX_ATTACH).await,
         Err(FramingError::TooLarge)
     ));
+}
+
+/// What `fuzz/fuzz_targets/message.rs` checks: any type and payload decodes without a panic, and
+/// whatever decodes encodes back to something that decodes the same.
+fn fuzz_message(data: &[u8]) {
+    if let Some((&ty, payload)) = data.split_first() {
+        if let Ok(m) = Message::decode(u64::from(ty), payload) {
+            if !matches!(m, Message::Unknown { .. }) {
+                let again = decode_from(&m.encode(), usize::MAX).expect("re-encoded message decodes");
+                assert_eq!(again.map(|(m, _)| m), Some(m));
+            }
+        }
+    }
+    let _ = decode_from(data, MAX_TERMINAL);
+}
+
+/// The first CI fuzz crash (crash-9a296c96…): an EXIT whose signal name is 17 bytes of invalid
+/// UTF-8. Replacing each bad byte with U+FFFD (3 bytes) made the name longer than its 32-byte
+/// maximum, so it was cut on re-encoding and decoded differently.
+#[test]
+fn fuzz_crash_exit_with_an_invalid_signal_name() {
+    let crash: &[u8] = &[
+        0x19, 0x01, 0xff, 0xff, 0xf7, 0x00, 0x11, 0xff, 0xff, 0x01, 0x7a, 0xff, 0x19, 0x01, 0xff, 0x11, 0xff, 0xff,
+        0x01, 0x7a, 0xff, 0xff, 0x28, 0xff, 0x03, 0x00, 0xff, 0xff, 0x28, 0xff, 0x28, 0xff, 0x03, 0x00, 0xff, 0xff,
+        0x28, 0xff,
+    ];
+    assert_eq!(crash.len(), 38);
+    // A signal name is read by programs: invalid UTF-8 is malformed
+    assert!(Message::decode(types::EXIT, &crash[1..]).is_err());
+    fuzz_message(crash);
+}
+
+#[test]
+fn texts_with_invalid_utf8_decode_to_what_they_encode_to() {
+    // ERROR with 256 bytes of 0xff: 256 replacement characters are 768 bytes, cut to 256
+    let mut payload = Vec::new();
+    varint::encode(ErrorCode::INTERNAL_ERROR.0, &mut payload);
+    varint::encode(256, &mut payload);
+    payload.extend([0xff; 256]);
+    let m = Message::decode(types::ERROR, &payload).unwrap();
+    let Message::Error { message, .. } = &m else {
+        panic!("{m:?}")
+    };
+    assert!(message.len() <= MAX_MESSAGE_LEN && message.starts_with('\u{fffd}'));
+    let mut data = vec![types::ERROR as u8];
+    data.extend(&payload);
+    fuzz_message(&data);
+    // An IPv4-mapped IPv6 address in PATH_INFO decodes as the IPv4 address it is sent as
+    let mut payload = vec![0, 6];
+    payload.extend("::ffff:192.0.2.7".parse::<std::net::Ipv6Addr>().unwrap().octets());
+    payload.extend([0, 1]);
+    let mut data = vec![types::PATH_INFO as u8];
+    data.extend(&payload);
+    fuzz_message(&data);
+}
+
+/// protocol.md A.6 and A.7: KEY_CONFIRM, and a pipe session's appended fields.
+#[test]
+fn appendix_a_pipe_session_encodings() {
+    let k2 = crate::crypto::SessionKey::from_hex("202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f")
+        .unwrap();
+    let confirm = Message::KeyConfirm { key_id: k2.id() };
+    assert_eq!(crate::crypto::hex(&confirm.encode()), "120872dbb7336c767800");
+    let session = crate::crypto::unhex("00112233445566778899aabbccddeeff").unwrap();
+    let proof = crate::crypto::unhex("0c95bd8bdd96004ec3f84f7bcc9526ee33491925dae778d32b6b81a42c38fe93").unwrap();
+    let attach = Message::Attach {
+        session,
+        proof,
+        output_received: 4096,
+        size: WindowSize::default(),
+        flags: 0,
+        error_received: Some(100),
+    };
+    let hex = crate::crypto::hex(&attach.encode());
+    assert!(hex.starts_with("104049"), "{hex}");
+    assert!(
+        hex.ends_with("00000000000010000000000000000000000000000000000064"),
+        "{hex}"
+    );
+    assert_eq!(attach.encode().len(), 3 + 73);
+    let server_proof =
+        crate::crypto::unhex("8ff9d481ebe0f5683b3e82707d8172e8bf8392b92d556fb9272ceecf814a2606").unwrap();
+    let attached = Message::Attached {
+        input_received: 250,
+        output_start: 4096,
+        next_key: k2,
+        server_proof,
+        error_start: Some(100),
+    };
+    let hex = crate::crypto::hex(&attached.encode());
+    assert!(hex.starts_with("114058"), "{hex}");
+    assert!(hex.ends_with("0000000000000064"), "{hex}");
+    let eo = Message::ErrorOutput {
+        offset: 100,
+        data: b"oops\n".to_vec(),
+    };
+    assert_eq!(crate::crypto::hex(&eo.encode()), "1e0d00000000000000646f6f70730a");
+    assert_eq!(
+        crate::crypto::hex(&Message::InputEof { offset: 300 }.encode()),
+        "1d08000000000000012c"
+    );
+    let exit = Message::Exit {
+        output_end: 8192,
+        status: ExitStatus::Exited(0),
+        error_end: Some(105),
+    };
+    assert_eq!(
+        crate::crypto::hex(&exit.encode()),
+        "19170000000000002000000000000000000000000000000069"
+    );
+    let ack = Message::Ack {
+        received: 8192,
+        error_received: Some(105),
+    };
+    assert_eq!(
+        crate::crypto::hex(&ack.encode()),
+        "151000000000000020000000000000000069"
+    );
 }

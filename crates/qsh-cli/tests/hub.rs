@@ -56,6 +56,7 @@ fn open(paths: &Paths, world: &World, command: &str) -> Term {
     let paths = paths.clone();
     let exit = tokio::spawn(async move {
         let terminal = Terminal {
+            errors: None,
             input: input_rx,
             output: output_tx,
             events: None,
