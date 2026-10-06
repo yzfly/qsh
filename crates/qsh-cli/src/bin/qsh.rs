@@ -87,6 +87,10 @@ fn config_for(destination: &str, ssh: &SshArgs) -> Result<(ClientConfig, Termina
     }
     config.race = host.race();
     config.replay_on_attach = host.replay_on_attach;
+    config.keepalive = host.keepalive;
+    config.path_memory = host.path_memory;
+    config.catchup = host.catchup;
+    config.compression = host.compression;
     config.term = std::env::var("TERM").ok().filter(|t| !t.is_empty());
     config.env = std::env::vars()
         .filter(|(k, _)| accepted_env_name(k))

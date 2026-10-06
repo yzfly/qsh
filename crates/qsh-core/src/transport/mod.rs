@@ -504,6 +504,9 @@ pub struct Target {
     pub fingerprint: crypto::Fingerprint,
     /// ssh, for the pipe.
     pub ssh: ssh::SshCommand,
+    /// Further ports of the daemon, as the bootstrap reply announced them (protocol.md 10.4,
+    /// m2.md section 5). Not raced yet.
+    pub extra_ports: Vec<crate::proto::bootstrap::ExtraPort>,
 }
 
 /// Which transports to try, and when each starts (section 12.1).

@@ -89,8 +89,14 @@ pub const ATTACH_ACCEPT_SNAPSHOT: u64 = 0x1;
 pub const ATTACH_FRESH: u64 = 0x2;
 /// `Output Received` of a FRESH ATTACH that starts at the current end of the output.
 pub const LATEST: u64 = u64::MAX;
-/// SNAPSHOT flag: the last part of a snapshot.
+/// SNAPSHOT flag: the last part of a snapshot (7.8.3).
 pub const SNAPSHOT_FINAL: u8 = 0x1;
+/// SNAPSHOT flag: `Data` is one zstd frame, subject to the rules of OUTPUT_ZSTD (7.8.3, 7.12;
+/// only when `zstd` was negotiated).
+pub const SNAPSHOT_ZSTD: u8 = 0x2;
+/// The most snapshot data of one snapshot (all its messages), after decompression
+/// (`MAX_SNAPSHOT`, 7.8.3).
+pub const MAX_SNAPSHOT: usize = 1 << 20;
 /// EXIT flag: the program dumped core.
 pub const EXIT_CORE_DUMPED: u8 = 0x1;
 
@@ -257,13 +263,14 @@ pub enum Message {
     Snapshot {
         /// The output offset the screen corresponds to.
         offset: u64,
-        /// [`SNAPSHOT_FINAL`].
+        /// [`SNAPSHOT_FINAL`], [`SNAPSHOT_ZSTD`]; undefined bits are ignored.
         flags: u8,
         /// Columns.
         cols: u16,
         /// Rows.
         rows: u16,
-        /// Terminal bytes that redraw the screen.
+        /// Terminal bytes that redraw the screen (7.8.4), or one zstd frame of them with
+        /// [`SNAPSHOT_ZSTD`] (check it with [`super::zstd::check_frame`]).
         data: Vec<u8>,
     },
     /// 7.10
@@ -295,7 +302,7 @@ pub enum Message {
     OutputZstd {
         /// Offset of the first decompressed byte.
         offset: u64,
-        /// One zstd frame.
+        /// One zstd frame (check it with [`super::zstd::check_frame`] before decompressing).
         frame: Vec<u8>,
     },
     /// A type this implementation does not know: skipped on extensible channels (3.4).

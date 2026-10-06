@@ -57,6 +57,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "zstd_frame"
+path = "fuzz_targets/zstd_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "netwatch"
 path = "fuzz_targets/netwatch.rs"
 test = false

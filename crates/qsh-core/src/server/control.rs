@@ -212,6 +212,8 @@ fn credentials(shared: &Shared, id: &SessionId, key: &SessionKey, pipe: bool) ->
         server: format!("qsh-server/{}", env!("CARGO_PKG_VERSION")),
         ssh_addr: None,
         tty: pipe.then_some(false),
+        // Extra ports are announced once the daemon binds them (m2.md section 5, WP-4)
+        extra_ports: Vec::new(),
     })
     .unwrap_or(Value::Null)
 }

@@ -26,6 +26,31 @@ use crate::proto::ExitStatus;
 use crate::session::{Inbound, ReplayBuffer};
 use crate::sys;
 
+/// Receives a session's output as it enters the output replay buffer (m2.md 6.2): the hook
+/// through which the daemon's screen model is fed (work package WP-2), so that the model's state
+/// at offset `E` is available whenever the buffer's end is `E`.
+///
+/// [`OutputSink::output`] is called on the session's reader thread **while the output buffer's
+/// lock is held** ([`PtySession::output`]), with exactly the bytes appended, in order. It must
+/// be quick and must not lock the output buffer itself or block on anything that may wait for
+/// it. Code that needs the model and the buffer consistent (a snapshot at `end`) locks the
+/// buffer first, then whatever the sink shares with it: always in that order.
+pub trait OutputSink: Send {
+    /// `bytes` were appended to the output stream at `offset` (the buffer's end is now
+    /// `offset + bytes.len()`). Output that fell out of the buffer before the sink was set is
+    /// never seen; see [`PtySession::set_output_sink`].
+    fn output(&mut self, offset: u64, bytes: &[u8]);
+}
+
+/// The installed [`OutputSink`], if any.
+struct SinkSlot(Option<Box<dyn OutputSink>>);
+
+impl std::fmt::Debug for SinkSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() { "Some(OutputSink)" } else { "None" })
+    }
+}
+
 /// A session id: 16 random bytes.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct SessionId(pub [u8; 16]);
@@ -137,6 +162,8 @@ pub struct PtySession {
     pub output: Mutex<ReplayBuffer>,
     /// A pipe session's stderr, kept until acknowledged (empty on a tty session).
     pub errors: Mutex<ReplayBuffer>,
+    /// Fed with the output as it enters [`PtySession::output`], under its lock.
+    sink: Mutex<SinkSlot>,
     /// Woken when acknowledgements make room in a pipe session's buffers.
     room: Condvar,
     /// Input received from clients, and its end.
@@ -268,6 +295,7 @@ impl PtySession {
             input_queued: Arc::new(AtomicUsize::new(0)),
             output: Mutex::new(ReplayBuffer::new(replay_capacity)),
             errors: Mutex::new(ReplayBuffer::new(if spawn.pipe { error_capacity } else { 0 })),
+            sink: Mutex::new(SinkSlot(None)),
             room: Condvar::new(),
             input_received: Mutex::new(InputState::default()),
             changed: Notify::new(),
@@ -351,6 +379,24 @@ impl PtySession {
                 }
             })?;
         Ok(session)
+    }
+
+    /// Install `sink` for the output stream (or remove it with None), and return the output
+    /// offset from which it sees everything. Under the output buffer's lock, it is first given
+    /// what the buffer holds (from its `base`), so that a sink installed right after
+    /// [`PtySession::start`] misses nothing the program wrote meanwhile; then every new chunk.
+    pub fn set_output_sink(&self, sink: Option<Box<dyn OutputSink>>) -> u64 {
+        let buffer = self.output.lock().unwrap();
+        let mut slot = self.sink.lock().unwrap();
+        slot.0 = sink;
+        let base = buffer.base();
+        if let Some(sink) = slot.0.as_mut() {
+            let (offset, held) = buffer.read_from(base, usize::MAX);
+            if !held.is_empty() {
+                sink.output(offset, &held);
+            }
+        }
+        base
     }
 
     /// The replay buffer of `stream`.
@@ -559,7 +605,17 @@ fn read_output(mut fd: &File, stream: Stream, bounded: bool, weak: &Weak<PtySess
             Ok(0) => return,
             Ok(n) => {
                 let Some(s) = weak.upgrade() else { return };
-                s.buffer(stream).lock().unwrap().push(&buf[..n]);
+                {
+                    let mut buffer = s.buffer(stream).lock().unwrap();
+                    let offset = buffer.end();
+                    buffer.push(&buf[..n]);
+                    if stream == Stream::Output {
+                        // Under the buffer's lock (m2.md 6.2)
+                        if let Some(sink) = s.sink.lock().unwrap().0.as_mut() {
+                            sink.output(offset, &buf[..n]);
+                        }
+                    }
+                }
                 s.changed.notify_waiters();
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => match sys::wait_fd(fd, false, cancel, None) {
@@ -709,6 +765,39 @@ mod tests {
             ..Default::default()
         };
         PtySession::start(SessionId::generate(), SessionKey::generate(), &spawn, &sh(), 1 << 20).unwrap()
+    }
+
+    /// The output hook (m2.md 6.2): a sink installed after the start gets what the buffer
+    /// holds, then every chunk, contiguous and in order, exactly the buffer's bytes.
+    #[tokio::test]
+    async fn an_output_sink_sees_exactly_the_buffered_output() {
+        type Chunks = Arc<Mutex<Vec<(u64, Vec<u8>)>>>;
+        struct Collect(Chunks);
+        impl OutputSink for Collect {
+            fn output(&mut self, offset: u64, bytes: &[u8]) {
+                self.0.lock().unwrap().push((offset, bytes.to_vec()));
+            }
+        }
+        let s = start("echo one; read x; echo two-$x; exit 3", false);
+        wait_output(&s, "one").await;
+        let chunks = Arc::new(Mutex::new(Vec::new()));
+        assert_eq!(s.set_output_sink(Some(Box::new(Collect(chunks.clone())))), 0);
+        assert!(!chunks.lock().unwrap().is_empty(), "the buffered output first");
+        s.write_input(b"x\n".to_vec());
+        wait_output(&s, "two-x").await;
+        assert_eq!(wait_exit(&s).await, ExitStatus::Exited(3));
+        // The buffer's lock first, as the reader thread takes them
+        let buffer = s.output.lock().unwrap();
+        let buffered = buffer.read_from(0, usize::MAX).1;
+        let mut seen = Vec::new();
+        for (offset, bytes) in chunks.lock().unwrap().iter() {
+            assert_eq!(*offset, seen.len() as u64, "contiguous");
+            seen.extend_from_slice(bytes);
+        }
+        assert_eq!(String::from_utf8_lossy(&seen), String::from_utf8_lossy(&buffered));
+        drop(buffer);
+        // Removed: no more calls
+        assert_eq!(s.set_output_sink(None), 0);
     }
 
     #[tokio::test]

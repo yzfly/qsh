@@ -21,6 +21,9 @@ pub const MAX_SHORT_STRING: usize = 64;
 /// Longest accepted `env` value.
 pub const MAX_ENV_VALUE: usize = 256;
 
+/// Most extra ports in a reply (`extra_ports`, sections 10.4 and 12.6).
+pub const MAX_EXTRA_PORTS: usize = 8;
+
 /// The bootstrap operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -223,6 +226,61 @@ pub struct Credentials {
     /// the client uses the pipe-session layouts if and only if this is false.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tty: Option<bool>,
+    /// Further ports of the same daemon (sections 10.4 and 12.6), in announced order. Read
+    /// leniently: invalid entries, entries beyond the eighth and a member that is not an array
+    /// are ignored, never an error. Not sent when empty, so old clients see no difference.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "extra_ports_lenient"
+    )]
+    pub extra_ports: Vec<ExtraPort>,
+}
+
+/// A further port of the daemon, from the bootstrap reply member `extra_ports` (section 10.4):
+/// `{"port": N, "udp": bool, "tcp": bool}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ExtraPort {
+    /// The port number, 1 to 65535.
+    pub port: u16,
+    /// The daemon listens for QUIC on it.
+    pub udp: bool,
+    /// The daemon listens for TLS on it.
+    pub tcp: bool,
+}
+
+impl ExtraPort {
+    /// One entry of `extra_ports`, if it is valid: an object whose `port` is 1 to 65535, whose
+    /// `udp` and `tcp` are booleans (an absent one is false), at least one of them true.
+    pub fn from_json(value: &Value) -> Option<ExtraPort> {
+        let object = value.as_object()?;
+        let port = u16::try_from(object.get("port")?.as_u64()?).ok().filter(|p| *p != 0)?;
+        let flag = |name: &str| match object.get(name) {
+            None => Some(false),
+            Some(v) => v.as_bool(),
+        };
+        let (udp, tcp) = (flag("udp")?, flag("tcp")?);
+        (udp || tcp).then_some(ExtraPort { port, udp, tcp })
+    }
+
+    /// The valid entries among the first [`MAX_EXTRA_PORTS`] of `extra_ports`; nothing when
+    /// it is not an array.
+    pub fn list_from_json(value: &Value) -> Vec<ExtraPort> {
+        value
+            .as_array()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .take(MAX_EXTRA_PORTS)
+                    .filter_map(ExtraPort::from_json)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+fn extra_ports_lenient<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<ExtraPort>, D::Error> {
+    Ok(ExtraPort::list_from_json(&Value::deserialize(d)?))
 }
 
 impl Credentials {
@@ -246,6 +304,7 @@ impl std::fmt::Debug for Credentials {
             .field("server", &self.server)
             .field("ssh_addr", &self.ssh_addr)
             .field("tty", &self.tty)
+            .field("extra_ports", &self.extra_ports)
             .finish()
     }
 }
@@ -575,6 +634,81 @@ mod tests {
         let mut scanner = ReplyScanner::default();
         scanner.feed(reply);
         assert!(parse_reply(&scanner.finish(), Op::New).is_ok());
+    }
+
+    /// Section 10.4: `extra_ports` is read leniently and written only when there are some.
+    #[test]
+    fn extra_ports_in_the_reply() {
+        let reply = |extra: &str| {
+            format!(
+                r#"{{"qsh":1,"versions":[1],"session":"{}","key":"{}","cert_sha256":"{}","udp":60443,"tcp":60443{extra}}}"#,
+                "ab".repeat(16),
+                "cd".repeat(32),
+                "ef".repeat(32)
+            )
+        };
+        let credentials = |extra: &str| match parse_reply(reply(extra).as_bytes(), Op::New) {
+            Ok(Reply::Credentials(c)) => c,
+            other => panic!("{extra}: {other:?}"),
+        };
+        // protocol.md 10.4, the example
+        let c = credentials(r#","extra_ports":[{"port":443,"udp":true,"tcp":false}],"caps":["snapshot","zstd"]"#);
+        assert_eq!(
+            c.extra_ports,
+            vec![ExtraPort {
+                port: 443,
+                udp: true,
+                tcp: false
+            }]
+        );
+        assert!(credentials("").extra_ports.is_empty());
+        // Invalid entries are skipped, never an error; only the first eight entries count
+        let c = credentials(concat!(
+            r#","extra_ports":[{"port":0,"udp":true},{"port":70000,"udp":true},"#,
+            r#"{"port":1,"udp":false,"tcp":false},{"port":2,"udp":"yes"},"x",null,{"udp":true},"#,
+            r#"{"port":61443,"tcp":true},{"port":3,"udp":true}]"#
+        ));
+        assert_eq!(
+            c.extra_ports,
+            vec![ExtraPort {
+                port: 61443,
+                udp: false,
+                tcp: true
+            }]
+        );
+        for not_a_list in [
+            r#","extra_ports":7"#,
+            r#","extra_ports":{"port":443}"#,
+            r#","extra_ports":null"#,
+        ] {
+            assert!(credentials(not_a_list).extra_ports.is_empty(), "{not_a_list}");
+        }
+        // Written as the protocol says, and not at all when empty (old clients see nothing new)
+        let mut c = credentials("");
+        assert!(!serde_json::to_string(&c).unwrap().contains("extra_ports"));
+        c.extra_ports = vec![
+            ExtraPort {
+                port: 443,
+                udp: true,
+                tcp: false,
+            },
+            ExtraPort {
+                port: 61443,
+                udp: true,
+                tcp: true,
+            },
+        ];
+        let text = serde_json::to_string(&c).unwrap();
+        assert!(
+            text.contains(
+                r#""extra_ports":[{"port":443,"udp":true,"tcp":false},{"port":61443,"udp":true,"tcp":true}]"#
+            ),
+            "{text}"
+        );
+        match parse_reply(text.as_bytes(), Op::Attach) {
+            Ok(Reply::Credentials(back)) => assert_eq!(back, c),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

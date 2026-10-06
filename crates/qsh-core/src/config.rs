@@ -77,6 +77,7 @@ use toml::de::{DeString, DeTable, DeValue};
 use toml::Spanned;
 
 use crate::paths::Paths;
+use crate::proto::bootstrap::MAX_EXTRA_PORTS;
 use crate::server::ServerConfig;
 use crate::transport::{RaceConfig, Transport};
 
@@ -187,6 +188,38 @@ pub enum Keepalive {
     Every(Duration),
 }
 
+/// `catchup`: smart catch-up, SNAPSHOT instead of a backlog the path cannot carry in about
+/// two seconds (m2.md section 6).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Catchup {
+    /// Accept snapshots on tty sessions whose output goes to a terminal.
+    #[default]
+    Auto,
+    /// Never: every byte, however long it takes (0.2 behaviour).
+    Off,
+}
+
+/// `compression` (client): offer the `zstd` capability (m2.md section 7).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Compression {
+    /// Offer it; the server compresses when the path is slow and the output compressible.
+    #[default]
+    Auto,
+    /// Do not offer it.
+    Off,
+}
+
+/// `upgrade` (server): when the daemon replaces itself with a newer qsh-server in place,
+/// keeping its sessions (m2.md section 10).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Upgrade {
+    /// When a newer `qsh-server` asks, and by itself when idle.
+    #[default]
+    Auto,
+    /// Only on `qsh-server upgrade`.
+    Manual,
+}
+
 /// `install`: what to do when the host has no qsh-server.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Install {
@@ -222,6 +255,13 @@ pub struct HostSettings {
     /// On attaching to a session from a new client, replay the output it kept
     /// (`replay_on_attach`).
     pub replay_on_attach: bool,
+    /// Remember per network which transport and port worked (`path_memory`, m2.md section 3;
+    /// reserved, not used by this version).
+    pub path_memory: bool,
+    /// Smart catch-up (`catchup`, m2.md section 6; reserved, not used by this version).
+    pub catchup: Catchup,
+    /// Compression (`compression`, m2.md section 7; reserved, not used by this version).
+    pub compression: Compression,
 }
 
 impl Default for HostSettings {
@@ -237,6 +277,9 @@ impl Default for HostSettings {
             keepalive: Keepalive::Auto,
             install: Install::Ask,
             replay_on_attach: true,
+            path_memory: true,
+            catchup: Catchup::Auto,
+            compression: Compression::Auto,
         }
     }
 }
@@ -313,8 +356,8 @@ impl HostSettings {
 pub struct ServerSettings {
     /// The daemon's port range: the first port free on both UDP and TCP (`ports`).
     pub ports: Option<RangeInclusive<u16>>,
-    /// More ports to listen on, for networks that block the first (`extra_ports`; reserved
-    /// for M2, not used by this version).
+    /// More ports to listen on, for networks that block the first (`extra_ports`, at most
+    /// [`MAX_EXTRA_PORTS`], without duplicates; m2.md section 5, not used by this version).
     pub extra_ports: Option<Vec<u16>>,
     /// The most sessions one daemon keeps (`max_sessions`).
     pub max_sessions: Option<usize>,
@@ -326,6 +369,14 @@ pub struct ServerSettings {
     pub replay_bytes: Option<usize>,
     /// Limits on unauthenticated connections (`[server.preauth]`).
     pub preauth: PreauthSettings,
+    /// Screen models and the `snapshot` capability (`snapshot`, m2.md section 6; not used by
+    /// this version).
+    pub snapshot: Option<bool>,
+    /// Accept the `zstd` capability (`compression`, m2.md section 7; not used by this version).
+    pub compression: Option<bool>,
+    /// When the daemon upgrades itself in place (`upgrade`, m2.md section 10; not used by this
+    /// version).
+    pub upgrade: Option<Upgrade>,
 }
 
 /// `[server.preauth]`: limits on connections before authentication (protocol.md 6.6).
@@ -363,9 +414,20 @@ impl ServerSettings {
         self.apply_env(|name| std::env::var_os(name))
     }
 
-    /// Set the fields of `config` that these settings give. `extra_ports` (reserved) has no
-    /// field there.
+    /// Set the fields of `config` that these settings give.
     pub fn apply(&self, config: &mut ServerConfig) {
+        if let Some(ports) = &self.extra_ports {
+            config.extra_ports.clone_from(ports);
+        }
+        if let Some(on) = self.snapshot {
+            config.snapshot = on;
+        }
+        if let Some(on) = self.compression {
+            config.compression = on;
+        }
+        if let Some(upgrade) = self.upgrade {
+            config.upgrade = upgrade;
+        }
         if let Some(n) = self.max_sessions {
             config.max_sessions = n;
         }
@@ -408,6 +470,9 @@ impl ServerSettings {
         fill(&mut self.preauth.per_source, &other.preauth.per_source);
         fill(&mut self.preauth.failure_burst, &other.preauth.failure_burst);
         fill(&mut self.preauth.failure_refill, &other.preauth.failure_refill);
+        fill(&mut self.snapshot, &other.snapshot);
+        fill(&mut self.compression, &other.compression);
+        fill(&mut self.upgrade, &other.upgrade);
     }
 }
 
@@ -430,6 +495,9 @@ struct ClientLayer {
     keepalive: Option<Keepalive>,
     install: Option<Install>,
     replay_on_attach: Option<bool>,
+    path_memory: Option<bool>,
+    catchup: Option<Catchup>,
+    compression: Option<Compression>,
 }
 
 impl ClientLayer {
@@ -444,6 +512,9 @@ impl ClientLayer {
         fill(&mut self.keepalive, &other.keepalive);
         fill(&mut self.install, &other.install);
         fill(&mut self.replay_on_attach, &other.replay_on_attach);
+        fill(&mut self.path_memory, &other.path_memory);
+        fill(&mut self.catchup, &other.catchup);
+        fill(&mut self.compression, &other.compression);
     }
 
     fn resolve(self) -> HostSettings {
@@ -459,6 +530,9 @@ impl ClientLayer {
             keepalive: self.keepalive.unwrap_or(d.keepalive),
             install: self.install.unwrap_or(d.install),
             replay_on_attach: self.replay_on_attach.unwrap_or(d.replay_on_attach),
+            path_memory: self.path_memory.unwrap_or(d.path_memory),
+            catchup: self.catchup.unwrap_or(d.catchup),
+            compression: self.compression.unwrap_or(d.compression),
         }
     }
 }
@@ -474,6 +548,9 @@ const CLIENT_KEYS: &[&str] = &[
     "keepalive",
     "install",
     "replay_on_attach",
+    "path_memory",
+    "catchup",
+    "compression",
 ];
 
 #[derive(Debug, Clone)]
@@ -770,6 +847,21 @@ impl Reader<'_> {
                     })
                 }
                 "replay_on_attach" => layer.replay_on_attach = Some(self.boolean(name, value)?),
+                "path_memory" => layer.path_memory = Some(self.boolean(name, value)?),
+                "catchup" => {
+                    layer.catchup = Some(match self.string(name, value)? {
+                        "auto" => Catchup::Auto,
+                        "off" => Catchup::Off,
+                        other => return Err(self.error(span, one_of(name, other, "\"auto\" or \"off\""))),
+                    })
+                }
+                "compression" => {
+                    layer.compression = Some(match self.string(name, value)? {
+                        "auto" => Compression::Auto,
+                        "off" => Compression::Off,
+                        other => return Err(self.error(span, one_of(name, other, "\"auto\" or \"off\""))),
+                    })
+                }
                 other => self.warn(key.span(), format!("unknown key `{other}`, ignored")),
             }
         }
@@ -816,12 +908,30 @@ impl Reader<'_> {
                     let Some(items) = value.get_ref().as_array() else {
                         return Err(self.error(value.span(), "`extra_ports` must be an array of ports"));
                     };
-                    let mut ports = Vec::new();
+                    let mut ports: Vec<u16> = Vec::new();
                     for item in items {
-                        let p = self.integer("extra_ports", item, 1, 65535)?;
-                        ports.push(p as u16);
+                        let p = self.integer("extra_ports", item, 1, 65535)? as u16;
+                        if ports.contains(&p) {
+                            self.warn(item.span(), format!("port {p} listed twice in `extra_ports`"));
+                        } else if ports.len() == MAX_EXTRA_PORTS {
+                            self.warn(
+                                item.span(),
+                                format!("`extra_ports` has more than {MAX_EXTRA_PORTS} ports; port {p} ignored"),
+                            );
+                        } else {
+                            ports.push(p);
+                        }
                     }
                     s.extra_ports = Some(ports);
+                }
+                "snapshot" => s.snapshot = Some(self.boolean(name, value)?),
+                "compression" => s.compression = Some(self.boolean(name, value)?),
+                "upgrade" => {
+                    s.upgrade = Some(match self.string(name, value)? {
+                        "auto" => Upgrade::Auto,
+                        "manual" => Upgrade::Manual,
+                        other => return Err(self.error(value.span(), one_of(name, other, "\"auto\" or \"manual\""))),
+                    })
                 }
                 "max_sessions" => s.max_sessions = Some(self.integer(name, value, 1, 100_000)? as usize),
                 "detached_ttl" => s.detached_ttl = Some(self.duration(name, value, 1, 365 * 86400)?),

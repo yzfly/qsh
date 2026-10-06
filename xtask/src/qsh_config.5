@@ -149,6 +149,21 @@ Default: \fB"ask"\fR.
 .B replay_on_attach
 When a new client attaches to a running session, show the output the server kept for it:
 \fBtrue\fR or \fBfalse\fR. Default: \fBtrue\fR.
+.TP
+.B path_memory
+Remember, per server and per network, which transport and port worked, so that the next
+connection on that network starts with it: \fBtrue\fR or \fBfalse\fR. Reserved: this version
+reads it but does not use it yet. Default: \fBtrue\fR.
+.TP
+.B catchup
+When a session's output arrives faster than the network carries it, show the current screen
+instead of the backlog and announce the skipped part (smart catch\-up): \fB"auto"\fR or
+\fB"off"\fR (every byte, however long it takes). Reserved: this version reads it but does not
+use it yet. Default: \fB"auto"\fR.
+.TP
+.B compression
+Let the server compress output when the network is slow: \fB"auto"\fR or \fB"off"\fR.
+Reserved: this version reads it but does not use it yet. Default: \fB"auto"\fR.
 .SH SERVER SETTINGS
 These go in the
 .B [server]
@@ -165,8 +180,12 @@ every user of a shared host gets one. \fB"\fIFIRST\fB\-\fILAST\fB"\fR or a port 
 Default: \fB"60443\-60542"\fR.
 .TP
 .B extra_ports
-More ports to listen on, for networks that block the first, as an array of port numbers.
-Reserved: this version does not use it.
+More ports to listen on, for networks that block the first, as an array of at most 8 port
+numbers; more, and duplicates, are warnings. The daemon binds each on UDP and on TCP where it
+can (a port another program holds, or one below
+.B net.ipv4.ip_unprivileged_port_start
+on Linux, is skipped) and tells clients which it bound. Reserved: this version reads it but
+does not use it yet. Default: none.
 .TP
 .B max_sessions
 The most sessions one daemon keeps, from 1 to 100000. Default: 1000.
@@ -182,6 +201,23 @@ time of at most a year. Default: \fB"1h"\fR.
 .B replay_bytes
 How much output each session keeps for clients that come back, a size from 1 MiB to 1 GiB.
 Default: \fB"8M"\fR.
+.TP
+.B snapshot
+Keep a model of each session's screen, so that a client far behind can be sent the current
+screen instead of the backlog: \fBtrue\fR or \fBfalse\fR. Reserved: this version reads it
+but does not use it yet. Default: \fBtrue\fR.
+.TP
+.B compression
+Compress output for clients that ask for it, when their network is slow: \fBtrue\fR or
+\fBfalse\fR. Reserved: this version reads it but does not use it yet. Default: \fBtrue\fR.
+.TP
+.B upgrade
+When the daemon replaces itself with a newer
+.B qsh\-server
+in place, keeping its sessions: \fB"auto"\fR (when a newer version connects to it, and by
+itself when no client is attached), or \fB"manual"\fR (only on
+.BR "qsh\-server upgrade" ).
+Reserved: this version reads it but does not use it yet. Default: \fB"auto"\fR.
 .PP
 .B [server.preauth]
 limits the connections that have not authenticated yet:

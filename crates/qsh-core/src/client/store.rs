@@ -18,6 +18,9 @@
 //!  "udp":60443,"tcp":60443,"cert_sha256":"…","session":"…","key":"…","name":null,
 //!  "command":"make","created":1791200000}
 //! ```
+//!
+//! A daemon that announced extra ports (protocol.md 10.4) adds them as `"extra_ports"`, in the
+//! format of the bootstrap reply; a file without them is read as having none.
 
 use std::fmt;
 use std::fs;
@@ -30,6 +33,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::crypto::{self, Fingerprint, SessionKey};
 use crate::paths::{self, Paths};
+use crate::proto::bootstrap::ExtraPort;
 use crate::sys;
 
 /// The format version of a state file, member `"qsh"`.
@@ -69,6 +73,9 @@ pub struct SavedSession {
     pub command: Option<String>,
     /// When the session was created, in seconds since the Unix epoch.
     pub created: u64,
+    /// Further ports of the daemon from the bootstrap reply (protocol.md 10.4), so that
+    /// reconnects and `qsh attach` use them too (m2.md section 5.2).
+    pub extra_ports: Vec<ExtraPort>,
 }
 
 impl SavedSession {
@@ -93,6 +100,7 @@ impl fmt::Debug for SavedSession {
             .field("name", &self.name)
             .field("command", &self.command)
             .field("created", &self.created)
+            .field("extra_ports", &self.extra_ports)
             .finish()
     }
 }
@@ -118,6 +126,16 @@ struct FileFormat {
     command: Option<String>,
     #[serde(default)]
     created: u64,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "extra_ports_lenient"
+    )]
+    extra_ports: Vec<ExtraPort>,
+}
+
+fn extra_ports_lenient<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<ExtraPort>, D::Error> {
+    Ok(ExtraPort::list_from_json(&serde_json::Value::deserialize(d)?))
 }
 
 impl Drop for FileFormat {
@@ -142,6 +160,7 @@ impl FileFormat {
             name: s.name.clone(),
             command: s.command.clone(),
             created: s.created,
+            extra_ports: s.extra_ports.clone(),
         }
     }
 
@@ -162,6 +181,7 @@ impl FileFormat {
             name: self.name.clone(),
             command: self.command.clone(),
             created: self.created,
+            extra_ports: self.extra_ports.clone(),
         })
     }
 }
@@ -406,6 +426,7 @@ mod tests {
             name: Some("build".into()),
             command: None,
             created: 1_791_200_000 + u64::from(id),
+            extra_ports: Vec::new(),
         }
     }
 
@@ -450,6 +471,26 @@ mod tests {
         store.remove("alice@h", &[1; 16]).unwrap();
         store.remove("alice@h", &[1; 16]).unwrap();
         assert_eq!(store.list().unwrap().sessions.len(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// m2.md 5.2: extra ports are kept with the credentials; files without them still load.
+    #[test]
+    fn extra_ports_are_saved_with_the_credentials() {
+        let root = scratch("extra-ports");
+        let store = SessionStore::new(root.join("state/sessions"));
+        let mut s = saved("h", 1, 0x11);
+        store.save(&s).unwrap();
+        let file = fs::read_dir(store.dir()).unwrap().next().unwrap().unwrap().path();
+        assert!(!fs::read_to_string(&file).unwrap().contains("extra_ports"));
+        assert!(store.load("h", &[1; 16]).unwrap().unwrap().extra_ports.is_empty());
+        s.extra_ports = vec![ExtraPort {
+            port: 443,
+            udp: true,
+            tcp: false,
+        }];
+        store.save(&s).unwrap();
+        assert_eq!(store.load("h", &[1; 16]).unwrap().unwrap().extra_ports, s.extra_ports);
         fs::remove_dir_all(root).unwrap();
     }
 

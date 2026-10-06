@@ -71,6 +71,15 @@ pub struct ServerConfig {
     pub preauth: PreauthLimits,
     /// The most sessions the daemon keeps; a bootstrap `new` beyond it gets `limit`.
     pub max_sessions: usize,
+    /// More ports to listen on, UDP and TCP independently, where the bind succeeds (m2.md
+    /// section 5; at most 8). Not used yet.
+    pub extra_ports: Vec<u16>,
+    /// Keep screen models and offer the `snapshot` capability (m2.md section 6). Not used yet.
+    pub snapshot: bool,
+    /// Accept the `zstd` capability (m2.md section 7). Not used yet.
+    pub compression: bool,
+    /// When the daemon upgrades itself in place (m2.md section 10). Not used yet.
+    pub upgrade: crate::config::Upgrade,
 }
 
 /// The default of [`ServerConfig::max_sessions`].
@@ -89,6 +98,10 @@ impl ServerConfig {
             output_replay: crate::session::OUTPUT_REPLAY,
             preauth: PreauthLimits::default(),
             max_sessions: MAX_SESSIONS,
+            extra_ports: Vec::new(),
+            snapshot: true,
+            compression: true,
+            upgrade: crate::config::Upgrade::Auto,
         }
     }
 }
@@ -246,9 +259,9 @@ impl Daemon {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         // 4. GOAWAY (SHUTDOWN) on every connection; 5. close after a moment for delivery
-        serve::goaway_all(&shared);
+        serve::goaway_all(&shared, ErrorCode::SHUTDOWN);
         tokio::time::sleep(Duration::from_millis(500)).await;
-        serve::close_all(&shared);
+        serve::close_all(&shared, ErrorCode::SHUTDOWN);
         endpoint.close(quinn::VarInt::from_u32(ErrorCode::SHUTDOWN.0 as u32), b"daemon stopped");
         // Give QUIC a moment to send the close to connected clients
         tokio::time::sleep(Duration::from_millis(200)).await;

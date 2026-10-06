@@ -50,19 +50,31 @@ impl Registry {
     }
 }
 
-/// Shutdown, step 4 (7.13): GOAWAY (SHUTDOWN) on every connection.
-pub(crate) fn goaway_all(shared: &Shared) {
+/// GOAWAY with `code` on every connection: SHUTDOWN at shutdown, step 4 (7.13), RESTART
+/// before an upgrade in place (10.6, m2.md 10.3 step 3). Connections stay open until
+/// [`close_all`].
+pub(crate) fn goaway_all(shared: &Shared, code: ErrorCode) {
+    let message = goaway_text(code);
     shared.connections.broadcast(|| {
         Control::Send(Message::GoAway {
-            code: ErrorCode::SHUTDOWN,
-            message: "the server is stopping".into(),
+            code,
+            message: message.into(),
         })
     });
 }
 
-/// Shutdown, step 5: close every connection.
-pub(crate) fn close_all(shared: &Shared) {
-    shared.connections.broadcast(|| Control::Shutdown);
+/// Close every connection with `code`, after [`goaway_all`] with the same code (shutdown,
+/// step 5; or an upgrade in place).
+pub(crate) fn close_all(shared: &Shared, code: ErrorCode) {
+    shared.connections.broadcast(|| Control::Shutdown(code));
+}
+
+fn goaway_text(code: ErrorCode) -> &'static str {
+    match code {
+        ErrorCode::SHUTDOWN => "the server is stopping",
+        ErrorCode::RESTART => "the server is restarting in place",
+        _ => "",
+    }
 }
 
 pub(crate) async fn accept_quic(shared: Arc<Shared>, endpoint: quinn::Endpoint) {
@@ -150,8 +162,8 @@ enum Control {
     Close(ErrorCode, String),
     /// Send GOAWAY with the code, then close the connection (IDLE).
     GoAwayClose(ErrorCode),
-    /// Close the connection (SHUTDOWN), after GOAWAY was sent.
-    Shutdown,
+    /// Close the connection with the code (SHUTDOWN, RESTART), after GOAWAY was sent.
+    Shutdown(ErrorCode),
 }
 
 /// What the tasks of one connection share.
@@ -319,7 +331,7 @@ async fn control_writer(conn: Arc<Conn>, mut send: SendStream, mut rx: mpsc::Unb
                     message: String::new(),
                 }),
             ),
-            Control::Shutdown => (ErrorCode::SHUTDOWN, "the server is stopping".to_string(), None),
+            Control::Shutdown(code) => (code, goaway_text(code).to_string(), None),
         };
         if let Some(m) = last {
             let _ = tokio::time::timeout(Duration::from_secs(1), write(&mut send, &[m])).await;

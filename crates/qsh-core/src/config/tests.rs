@@ -69,6 +69,9 @@ ssh_options = ["-o", "Compression=yes"]
 keepalive = 25
 install = "never"
 replay_on_attach = false
+path_memory = false
+catchup = "off"
+compression = "off"
 "#,
     );
     assert!(warnings.is_empty(), "{warnings:?}");
@@ -86,6 +89,9 @@ replay_on_attach = false
             keepalive: Keepalive::Every(Duration::from_secs(25)),
             install: Install::Never,
             replay_on_attach: false,
+            path_memory: false,
+            catchup: Catchup::Off,
+            compression: Compression::Off,
         }
     );
     let (config, _) = parse("[defaults]\nkeepalive = \"auto\"\nescape_char = \"none\"\n");
@@ -286,6 +292,9 @@ max_sessions = 50
 detached_ttl = "1d"
 exited_ttl = 600
 replay_bytes = "16M"
+snapshot = false
+compression = false
+upgrade = "manual"
 
 [server.preauth]
 connections = 128
@@ -311,6 +320,9 @@ failure_refill = "30s"
                 failure_burst: Some(5),
                 failure_refill: Some(Duration::from_secs(30)),
             },
+            snapshot: Some(false),
+            compression: Some(false),
+            upgrade: Some(Upgrade::Manual),
         }
     );
     let mut server = ServerConfig::new(Paths::under(Path::new("/nonexistent")));
@@ -323,6 +335,9 @@ failure_refill = "30s"
     assert_eq!(server.preauth.per_source, 4);
     assert_eq!(server.preauth.failure_burst, 5);
     assert_eq!(server.preauth.failure_refill, Duration::from_secs(30));
+    assert_eq!(server.extra_ports, [443, 8443]);
+    assert!(!server.snapshot && !server.compression);
+    assert_eq!(server.upgrade, Upgrade::Manual);
     // A single port
     let (config, _) = parse("[server]\nports = 60443\n");
     assert_eq!(config.server().ports, Some(60443..=60443));
@@ -602,4 +617,48 @@ fn parsing_takes_any_text() {
             let _ = config.server();
         }
     }
+}
+
+/// The keys of m2.md section 11: defaults, values, and the errors and warnings.
+#[test]
+fn m2_keys() {
+    let d = HostSettings::default();
+    assert!(d.path_memory);
+    assert_eq!(
+        (d.catchup, d.compression, d.keepalive),
+        (Catchup::Auto, Compression::Auto, Keepalive::Auto)
+    );
+    let server = ServerConfig::new(Paths::under(Path::new("/nonexistent")));
+    assert!(server.extra_ports.is_empty() && server.snapshot && server.compression);
+    assert_eq!(server.upgrade, Upgrade::Auto);
+    let (config, warnings) = parse("[defaults]\ncatchup = \"auto\"\ncompression = \"auto\"\n");
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let h = config.for_host("any", None);
+    assert_eq!((h.catchup, h.compression), (Catchup::Auto, Compression::Auto));
+    // The first value wins: a host table over [defaults]
+    let (config, _) = parse("[host.\"web*\"]\npath_memory = false\n[defaults]\npath_memory = true\n");
+    assert!(!config.for_host("web1", None).path_memory);
+    assert!(config.for_host("db1", None).path_memory);
+    for (text, line, needle) in [
+        ("[defaults]\ncatchup = \"on\"\n", 2, "catchup"),
+        ("[defaults]\ncompression = true\n", 2, "compression"),
+        ("[defaults]\npath_memory = \"yes\"\n", 2, "path_memory"),
+        ("[defaults]\nkeepalive = 0\n", 2, "keepalive"),
+        ("[defaults]\nkeepalive = \"2h\"\n", 2, "keepalive"),
+        ("[server]\nsnapshot = \"auto\"\n", 2, "snapshot"),
+        ("[server]\ncompression = \"off\"\n", 2, "compression"),
+        ("[server]\nupgrade = \"never\"\n", 2, "upgrade"),
+        ("[server]\nextra_ports = 443\n", 2, "extra_ports"),
+    ] {
+        let e = parse_err(text);
+        assert_eq!(e.line, Some(line), "{text:?}: {e}");
+        assert!(e.message.contains(needle), "{text:?}: {e}");
+    }
+    // At most 8 extra ports, no duplicates: the rest is a warning, not an error (m2.md 5.1)
+    let (config, warnings) = parse("[server]\nextra_ports = [1, 2, 3, 2, 4, 5, 6, 7, 8, 9, 10]\n");
+    assert_eq!(config.server().extra_ports, Some(vec![1, 2, 3, 4, 5, 6, 7, 8]));
+    assert_eq!(warnings.len(), 3, "{warnings:?}");
+    assert!(warnings[0].message.contains("twice"), "{warnings:?}");
+    assert!(warnings[1].message.contains("more than 8"), "{warnings:?}");
+    assert!(warnings.iter().all(|w| w.line == Some(2)), "{warnings:?}");
 }

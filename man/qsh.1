@@ -201,6 +201,10 @@ Where
 downloads releases from, instead of https://github.com/yzfly/qsh/releases (a mirror;
 https:// or file:// only).
 .TP
+.B QSH_TRANSCRIPT
+A file to which qsh appends a line of JSON for every piece of output, gap and reconnect, for
+qsh's own tests. Unstable: the format changes without notice.
+.TP
 .BR LANG ", " LANGUAGE ", " LC_* ", " COLORTERM ", " TERM
 Passed to the session.
 .SH SEE ALSO

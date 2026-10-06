@@ -4,6 +4,7 @@
 pub mod bootstrap;
 pub mod message;
 pub mod varint;
+pub mod zstd;
 
 use std::fmt;
 use std::io;
@@ -67,6 +68,24 @@ pub mod limits {
     pub const FAILURE_BURST: u32 = 10;
     /// … refilled with one token every 6 s (10 per minute).
     pub const FAILURE_REFILL: Duration = Duration::from_secs(6);
+    /// A client reconnects this long (± 20 %) after GOAWAY with RESTART, without back-off
+    /// (10.6).
+    pub const RESTART_RECONNECT: Duration = Duration::from_millis(500);
+}
+
+/// Capability names (protocol.md 5.4 and 14.3). An implementation offers a capability only
+/// once it implements the sections that define it in full; this version offers none.
+pub mod caps {
+    /// The server may send OUTPUT_ZSTD and compressed SNAPSHOT data (7.12, 7.8.3).
+    pub const ZSTD: &str = "zstd";
+    /// The server may send SNAPSHOT to an attachment that asked for it (7.8).
+    pub const SNAPSHOT: &str = "snapshot";
+    /// Port forwarding channels: reserved (M3), never offered.
+    pub const FORWARD: &str = "forward";
+    /// File copy channels: reserved (M3), never offered.
+    pub const COPY: &str = "copy";
+    /// ssh agent forwarding: reserved, never offered.
+    pub const AGENT: &str = "agent";
 }
 
 /// Implementation name sent in the hellos.
@@ -116,6 +135,7 @@ error_codes! {
     SESSION_TAKEN_OVER = 0x12, "A newer attachment took the session.";
     SESSION_ENDED = 0x13, "The session was ended.";
     SEQUENCE_ERROR = 0x14, "Offsets or acknowledgements were inconsistent.";
+    RESTART = 0x15, "The daemon restarts in place and keeps every session (sent in GOAWAY, 10.6).";
 }
 
 impl fmt::Debug for ErrorCode {

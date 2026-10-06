@@ -537,3 +537,124 @@ fn appendix_a_pipe_session_encodings() {
         "151000000000000020000000000000000069"
     );
 }
+
+/// Turn the hex dump of an appendix (bytes separated by spaces, lines by newlines) into bytes.
+fn from_dump(dump: &str) -> Vec<u8> {
+    dump.split_whitespace()
+        .map(|b| u8::from_str_radix(b, 16).unwrap())
+        .collect()
+}
+
+/// protocol.md A.8: a resync SNAPSHOT of a 20 × 3 terminal, byte for byte, and its content.
+#[test]
+fn appendix_a8_snapshot() {
+    let wire = from_dump(
+        "18 40 86 00 00 00 00 00 10 00 00 01 00 14 00 03
+         1b 5b 21 70 1b 5b 3f 31 30 34 39 6c 1b 5b 31 3b 31 48 24 20 6c 73 1b 5b 4b
+         1b 5b 32 3b 31 48 1b 5b 33 32 6d 61 2e 74 78 74 1b 5b 6d 1b 5b 4b
+         1b 5b 33 3b 31 48 24 1b 5b 4b
+         1b 5b 3f 39 3b 31 30 30 30 3b 31 30 30 32 3b 31 30 30 33 3b 31 30 30 34 3b 31 30
+         30 35 3b 31 30 30 36 3b 31 30 31 35 6c
+         1b 5b 3f 32 30 30 34 68 1b 5d 32 3b 77 65 62 31 1b 5c 1b 5b 33 3b 33 48",
+    );
+    let data = concat!(
+        "\x1b[!p",
+        "\x1b[?1049l",
+        "\x1b[1;1H$ ls\x1b[K",
+        "\x1b[2;1H\x1b[32ma.txt\x1b[m\x1b[K",
+        "\x1b[3;1H$\x1b[K",
+        "\x1b[?9;1000;1002;1003;1004;1005;1006;1015l",
+        "\x1b[?2004h",
+        "\x1b]2;web1\x1b\\",
+        "\x1b[3;3H",
+    );
+    let snapshot = Message::Snapshot {
+        offset: 1_048_576,
+        flags: SNAPSHOT_FINAL,
+        cols: 20,
+        rows: 3,
+        data: data.as_bytes().to_vec(),
+    };
+    assert_eq!(snapshot.payload().len(), 134);
+    assert_eq!(crate::crypto::hex(&snapshot.encode()), crate::crypto::hex(&wire));
+    let (decoded, used) = message::decode_from(&wire, MAX_TERMINAL).unwrap().unwrap();
+    assert_eq!(used, wire.len());
+    assert_eq!(decoded, snapshot);
+}
+
+/// protocol.md A.9: OUTPUT_ZSTD, both messages, and their frame headers.
+#[test]
+fn appendix_a9_output_zstd() {
+    let wire = from_dump("1c 18 00 00 00 00 00 00 10 00 28 b5 2f fd 20 07 39 00 00 68 65 6c 6c 6f 0d 0a");
+    let (m, used) = message::decode_from(&wire, MAX_TERMINAL).unwrap().unwrap();
+    assert_eq!(used, wire.len());
+    let Message::OutputZstd { offset, frame } = &m else {
+        panic!("{m:?}")
+    };
+    assert_eq!(*offset, 4096);
+    assert_eq!(zstd::check_frame(frame), Ok(7));
+    // A raw block: the content is the block itself
+    let header = zstd::parse_header(frame).unwrap();
+    assert_eq!(&frame[header.header_len + 3..], b"hello\r\n");
+    assert_eq!(m.encode(), wire);
+
+    let wire = from_dump("1c 13 00 00 00 00 00 00 20 00 28 b5 2f fd 60 e8 02 43 1f 00 3d");
+    let (m, _) = message::decode_from(&wire, MAX_TERMINAL).unwrap().unwrap();
+    let Message::OutputZstd { offset, frame } = &m else {
+        panic!("{m:?}")
+    };
+    assert_eq!(*offset, 8192);
+    assert_eq!(zstd::check_frame(frame), Ok(1000));
+    assert_eq!(m.encode(), wire);
+    // The same frame declaring one byte more than the limit (2-byte field: size − 256)
+    let mut big = frame.clone();
+    big[5..7].copy_from_slice(&((65537 - 256) as u16).to_le_bytes());
+    assert_eq!(zstd::check_frame(&big), Err(zstd::FrameError::ContentSize(65537)));
+    // Without Single_Segment
+    let mut multi = frame.clone();
+    multi[4] &= !0x20;
+    assert_eq!(zstd::check_frame(&multi), Err(zstd::FrameError::NotSingleSegment));
+}
+
+/// SNAPSHOT flags, the error code and capability names of M2 (protocol.md 7.8, 10.6, 14.3).
+#[test]
+fn m2_registry_entries() {
+    assert_eq!((SNAPSHOT_FINAL, SNAPSHOT_ZSTD), (0x1, 0x2));
+    assert_eq!(MAX_SNAPSHOT, 1 << 20);
+    assert_eq!(zstd::MAX_ZSTD_CONTENT, MAX_TERMINAL);
+    assert_eq!(ErrorCode::RESTART.0, 0x15);
+    assert_eq!(ErrorCode::RESTART.name(), Some("RESTART"));
+    assert_eq!(ErrorCode(0x16).name(), None);
+    let goaway = Message::GoAway {
+        code: ErrorCode::RESTART,
+        message: String::new(),
+    };
+    assert_eq!(crate::crypto::hex(&goaway.encode()), "06021500");
+    for name in [caps::ZSTD, caps::SNAPSHOT, caps::FORWARD, caps::COPY, caps::AGENT] {
+        assert!(valid_capability(name), "{name}");
+    }
+    // Every flag combination and undefined bits survive a round trip (receivers ignore them)
+    for flags in [0, SNAPSHOT_FINAL, SNAPSHOT_ZSTD, SNAPSHOT_FINAL | SNAPSHOT_ZSTD, 0xff] {
+        let m = Message::Snapshot {
+            offset: 1,
+            flags,
+            cols: 1,
+            rows: 1,
+            data: Vec::new(),
+        };
+        assert_eq!(Message::decode(m.ty(), &m.payload()), Ok(m));
+    }
+    // Shorter than its fixed fields
+    for len in 0..13 {
+        assert!(
+            Message::decode(message::types::SNAPSHOT, &vec![0; len]).is_err(),
+            "{len}"
+        );
+    }
+    for len in 0..8 {
+        assert!(
+            Message::decode(message::types::OUTPUT_ZSTD, &vec![0; len]).is_err(),
+            "{len}"
+        );
+    }
+}
