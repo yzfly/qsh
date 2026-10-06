@@ -108,6 +108,24 @@ _arguments "${_arguments_options[@]}" : \
 ':destination -- \[user@\]host to install on:_default' \
 && ret=0
 ;;
+(doctor)
+_arguments "${_arguments_options[@]}" : \
+'-p+[Port of the ssh server (ssh -p)]:PORT:_default' \
+'-l+[User to log in as (ssh -l)]:USER:_default' \
+'*-i+[Identity file (ssh -i); may be repeated]:FILE:_files' \
+'-J+[Jump hosts (ssh -J)]:DESTINATION:_default' \
+'-F+[ssh configuration file (ssh -F)]:FILE:_files' \
+'*-o+[ssh option (ssh -o); may be repeated]:OPTION:_default' \
+'--json[Print JSON (schema in qsh(1)), for scripts]' \
+'--tune[Then run sudo qsh-server tune --apply on DESTINATION over ssh -t (it shows its plan and asks first)]' \
+'-4[Use IPv4 addresses only (ssh -4)]' \
+'-6[Use IPv6 addresses only (ssh -6)]' \
+'*-v[Verbose\: qsh'\''s own messages, and ssh -v; may be repeated]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+'::destination -- \[user@\]host to check; without it, only this machine:_default' \
+&& ret=0
+;;
         esac
     ;;
 esac
@@ -120,6 +138,7 @@ _qsh_commands() {
 'ls:List sessions\: on DESTINATION (over ssh), or the saved ones of every host' \
 'kill:End a session\: its programs get SIGHUP' \
 'install:Install qsh-server into ~/.local/bin on DESTINATION (builds with feature self-install)' \
+'doctor:Check this machine, or what works between here and DESTINATION, and what to fix' \
     )
     _describe -t commands 'qsh commands' commands "$@"
 }
@@ -127,6 +146,11 @@ _qsh_commands() {
 _qsh__subcmd__attach_commands() {
     local commands; commands=()
     _describe -t commands 'qsh attach commands' commands "$@"
+}
+(( $+functions[_qsh__subcmd__doctor_commands] )) ||
+_qsh__subcmd__doctor_commands() {
+    local commands; commands=()
+    _describe -t commands 'qsh doctor commands' commands "$@"
 }
 (( $+functions[_qsh__subcmd__install_commands] )) ||
 _qsh__subcmd__install_commands() {

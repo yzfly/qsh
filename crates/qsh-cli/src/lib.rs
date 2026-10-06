@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 
 pub mod cli;
+pub mod doctor;
 pub mod escape;
 #[cfg(feature = "self-install")]
 pub mod install;

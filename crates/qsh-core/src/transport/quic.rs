@@ -180,3 +180,12 @@ pub fn server_endpoint(socket: std::net::UdpSocket, identity: &Identity) -> io::
         runtime,
     )
 }
+
+/// UDP segmentation offload as a socket of this system gets it: the most datagrams one
+/// send may carry (GSO, Linux 4.18+) and one receive may return (GRO, Linux 5.0+), as quinn
+/// will use them; 1 means unavailable. For `qsh-server doctor` (m2.md 8.2, `gso-gro`).
+pub fn udp_offload() -> io::Result<(usize, usize)> {
+    let socket = sys::udp_any(0)?;
+    let state = quinn::udp::UdpSocketState::new((&socket).into())?;
+    Ok((state.max_gso_segments(), state.gro_segments()))
+}

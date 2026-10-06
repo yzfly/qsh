@@ -13,6 +13,7 @@ with every change and can be handed to distribution maintainers as it is.
 | `homebrew/qsh.rb` | Homebrew formula | macOS (latest) |
 | `systemd/qsh-server.service` | systemd user unit, installed by every Linux package that has systemd | |
 | `openrc/` | OpenRC script (per-user instances), Alpine's `qsh-server-openrc` | |
+| `firewalld/qsh.xml`, `ufw/qsh` | the firewalld service and the ufw application profile `qsh` (UDP and TCP 60443-60542), installed with qsh-server and never enabled; `qsh-server doctor` and `tune` use them | |
 | `nfpm.yaml` | the convenience .deb/.rpm/.apk of static binaries attached to GitHub Releases | release.yml |
 | `ci/` | the scripts the Packaging workflow runs, one per distribution | |
 | `test/` | end-to-end tests of the static binaries on many distributions (distros.yml) | distros.yml |
@@ -20,9 +21,10 @@ with every change and can be handed to distribution maintainers as it is.
 All packages install the same files: `/usr/bin/qsh`, `/usr/bin/qsh-server`, the man pages qsh(1),
 qsh-server(1), qsh_config(5) (`man/`), bash, zsh and fish completions (`completions/`), the
 systemd user unit `/usr/lib/systemd/user/qsh-server.service` (not enabled: qsh-server starts on
-demand over ssh), the licenses and the documentation. None of them enables the cargo feature
-`self-install`, except Homebrew (see the formula); distribution builds make no network access at
-runtime.
+demand over ssh), the firewalld service `/usr/lib/firewalld/services/qsh.xml` and the ufw profile
+`/etc/ufw/applications.d/qsh` (not enabled either), the licenses and the documentation. None of
+them enables the cargo feature `self-install`, except Homebrew (see the formula); distribution
+builds make no network access at runtime.
 
 ## How CI builds them
 

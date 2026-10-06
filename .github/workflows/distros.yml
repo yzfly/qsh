@@ -2,7 +2,8 @@
 # x86_64 musl build of qsh-server in ~/.local/bin of a user on each distribution's stock image
 # with sshd, and the client on the runner. Each distribution also runs with UDP blocked (TLS over
 # TCP must take over) and with only ssh reachable (the ssh pipe must take over).
-# The per-distribution setup is packaging/test/ (Dockerfile, setup.sh, entrypoint.sh, e2e.sh).
+# The per-distribution setup is packaging/test/ (Dockerfile, setup.sh, entrypoint.sh, e2e.sh);
+# the doctor job runs packaging/test/doctor.sh in each stock image.
 name: Distributions
 
 on:
@@ -86,3 +87,42 @@ jobs:
           path: packaging/test/.work/
           if-no-files-found: ignore
           retention-days: 7
+
+  # qsh-server doctor and tune on each distribution (m2.md 8.6, 12.3): doctor read only (every
+  # check, the distribution recognized, nothing failing in a stock container), --probe, tune's
+  # dry run and its refusal to touch the host's sysctls from inside a container, then
+  # tune --apply / --revert on a fake root seeded with stock values: the revert must restore it
+  # byte for byte (S6). The container is thrown away afterwards.
+  doctor:
+    name: doctor ${{ matrix.image }}
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - ubuntu:20.04
+          - ubuntu:24.04
+          - debian:12
+          - fedora:latest
+          - rockylinux/rockylinux:9
+          - alpine:latest
+          - archlinux:latest
+          - opensuse/tumbleweed
+          - amazonlinux:2023
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: qsh-${{ env.TARGET }}
+          path: bin
+      - run: chmod 0755 bin/qsh bin/qsh-server
+      - name: doctor and tune
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: >-
+          docker run --rm
+          -v "$PWD/bin:/qsh/bin:ro"
+          -v "$PWD/packaging/test:/t:ro"
+          "$IMAGE" sh /t/doctor.sh

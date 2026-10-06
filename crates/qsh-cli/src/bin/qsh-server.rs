@@ -1,11 +1,13 @@
-//! `qsh-server bootstrap | pipe | daemon | status | stop | upgrade`: the server side of qsh.
+//! `qsh-server bootstrap | pipe | daemon | status | stop | upgrade | doctor | tune`: the server
+//! side of qsh.
 
 #![forbid(unsafe_code)]
 
 use std::process::ExitCode;
 
 use clap::Parser;
-use qsh_cli::cli::{parse_ports, DaemonArgs, ServerArgs, ServerCommand};
+use qsh_cli::cli::{parse_ports, DaemonArgs, DoctorArgs, ServerArgs, ServerCommand, TuneArgs};
+use qsh_cli::doctor::{self, checks, report, tune};
 use qsh_core::config::{Config, ConfigPaths, ServerSettings};
 use qsh_core::server::{self, Daemon, DaemonLauncher, Reexec, Resume, ServerConfig, StartError, ON_DEMAND_IDLE_EXIT};
 use qsh_core::{log, Paths};
@@ -83,6 +85,9 @@ async fn run(command: ServerCommand) -> u8 {
         println!("{}", server::handoff::probe_line(server::version()));
         return 0;
     }
+    if let ServerCommand::Tune(args) = command {
+        return tune_command(args);
+    }
     let paths = Paths::from_env();
     let launcher = match DaemonLauncher::current_exe() {
         Ok(l) => l,
@@ -125,8 +130,148 @@ async fn run(command: ServerCommand) -> u8 {
         }
         ServerCommand::Stop => stop(&paths).await,
         ServerCommand::Upgrade { exe, force } => upgrade(&paths, exe, force).await,
-        ServerCommand::HandoffProbe => 0,
+        ServerCommand::Doctor(args) => doctor_command(&paths, &launcher, args).await,
+        ServerCommand::HandoffProbe | ServerCommand::Tune(_) => 0,
     }
+}
+
+/// The daemon's port range and extra ports, from the configuration files and
+/// `QSH_SERVER_PORTS`, or `--ports`; quietly (`qsh-server status` reports the files'
+/// problems).
+fn configured_ports(paths: &Paths, ports: Option<&str>) -> Result<(std::ops::RangeInclusive<u16>, Vec<u16>), u8> {
+    let mut config = ServerConfig::new(paths.clone());
+    let mut settings = Config::load(&ConfigPaths::standard(paths))
+        .map(|(c, _)| c.server())
+        .unwrap_or_default();
+    let _ = settings.apply_process_env();
+    settings.apply(&mut config);
+    if let Some(text) = ports {
+        match parse_ports(text) {
+            Some(range) => config.ports = range,
+            None => {
+                eprintln!("qsh-server: bad port range {text:?}; expected FIRST-LAST");
+                return Err(2);
+            }
+        }
+    }
+    Ok((config.ports, config.extra_ports))
+}
+
+/// The user the per-user checks are about, from the password database for this process.
+fn doctor_user(sys: &dyn doctor::System) -> checks::User {
+    let own = qsh_core::sys::passwd_entry().map(|u| (u.name, u.home.display().to_string()));
+    checks::target_user(sys, own)
+}
+
+/// `qsh-server doctor` (m2.md 8.1, 8.2).
+async fn doctor_command(paths: &Paths, launcher: &DaemonLauncher, args: DoctorArgs) -> u8 {
+    let sys = doctor::system::Host::new(args.root.clone().unwrap_or_else(|| "/".into()));
+    let (range, extra_ports) = match configured_ports(paths, args.ports.as_deref()) {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
+    let user = doctor_user(&sys);
+    let daemon = if user.sudo {
+        checks::DaemonState::Unreachable(format!(
+            "root cannot ask {}'s daemon; run qsh-server doctor as {}",
+            user.name, user.name
+        ))
+    } else {
+        // --probe starts it as a bootstrap would, so that its ports and certificate are known
+        let started = match args.probe {
+            true => server::connect_or_start(paths, launcher).await.map(drop),
+            false => Ok(()),
+        };
+        let socket = paths.control_socket();
+        match (started, server::request_status(paths).await) {
+            (_, Ok(Some(status))) => checks::DaemonState::Running(status),
+            (Err(e), _) => checks::DaemonState::Failed(
+                format!("{} ({e})", socket.display()),
+                paths.daemon_log().display().to_string(),
+            ),
+            (Ok(()), Ok(None)) => checks::DaemonState::NotRunning,
+            (Ok(()), Err(e)) => checks::DaemonState::Unreachable(format!("{}: {e}", socket.display())),
+        }
+    };
+    let host = checks::HostInfo::read(&sys);
+    let ctx = checks::Context {
+        version: server::version().to_string(),
+        exe: std::env::current_exe().ok().map(|p| p.display().to_string()),
+        range,
+        extra_ports,
+        daemon,
+        probe: args.probe,
+        user,
+    };
+    let results = checks::run_all(&sys, &host, &ctx);
+    use std::io::Write;
+    let mut stdout = std::io::stdout();
+    let text = if args.json {
+        let value = report::json(&host, &ctx.daemon, ctx.probe, &results);
+        // One line for programs (qsh doctor HOST reads it over ssh), indented for people
+        if qsh_core::sys::is_tty(&stdout) {
+            format!("{value:#}\n")
+        } else {
+            format!("{value}\n")
+        }
+    } else {
+        report::human(&host, &results, &report::Style::for_stdout())
+    };
+    if stdout.write_all(text.as_bytes()).and_then(|()| stdout.flush()).is_err() {
+        return 2;
+    }
+    doctor::exit_status(&results)
+}
+
+/// `qsh-server tune` (m2.md 8.4).
+fn tune_command(args: TuneArgs) -> u8 {
+    let paths = Paths::from_env();
+    let sys = doctor::system::Host::new(args.root.clone().unwrap_or_else(|| "/".into()));
+    let (range, extra) = match configured_ports(&paths, args.ports.as_deref()) {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
+    let host = checks::HostInfo::read(&sys);
+    let user = doctor_user(&sys);
+    let ports = doctor::firewall::Ports {
+        udp: *range.start(),
+        tcp: *range.start(),
+        range,
+        extra,
+    };
+    let request = tune::Request {
+        apply: args.apply,
+        revert: args.revert,
+        yes: args.yes,
+        options: tune::Options {
+            bbr_default: args.bbr_default,
+            low_ports: args.allow_low_ports,
+            linger: args.linger,
+            ports,
+        },
+    };
+    let needs_root = sys.is_real_root() && qsh_core::sys::euid() != 0;
+    let mut ask = |question: &str| -> Option<bool> {
+        use std::io::{BufRead, Write};
+        let stdin = std::io::stdin();
+        if !qsh_core::sys::is_tty(&stdin) {
+            return None;
+        }
+        print!("{question}");
+        let _ = std::io::stdout().flush();
+        let mut answer = String::new();
+        stdin.lock().read_line(&mut answer).ok()?;
+        Some(matches!(answer.trim(), "y" | "Y" | "yes" | "Yes"))
+    };
+    tune::command(
+        &sys,
+        &host,
+        &user,
+        &request,
+        needs_root,
+        &mut ask,
+        &mut std::io::stdout(),
+    )
 }
 
 /// `qsh-server upgrade`: have the running daemon execute `exe` (default: this program) in

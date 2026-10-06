@@ -1,11 +1,11 @@
 //! `qsh [ssh options] [user@]host [command…]`: a remote shell over QUIC; and `qsh attach`,
-//! `qsh ls`, `qsh kill`, `qsh install`.
+//! `qsh ls`, `qsh kill`, `qsh install`, `qsh doctor`.
 
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
 
-use qsh_cli::cli::{parse_qsh, Invocation, QshCommand, SshArgs, RESERVED};
+use qsh_cli::cli::{parse_qsh, Invocation, QshCommand, SshArgs};
 use qsh_cli::terminal::{self, Start, TerminalOptions};
 use qsh_core::client::store::SessionStore;
 use qsh_core::client::{ClientConfig, EXIT_ERROR};
@@ -24,27 +24,13 @@ fn main() {
         }
     };
     let code = match invocation {
-        Invocation::Connect(args) => {
-            // `qsh doctor` is a subcommand to come (M2); `qsh -- doctor` is a host named doctor
-            let explicit_host = std::env::args()
-                .skip(1)
-                .take_while(|a| a != &args.destination)
-                .any(|a| a == "--");
-            if RESERVED.contains(&args.destination.as_str()) && !explicit_host {
-                eprintln!(
-                    "qsh: `qsh {}` is not available in this version; to connect to a host of that name: qsh -- {}",
-                    args.destination, args.destination
-                );
-                std::process::exit(EXIT_ERROR);
+        Invocation::Connect(args) => match config_for(&args.destination, &args.ssh) {
+            Ok((mut config, options)) => {
+                config.command = args.remote_command();
+                block_on(terminal::run(config, Start::New, options))
             }
-            match config_for(&args.destination, &args.ssh) {
-                Ok((mut config, options)) => {
-                    config.command = args.remote_command();
-                    block_on(terminal::run(config, Start::New, options))
-                }
-                Err(code) => code,
-            }
-        }
+            Err(code) => code,
+        },
         Invocation::Subcommand(ssh, command) => subcommand(ssh, command),
     };
     std::process::exit(code);
@@ -200,7 +186,40 @@ fn subcommand(ssh: SshArgs, command: QshCommand) -> i32 {
             Ok((config, _)) => install(config, from),
             Err(code) => code,
         },
+        QshCommand::Doctor {
+            destination,
+            json,
+            tune,
+        } => doctor(&ssh, destination, json, tune),
     }
+}
+
+/// `qsh doctor [DESTINATION]` (m2.md 8.5).
+fn doctor(ssh: &SshArgs, destination: Option<String>, json: bool, tune: bool) -> i32 {
+    let (config, path_memory, keepalive) = match destination {
+        Some(d) => match config_for(&d, ssh) {
+            Ok((config, _)) => {
+                let (pm, ka) = (config.path_memory, config.keepalive);
+                (Some(config), pm, ka)
+            }
+            Err(code) => return code,
+        },
+        None => {
+            let paths = Paths::from_env();
+            let defaults = Config::load(&ConfigPaths::standard(&paths))
+                .map(|(file, _)| file.for_host("", None))
+                .unwrap_or_default();
+            (None, defaults.path_memory, defaults.keepalive)
+        }
+    };
+    let options = qsh_cli::doctor::client::Options {
+        json,
+        tune,
+        interactive: interactive(),
+        path_memory,
+        keepalive,
+    };
+    block_on(qsh_cli::doctor::client::run(config, options))
 }
 
 #[cfg(feature = "self-install")]

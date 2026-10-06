@@ -96,7 +96,7 @@ ssh myserver 'curl -fsSL https://github.com/yzfly/qsh/releases/latest/download/i
 
 qsh 在服务器上监听 60443–60542 中第一个空闲的 UDP 和 TCP 端口。即使防火墙挡住了它们，qsh
 仍然可用：先退到 TCP 上的 TLS，再退到经由 ssh 本身的管道。`qsh doctor myserver`
-*（计划中，M2）* 会告诉你哪些传输方式可用、要打开什么才能用上最快的那个。
+会告诉你从你所在的网络哪些传输方式可用、要打开什么才能用上最快的那个（见下文）。
 
 ### 会话比客户端活得久
 
@@ -134,6 +134,32 @@ qsh kill myserver 3f2a    # 结束一个会话（--all：那台主机上的全�
 
 远程程序的退出码；qsh 自身出错时为 255（和 ssh 一样）；主机上没有 `qsh-server`、而 qsh
 又不在终端上无法提议安装时为 42，脚本可以据此退回 ssh。
+
+### 什么挡住了什么：doctor 和 tune
+
+```sh
+qsh doctor myserver         # 在你的机器上：逐个传输方式和端口探测、服务器端的检查、综合诊断
+qsh-server doctor           # 在服务器上：每项检查一行，以及针对本发行版的确切修复命令
+sudo qsh-server tune        # tune 会改什么：先给出 diff，此时什么都不改
+```
+
+`qsh doctor myserver` 经你的 ssh 运行 `qsh-server doctor`，再从你所在的位置探测 daemon 的每个端口上的
+QUIC 和 TLS，以及 ssh 管道：握手时间、往返时延、丢包率和路径 MTU。它把两端的结果合成一句诊断，例如
+*UDP 60443 从这里超时，服务器防火墙放行了它，而服务器在 Amazon EC2 上：多半是安全组挡住了 UDP 60443*，或者
+*服务器上没有任何东西拦 UDP，TLS 可用：是你所在的网络屏蔽了 UDP；qsh 在这个网络上会改用 TLS（并记住）*。
+
+`qsh-server doctor` 检查 daemon、端口、防火墙（ufw、firewalld、nftables、iptables）、UDP 缓冲区、GSO/GRO、
+BBR、IPv6、MTU、linger、运行时目录、SELinux 与 AppArmor、时钟、文件描述符上限、NAT、云厂商（只读 DMI，
+不联网）、容器，以及 ssh 能否找到 `qsh-server`；支持 Debian、Ubuntu、Fedora、RHEL、Rocky、AlmaLinux、
+openSUSE、Arch、Alpine 和 Amazon Linux。它只读不写；`--json` 供脚本使用。
+
+`sudo qsh-server tune --apply` 先展示改动并征得确认，再做它能做的修复：socket 缓冲区上限和 qsh 的 TLS
+连接所用的 BBR（`/etc/sysctl.d/90-qsh.conf`、`/etc/modules-load.d/qsh.conf`）、为 daemon 端口添加的 ufw 或
+firewalld 规则（软件包自带名为 `qsh` 的 firewalld 服务和 ufw 配置，但从不启用），以及在 logind 会于注销时
+结束会话的系统上开启 linger。每项改动都记录在 `/var/lib/qsh/tune.json`，`sudo qsh-server tune --revert`
+只撤销其中仍保持原样的部分。让整台主机的 TCP 都用 BBR（`--bbr-default`）和允许绑定 1024 以下端口
+（`--allow-low-ports=443`）必须显式指定。tune 从不自动运行；`qsh doctor myserver --tune` 会经 `ssh -t`
+在你眼前到服务器上运行它。
 
 ## 工作原理
 

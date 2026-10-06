@@ -107,6 +107,8 @@ included for those who want the daemon supervised.
 install -Dpm 0755 target/rpm/qsh %{buildroot}%{_bindir}/qsh
 install -Dpm 0755 target/rpm/qsh-server %{buildroot}%{_bindir}/qsh-server
 install -Dpm 0644 packaging/systemd/qsh-server.service %{buildroot}%{_userunitdir}/qsh-server.service
+install -Dpm 0644 packaging/firewalld/qsh.xml %{buildroot}%{_prefix}/lib/firewalld/services/qsh.xml
+install -Dpm 0644 packaging/ufw/qsh %{buildroot}%{_sysconfdir}/ufw/applications.d/qsh
 install -Dpm 0644 -t %{buildroot}%{_mandir}/man1 man/qsh.1 man/qsh-server.1
 install -Dpm 0644 -t %{buildroot}%{_mandir}/man5 man/qsh_config.5
 install -Dpm 0644 completions/qsh.bash %{buildroot}%{bash_completions_dir}/qsh
@@ -146,6 +148,14 @@ install -Dpm 0644 -t %{buildroot}%{fish_completions_dir} completions/qsh.fish co
 %doc README.md docs/security.md
 %{_bindir}/qsh-server
 %{_userunitdir}/qsh-server.service
+# The firewalld service and the ufw profile, never enabled (qsh-server doctor names them);
+# the directories are co-owned so that neither firewall needs to be installed
+%dir %{_prefix}/lib/firewalld
+%dir %{_prefix}/lib/firewalld/services
+%{_prefix}/lib/firewalld/services/qsh.xml
+%dir %{_sysconfdir}/ufw
+%dir %{_sysconfdir}/ufw/applications.d
+%config(noreplace) %{_sysconfdir}/ufw/applications.d/qsh
 %{_mandir}/man1/qsh-server.1*
 %{bash_completions_dir}/qsh-server
 %{zsh_completions_dir}/_qsh-server

@@ -54,6 +54,8 @@ package() {
 		-t "$pkgdir"/usr/share/fish/vendor_completions.d/
 
 	install -Dm755 packaging/openrc/qsh-server "$pkgdir"/etc/init.d/qsh-server
+	install -Dm644 packaging/firewalld/qsh.xml "$pkgdir"/usr/lib/firewalld/services/qsh.xml
+	install -Dm644 packaging/ufw/qsh "$pkgdir"/etc/ufw/applications.d/qsh
 
 	install -Dm644 README.md docs/DESIGN.md docs/protocol.md docs/security.md \
 		-t "$pkgdir"/usr/share/doc/$pkgname/
@@ -65,6 +67,8 @@ server() {
 	depends=""
 
 	amove usr/bin/qsh-server
+	amove usr/lib/firewalld
+	amove etc/ufw
 }
 
 server_openrc() {

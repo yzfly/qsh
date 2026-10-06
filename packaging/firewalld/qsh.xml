@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<service>
+  <short>qsh</short>
+  <description>qsh, a remote shell over QUIC. Each user's qsh-server daemon listens on the first port of this range free on both UDP (QUIC) and TCP (TLS); every connection must still authenticate with a session key obtained over ssh. Packages install this file but never enable it: firewall-cmd --permanent --add-service=qsh, or qsh-server tune --apply as root.</description>
+  <port protocol="udp" port="60443-60542"/>
+  <port protocol="tcp" port="60443-60542"/>
+</service>

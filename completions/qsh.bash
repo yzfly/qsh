@@ -19,6 +19,9 @@ _qsh() {
             qsh,attach)
                 cmd="qsh__subcmd__attach"
                 ;;
+            qsh,doctor)
+                cmd="qsh__subcmd__doctor"
+                ;;
             qsh,install)
                 cmd="qsh__subcmd__install"
                 ;;
@@ -35,7 +38,7 @@ _qsh() {
 
     case "${cmd}" in
         qsh)
-            opts="-p -l -i -J -F -o -4 -6 -v -h -V --help --version attach ls kill install"
+            opts="-p -l -i -J -F -o -4 -6 -v -h -V --help --version attach ls kill install doctor"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -74,6 +77,44 @@ _qsh() {
             ;;
         qsh__subcmd__attach)
             opts="-p -l -i -J -F -o -4 -6 -v -h --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                -p)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                -l)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                -i)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                -J)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                -F)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                -o)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        qsh__subcmd__doctor)
+            opts="-p -l -i -J -F -o -4 -6 -v -h --json --tune --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0

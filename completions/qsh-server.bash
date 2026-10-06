@@ -22,6 +22,9 @@ _qsh__server() {
             qsh__server,daemon)
                 cmd="qsh__server__subcmd__daemon"
                 ;;
+            qsh__server,doctor)
+                cmd="qsh__server__subcmd__doctor"
+                ;;
             qsh__server,handoff-probe)
                 cmd="qsh__server__subcmd__handoff__subcmd__probe"
                 ;;
@@ -37,6 +40,9 @@ _qsh__server() {
             qsh__server,stop)
                 cmd="qsh__server__subcmd__stop"
                 ;;
+            qsh__server,tune)
+                cmd="qsh__server__subcmd__tune"
+                ;;
             qsh__server,upgrade)
                 cmd="qsh__server__subcmd__upgrade"
                 ;;
@@ -45,6 +51,9 @@ _qsh__server() {
                 ;;
             qsh__server__subcmd__help,daemon)
                 cmd="qsh__server__subcmd__help__subcmd__daemon"
+                ;;
+            qsh__server__subcmd__help,doctor)
+                cmd="qsh__server__subcmd__help__subcmd__doctor"
                 ;;
             qsh__server__subcmd__help,handoff-probe)
                 cmd="qsh__server__subcmd__help__subcmd__handoff__subcmd__probe"
@@ -61,6 +70,9 @@ _qsh__server() {
             qsh__server__subcmd__help,stop)
                 cmd="qsh__server__subcmd__help__subcmd__stop"
                 ;;
+            qsh__server__subcmd__help,tune)
+                cmd="qsh__server__subcmd__help__subcmd__tune"
+                ;;
             qsh__server__subcmd__help,upgrade)
                 cmd="qsh__server__subcmd__help__subcmd__upgrade"
                 ;;
@@ -71,7 +83,7 @@ _qsh__server() {
 
     case "${cmd}" in
         qsh__server)
-            opts="-v -h -V --help --version bootstrap pipe daemon status stop upgrade handoff-probe help"
+            opts="-v -h -V --help --version bootstrap pipe daemon status stop upgrade doctor tune handoff-probe help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -128,6 +140,28 @@ _qsh__server() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
+        qsh__subcmd__server__subcmd__doctor)
+            opts="-v -h --json --probe --ports --root --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --ports)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --root)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
         qsh__subcmd__server__subcmd__handoff__subcmd__probe)
             opts="-v -h --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
@@ -143,7 +177,7 @@ _qsh__server() {
             return 0
             ;;
         qsh__subcmd__server__subcmd__help)
-            opts="bootstrap pipe daemon status stop upgrade handoff-probe help"
+            opts="bootstrap pipe daemon status stop upgrade doctor tune handoff-probe help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -171,6 +205,20 @@ _qsh__server() {
             return 0
             ;;
         qsh__subcmd__server__subcmd__help__subcmd__daemon)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        qsh__subcmd__server__subcmd__help__subcmd__doctor)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -254,6 +302,20 @@ _qsh__server() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
+        qsh__subcmd__server__subcmd__help__subcmd__tune)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
         qsh__subcmd__server__subcmd__help__subcmd__upgrade)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
@@ -307,6 +369,32 @@ _qsh__server() {
                 return 0
             fi
             case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        qsh__subcmd__server__subcmd__tune)
+            opts="-y -v -h --apply --revert --yes --bbr-default --allow-low-ports --linger --ports --root --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --allow-low-ports)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --ports)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --root)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
                 *)
                     COMPREPLY=()
                     ;;

@@ -1,0 +1,6 @@
+# ufw application profile for qsh (ufw app info qsh). Installed by the packages, never enabled:
+# sudo ufw allow qsh, or sudo qsh-server tune --apply.
+[qsh]
+title=qsh remote shell
+description=qsh, a remote shell over QUIC: each user's daemon listens on UDP (QUIC) and TCP (TLS) on the first free port of 60443-60542; sessions start over ssh
+ports=60443:60542/udp|60443:60542/tcp

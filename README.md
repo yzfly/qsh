@@ -104,8 +104,8 @@ above instead.
 
 qsh listens on the first free UDP and TCP port from 60443–60542 on the server. If a firewall
 blocks them, qsh still works: it falls back to TLS over TCP, then to a pipe through ssh itself.
-`qsh doctor myserver` *(planned, M2)* tells you which transports work and what to open for the
-fastest one.
+`qsh doctor myserver` tells you which transports work from where you are and what to open for
+the fastest one (see below).
 
 ### Sessions outlive the client
 
@@ -155,6 +155,48 @@ At the start of a line, like ssh:
 The remote program's exit status; 255 when qsh itself fails (like ssh); 42 when the host has no
 `qsh-server` and qsh is not on a terminal to offer to install it, so scripts can fall back to
 ssh.
+
+### What blocks what: doctor and tune
+
+```sh
+qsh doctor myserver         # from your machine: every transport and port, the server's checks, a diagnosis
+qsh-server doctor           # on the server: one line per check, the exact fix for this distribution
+sudo qsh-server tune        # what tune would change: a diff, nothing changed yet
+```
+
+`qsh doctor myserver` runs `qsh-server doctor` over your ssh, then probes QUIC and TLS on every
+port the daemon has, and the ssh pipe, from where you are: handshake time, round-trip time, loss
+and path MTU. It combines both sides into a diagnosis, for example *UDP 60443 times out from
+here, the server's firewall allows it, and the server is on Amazon EC2: the security group most
+likely blocks UDP 60443*, or *nothing on the server blocks UDP, and TLS works: your network
+blocks UDP; qsh will use TLS on this network (remembered)*.
+
+```
+  ok    daemon         0.5.0 running, UDP+TCP 60443, 3 sessions
+  fail  firewall       firewalld (zone public) is active and allows neither UDP nor TCP 60443
+                       fix: sudo qsh-server tune --apply
+  warn  udp-buffers    net.core.rmem_max is 212992, net.core.wmem_max is 212992; QUIC on long fast
+                       paths needs 4194304
+                       fix: sudo qsh-server tune --apply
+  info  cloud          Amazon EC2: the instance's security group must allow inbound UDP and TCP
+                       60443-60542; this host cannot see it (try qsh doctor HOST from your client)
+```
+
+`qsh-server doctor` checks the daemon, its ports, the firewall (ufw, firewalld, nftables,
+iptables), UDP buffers, GSO/GRO, BBR, IPv6, MTU, linger, the runtime directory, SELinux and
+AppArmor, the clock, descriptor limits, NAT, the cloud provider (from DMI, no network calls),
+containers, and whether ssh finds `qsh-server`, on Debian, Ubuntu, Fedora, RHEL, Rocky,
+AlmaLinux, openSUSE, Arch, Alpine and Amazon Linux. It only reads; `--json` is for scripts.
+
+`sudo qsh-server tune --apply` makes the fixes it can, after showing them and asking: socket
+buffer limits and BBR for qsh's TLS connections (`/etc/sysctl.d/90-qsh.conf`,
+`/etc/modules-load.d/qsh.conf`), the ufw or firewalld rule for the daemon's ports (the packages
+ship a firewalld service and a ufw profile named `qsh`, never enabled), and linger where logind
+would end sessions at logout. It records every change in `/var/lib/qsh/tune.json`;
+`sudo qsh-server tune --revert` undoes exactly those, where nobody changed them since. BBR for
+every TCP connection of the host (`--bbr-default`) and binding ports below 1024
+(`--allow-low-ports=443`) need their explicit flags. Nothing runs tune for you; `qsh doctor
+myserver --tune` runs it on the server over `ssh -t`, in front of you.
 
 ## How it works
 

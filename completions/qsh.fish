@@ -39,6 +39,7 @@ complete -c qsh -n "__fish_qsh_needs_command" -a "attach" -d 'Reattach a detache
 complete -c qsh -n "__fish_qsh_needs_command" -a "ls" -d 'List sessions: on DESTINATION (over ssh), or the saved ones of every host'
 complete -c qsh -n "__fish_qsh_needs_command" -a "kill" -d 'End a session: its programs get SIGHUP'
 complete -c qsh -n "__fish_qsh_needs_command" -a "install" -d 'Install qsh-server into ~/.local/bin on DESTINATION (builds with feature self-install)'
+complete -c qsh -n "__fish_qsh_needs_command" -a "doctor" -d 'Check this machine, or what works between here and DESTINATION, and what to fix'
 complete -c qsh -n "__fish_qsh_using_subcommand attach" -s p -d 'Port of the ssh server (ssh -p)' -r
 complete -c qsh -n "__fish_qsh_using_subcommand attach" -s l -d 'User to log in as (ssh -l)' -r
 complete -c qsh -n "__fish_qsh_using_subcommand attach" -s i -d 'Identity file (ssh -i); may be repeated' -r -F
@@ -82,3 +83,15 @@ complete -c qsh -n "__fish_qsh_using_subcommand install" -s 4 -d 'Use IPv4 addre
 complete -c qsh -n "__fish_qsh_using_subcommand install" -s 6 -d 'Use IPv6 addresses only (ssh -6)'
 complete -c qsh -n "__fish_qsh_using_subcommand install" -s v -d 'Verbose: qsh\'s own messages, and ssh -v; may be repeated'
 complete -c qsh -n "__fish_qsh_using_subcommand install" -s h -l help -d 'Print help (see more with \'--help\')'
+complete -c qsh -n "__fish_qsh_using_subcommand doctor" -s p -d 'Port of the ssh server (ssh -p)' -r
+complete -c qsh -n "__fish_qsh_using_subcommand doctor" -s l -d 'User to log in as (ssh -l)' -r
+complete -c qsh -n "__fish_qsh_using_subcommand doctor" -s i -d 'Identity file (ssh -i); may be repeated' -r -F
+complete -c qsh -n "__fish_qsh_using_subcommand doctor" -s J -d 'Jump hosts (ssh -J)' -r
+complete -c qsh -n "__fish_qsh_using_subcommand doctor" -s F -d 'ssh configuration file (ssh -F)' -r -F
+complete -c qsh -n "__fish_qsh_using_subcommand doctor" -s o -d 'ssh option (ssh -o); may be repeated' -r
+complete -c qsh -n "__fish_qsh_using_subcommand doctor" -l json -d 'Print JSON (schema in qsh(1)), for scripts'
+complete -c qsh -n "__fish_qsh_using_subcommand doctor" -l tune -d 'Then run sudo qsh-server tune --apply on DESTINATION over ssh -t (it shows its plan and asks first)'
+complete -c qsh -n "__fish_qsh_using_subcommand doctor" -s 4 -d 'Use IPv4 addresses only (ssh -4)'
+complete -c qsh -n "__fish_qsh_using_subcommand doctor" -s 6 -d 'Use IPv6 addresses only (ssh -6)'
+complete -c qsh -n "__fish_qsh_using_subcommand doctor" -s v -d 'Verbose: qsh\'s own messages, and ssh -v; may be repeated'
+complete -c qsh -n "__fish_qsh_using_subcommand doctor" -s h -l help -d 'Print help (see more with \'--help\')'

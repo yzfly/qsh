@@ -115,6 +115,24 @@ Install qsh\-server, of this qsh's version, into ~/.local/bin on DESTINATION; no
 .B \-\-from FILE
 Copy this qsh\-server binary instead (built for the host's system)
 .RE
+.TP
+.B qsh doctor [OPTIONS] [DESTINATION]
+Without DESTINATION: check this machine (network, socket buffers, ssh, path memory). With it: run qsh\-server doctor on DESTINATION over ssh, probe every transport and port from here (QUIC and TLS handshakes pinned to the daemon's certificate, RTT, loss and path MTU, the ssh pipe), show what path memory knows about this network, and say what blocks what, with the exact fix. Nothing is changed on DESTINATION unless \-\-tune is given. Exit status: 0 when nothing failed, 1 when something did, 2 when doctor could not run.
+.RS
+.TP
+.B DESTINATION
+[user@]host to check; without it, only this machine
+.RE
+.RS
+.TP
+.B \-\-json
+Print JSON (schema in qsh(1)), for scripts
+.RE
+.RS
+.TP
+.B \-\-tune
+Then run sudo qsh\-server tune \-\-apply on DESTINATION over ssh \-t (it shows its plan and asks first)
+.RE
 .SH SESSIONS
 A session lives on the server; the client is a replaceable window on it. Detach with
 .BR ~d ,
@@ -161,6 +179,50 @@ List the escapes.
 .TP
 .B ~~
 Send a literal ~.
+.SH DOCTOR
+.B qsh doctor
+checks this machine: the default routes and how network changes are noticed, the UDP socket
+buffer limits, ssh, and path memory.
+.B qsh doctor
+.I HOST
+also runs
+.B qsh\-server doctor \-\-json \-\-probe
+on the host over ssh (see
+.BR qsh\-server (1)),
+then probes every transport and port from here, in parallel: QUIC and TLS handshakes pinned to
+the certificate the report announced (no session is created), QUIC sampled for 3 seconds for
+the round-trip time, loss and path MTU, and the ssh pipe to its preface. It prints this
+machine's checks, one line per transport and port, the host's report, and a diagnosis that
+combines both sides (for example: UDP times out from here although nothing on the host blocks
+it, and TLS works: this network blocks UDP). What worked and what was blocked is recorded in
+path memory, as a connection would record it. With
+.BR \-\-tune ,
+it then runs
+.B sudo qsh\-server tune \-\-apply
+on the host over
+.BR "ssh \-t" ,
+which shows its plan and asks before changing anything.
+.PP
+With
+.BR \-\-json ,
+one object (schema version 1):
+.RS
+.nf
+{"doctor": 1, "destination": "HOST",
+ "client": {"checks": [...], "nat": "..."},
+ "server": {the host's report, see qsh\-server(1)} or null,
+ "server_error": null or why there is no report,
+ "probes": [{"transport": "quic" | "tls" | "ssh", "port": N,
+             "outcome": "ok" | "timeout" | "reset" | "hello" | "refused" | ...,
+             "error", "handshake_ms", "rtt_ms", "loss", "mtu", "observed"}],
+ "diagnosis": ["...", ...]}
+.fi
+.RE
+.PP
+Checks have the form described in
+.BR qsh\-server (1).
+Exit status: 0 when nothing failed; 1 when a check failed, no direct transport works, or the
+host gave no report; 2 when doctor could not run (no report and nothing could be probed).
 .SH EXIT STATUS
 The remote program's exit status, or 128 plus the signal number when a signal killed it;
 0 after detaching;

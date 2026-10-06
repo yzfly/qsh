@@ -810,6 +810,28 @@ pub struct User {
     pub home: PathBuf,
 }
 
+/// Whether the kernel considers the system clock synchronized (an NTP daemon disciplines
+/// it): `adjtimex` without changing anything. None where it cannot tell (not Linux).
+/// For `qsh-server doctor` (m2.md 8.2, `clock`).
+#[cfg(target_os = "linux")]
+pub fn clock_synchronized() -> Option<bool> {
+    // SAFETY: timex is plain old data; all zeroes is a valid value, and modes = 0 makes the
+    // call read only.
+    let mut tx: libc::timex = unsafe { std::mem::zeroed() };
+    // SAFETY: adjtimex fills in the timex the pointer refers to, valid across the call.
+    let state = unsafe { libc::adjtimex(&mut tx) };
+    if state < 0 {
+        return None;
+    }
+    Some(state != libc::TIME_ERROR && tx.status & libc::STA_UNSYNC == 0)
+}
+
+/// Whether the kernel considers the system clock synchronized: unknown on this system.
+#[cfg(not(target_os = "linux"))]
+pub fn clock_synchronized() -> Option<bool> {
+    None
+}
+
 /// The effective user's entry in the password database.
 pub fn passwd_entry() -> Option<User> {
     // SAFETY: passwd is plain old data; all zeroes is a valid value.

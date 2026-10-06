@@ -60,12 +60,12 @@ pub struct QshSubcommandArgs {
 pub enum Invocation {
     /// A session on a host: `qsh [options] destination [command…]`.
     Connect(QshArgs),
-    /// A subcommand: `qsh [options] attach|ls|kill|install …`.
+    /// A subcommand: `qsh [options] attach|ls|kill|install|doctor …`.
     Subcommand(SshArgs, QshCommand),
 }
 
 /// The names of the subcommands.
-pub const SUBCOMMANDS: &[&str] = &["attach", "ls", "kill", "install"];
+pub const SUBCOMMANDS: &[&str] = &["attach", "ls", "kill", "install", "doctor"];
 
 /// The ssh options of qsh that take a value (`-p 22`, or `-p22`).
 const OPTIONS_WITH_VALUES: &[char] = &['p', 'l', 'i', 'J', 'F', 'o'];
@@ -223,6 +223,29 @@ pub enum QshCommand {
         #[arg(long, value_name = "FILE")]
         from: Option<PathBuf>,
     },
+    /// Check this machine, or what works between here and DESTINATION, and what to fix
+    #[command(long_about = "Without DESTINATION: check this machine (network, socket buffers, \
+                      ssh, path memory). With it: run qsh-server doctor on DESTINATION over \
+                      ssh, probe every transport and port from here (QUIC and TLS handshakes \
+                      pinned to the daemon's certificate, RTT, loss and path MTU, the ssh \
+                      pipe), show what path memory knows about this network, and say what \
+                      blocks what, with the exact fix. Nothing is changed on DESTINATION \
+                      unless --tune is given. Exit status: 0 when nothing failed, 1 when \
+                      something did, 2 when doctor could not run.")]
+    Doctor {
+        /// The host to check (user@host or host); without it, only this machine
+        #[arg(
+            value_name = "DESTINATION",
+            help = "[user@]host to check; without it, only this machine"
+        )]
+        destination: Option<String>,
+        /// Print JSON (schema in qsh(1)), for scripts
+        #[arg(long)]
+        json: bool,
+        /// Then run sudo qsh-server tune --apply on DESTINATION over ssh -t (it shows its plan and asks first)
+        #[arg(long, requires = "destination")]
+        tune: bool,
+    },
 }
 
 impl SshArgs {
@@ -271,10 +294,6 @@ impl QshArgs {
         (!self.command.is_empty()).then(|| self.command.join(" "))
     }
 }
-
-/// Names that are not hosts unless written after `--`: the subcommands, and those planned
-/// for later milestones (`qsh doctor`, M2). `qsh -- doctor` is a host named doctor.
-pub const RESERVED: &[&str] = &["doctor"];
 
 /// qsh-server: the server side of qsh, run over ssh by the client, and the per-user daemon.
 #[derive(Debug, Parser)]
@@ -330,9 +349,77 @@ pub enum ServerCommand {
         #[arg(long)]
         force: bool,
     },
+    /// Check this host for everything that slows qsh down or stops a transport
+    #[command(long_about = "Check this host for everything that slows qsh down or stops a \
+                      transport: the daemon, ports, the firewall (ufw, firewalld, nftables, \
+                      iptables), UDP buffers, GSO/GRO, BBR, IPv6, MTU, linger, the runtime \
+                      directory, SELinux and AppArmor, the clock, descriptor limits, NAT, the \
+                      cloud provider (from DMI), containers, and whether qsh finds qsh-server \
+                      over ssh; with the exact fix for this distribution under each problem. \
+                      Read only, no network calls; as root it also reads firewall rules and \
+                      audit logs, and checks the user who ran sudo. Exit status: 0 when no \
+                      check failed, 1 when one did, 2 when doctor could not run.")]
+    Doctor(DoctorArgs),
+    /// Show, apply (root) or revert the host settings that make qsh faster
+    #[command(long_about = "Show what would make this host better for qsh, as a diff for \
+                      files and exact commands for the rest; with --apply (root) make those \
+                      changes after asking, and record them in /var/lib/qsh/tune.json; with \
+                      --revert undo exactly what that record lists, where nobody changed it \
+                      since. It changes only /etc/sysctl.d/90-qsh.conf (UDP buffer limits, \
+                      BBR among the allowed congestion controls), /etc/modules-load.d/qsh.conf \
+                      (tcp_bbr), the same sysctls at runtime, ufw or firewalld rules for the \
+                      daemon's ports, and linger for the user who ran sudo. Never run \
+                      automatically. Raw nftables and iptables rules are printed, not applied.")]
+    Tune(TuneArgs),
     /// Print the version and the handoff state formats this program reads (used by upgrades)
     #[command(name = "handoff-probe", hide = true)]
     HandoffProbe,
+}
+
+/// Options of `qsh-server doctor`.
+#[derive(Debug, Args)]
+pub struct DoctorArgs {
+    /// Print JSON (schema version 1, stable check ids; see qsh-server(1))
+    #[arg(long)]
+    pub json: bool,
+    /// Start the daemon if it does not run, and report its ports and certificate (what qsh doctor HOST runs)
+    #[arg(long)]
+    pub probe: bool,
+    /// The ports to check and open, FIRST-LAST (default: the configured range)
+    #[arg(long, value_name = "FIRST-LAST")]
+    pub ports: Option<String>,
+    /// Read /etc, /proc, /sys and /var under DIR instead of / (tests and image builds)
+    #[arg(long, value_name = "DIR")]
+    pub root: Option<PathBuf>,
+}
+
+/// Options of `qsh-server tune`.
+#[derive(Debug, Args)]
+pub struct TuneArgs {
+    /// Make the changes (root; asks first)
+    #[arg(long, conflicts_with = "revert")]
+    pub apply: bool,
+    /// Undo what tune changed, as recorded in /var/lib/qsh/tune.json (root; asks first)
+    #[arg(long)]
+    pub revert: bool,
+    /// Do not ask (scripts)
+    #[arg(long, short = 'y')]
+    pub yes: bool,
+    /// Also make BBR with fq the default for every TCP connection of the host (sshd's too)
+    #[arg(long)]
+    pub bbr_default: bool,
+    /// Let every user bind ports from PORT up (ip_unprivileged_port_start; single-user hosts only)
+    #[arg(long, value_name = "PORT")]
+    pub allow_low_ports: Option<u16>,
+    /// Enable linger for the user who ran sudo even where logind keeps processes at logout
+    #[arg(long)]
+    pub linger: bool,
+    /// The ports to open, FIRST-LAST (default: the configured range and extra ports)
+    #[arg(long, value_name = "FIRST-LAST")]
+    pub ports: Option<String>,
+    /// Read and change /etc, /proc/sys and /var under DIR instead of / (tests and image builds; no root needed)
+    #[arg(long, value_name = "DIR")]
+    pub root: Option<PathBuf>,
 }
 
 /// Options of `qsh-server daemon`.

@@ -58,6 +58,50 @@ List the escapes.
 .TP
 .B ~~
 Send a literal ~.
+.SH DOCTOR
+.B qsh doctor
+checks this machine: the default routes and how network changes are noticed, the UDP socket
+buffer limits, ssh, and path memory.
+.B qsh doctor
+.I HOST
+also runs
+.B qsh\-server doctor \-\-json \-\-probe
+on the host over ssh (see
+.BR qsh\-server (1)),
+then probes every transport and port from here, in parallel: QUIC and TLS handshakes pinned to
+the certificate the report announced (no session is created), QUIC sampled for 3 seconds for
+the round-trip time, loss and path MTU, and the ssh pipe to its preface. It prints this
+machine's checks, one line per transport and port, the host's report, and a diagnosis that
+combines both sides (for example: UDP times out from here although nothing on the host blocks
+it, and TLS works: this network blocks UDP). What worked and what was blocked is recorded in
+path memory, as a connection would record it. With
+.BR \-\-tune ,
+it then runs
+.B sudo qsh\-server tune \-\-apply
+on the host over
+.BR "ssh \-t" ,
+which shows its plan and asks before changing anything.
+.PP
+With
+.BR \-\-json ,
+one object (schema version 1):
+.RS
+.nf
+{"doctor": 1, "destination": "HOST",
+ "client": {"checks": [...], "nat": "..."},
+ "server": {the host's report, see qsh\-server(1)} or null,
+ "server_error": null or why there is no report,
+ "probes": [{"transport": "quic" | "tls" | "ssh", "port": N,
+             "outcome": "ok" | "timeout" | "reset" | "hello" | "refused" | ...,
+             "error", "handshake_ms", "rtt_ms", "loss", "mtu", "observed"}],
+ "diagnosis": ["...", ...]}
+.fi
+.RE
+.PP
+Checks have the form described in
+.BR qsh\-server (1).
+Exit status: 0 when nothing failed; 1 when a check failed, no direct transport works, or the
+host gave no report; 2 when doctor could not run (no report and nothing could be probed).
 .SH EXIT STATUS
 The remote program's exit status, or 128 plus the signal number when a signal killed it;
 0 after detaching;
@@ -120,7 +164,116 @@ Passed to the session.
 "#;
 
 /// Extra sections of qsh-server(1), in roff.
-const SERVER_EXTRA: &str = r#".SH FILES
+const SERVER_EXTRA: &str = r#".SH DOCTOR
+.B qsh\-server doctor
+checks this host for everything that slows qsh down or stops a transport, and prints the
+exact fix for the distribution it runs on (from
+.IR /etc/os\-release :
+Debian and Ubuntu, Fedora, RHEL, Rocky and AlmaLinux, openSUSE, Arch, Alpine, Amazon Linux;
+other distributions get the generic commands). It only reads: files under
+.IR /proc ,
+.I /sys
+and
+.IR /etc ,
+and the output of status commands; it makes no network calls (the cloud provider comes from
+DMI). Run as root through sudo it also reads firewall rules and audit logs, and checks the
+user who ran sudo (linger, runtime directory).
+.B \-\-probe
+starts the daemon if it does not run and reports its ports and certificate; this is what
+.B qsh doctor
+.I HOST
+runs over ssh.
+.PP
+One line per check, with the fix under each problem. The statuses:
+.B ok
+fine;
+.B info
+worth knowing, nothing to do;
+.B skip
+not applicable, or root is needed to tell;
+.B warn
+works, but slower or fragile;
+.B fail
+a transport or a feature cannot work (qsh still works through the others). The checks, by id:
+.BR daemon ,
+.BR ports ,
+.BR firewall " (ufw, firewalld, nftables, iptables),"
+.BR udp\-buffers ,
+.BR gso\-gro ,
+.BR tcp\-bbr ,
+.BR ipv6 ,
+.BR mtu ,
+.BR linger ,
+.BR runtime\-dir ,
+.BR selinux ,
+.BR apparmor ,
+.BR clock ,
+.BR limits ,
+.BR conntrack ,
+.BR cloud ,
+.BR container ,
+.BR discovery .
+.PP
+With
+.BR \-\-json ,
+one object, on one line when not on a terminal (schema version 1):
+.RS
+.nf
+{"doctor": 1, "version": "X.Y.Z",
+ "host": {"name", "os_id", "os_version", "os_name", "family", "init",
+          "systemd", "kernel", "virt", "container", "cloud"},
+ "daemon": {"running", "version", "pid", "sessions", "can_upgrade",
+            with \-\-probe also "udp", "tcp", "extra_ports", "cert_sha256"},
+ "checks": [{"id", "status": "ok" | "info" | "skip" | "warn" | "fail",
+             "summary", "facts": {...},
+             "fix": {"root", "tune", "tune_flags", "commands", "note"}}]}
+.fi
+.RE
+.PP
+.B fix
+is present only when there is something to do;
+.B tune
+names the fix that
+.B qsh\-server tune
+applies. Ids, statuses and these members are stable; new checks and facts may be added.
+.SH TUNE
+.B qsh\-server tune
+prints what would make this host better for qsh: a unified diff for each file, the exact
+command for everything else. It changes nothing.
+.B \-\-apply
+(root) prints the plan again, asks
+.B Apply these changes? [y/N]
+on the terminal (without a terminal it refuses unless
+.BR \-\-yes ),
+makes the changes and records each one with what undoes it in
+.IR /var/lib/qsh/tune.json .
+Every change is left out when the host already has it, so applying twice changes nothing the
+second time. It may change only:
+.I /etc/sysctl.d/90\-qsh.conf
+and the same settings at once (net.core.rmem_max and wmem_max raised to 4194304, never
+lowered; bbr added to net.ipv4.tcp_allowed_congestion_control);
+.I /etc/modules\-load.d/qsh.conf
+and the tcp_bbr module; ufw rules (comment qsh) or the firewalld service qsh (or ports) in
+the zone of the default route; and linger for the user who ran sudo, where systemd-logind
+kills processes at logout (or with
+.BR \-\-linger ).
+Raw nftables and iptables rulesets are printed, not changed. Inside a container it changes no
+sysctl or module: they belong to the host. Two changes need explicit flags and come with a
+warning:
+.B \-\-bbr\-default
+makes BBR with fq the congestion control of every TCP connection of the host, sshd's included
+(what speeds up the ssh pipe);
+.BI \-\-allow\-low\-ports= PORT
+sets net.ipv4.ip_unprivileged_port_start, so that every local user may bind ports from PORT
+to 1023 (and take a service's port before it starts): appropriate on a single-user host only.
+.PP
+.B \-\-revert
+undoes what the record lists, newest first, and only where the host is still as tune left it:
+a file someone changed since keeps its content, a sysctl set to another value keeps it, both
+with a warning; firewall configuration files nobody changed are restored byte for byte, others
+are undone with the tool's own delete commands. Then the record is deleted. Nothing runs tune
+automatically: not the packages, not the daemon, not the client.
+.SH FILES
 .TP
 .I $XDG_RUNTIME_DIR/qsh/control.sock
 The daemon's control socket (directory mode 0700;
@@ -132,12 +285,31 @@ The daemon's certificate and key.
 .TP
 .I $XDG_STATE_HOME/qsh/daemon.log
 The log of a daemon started on demand.
+.TP
+.IR /etc/sysctl.d/90\-qsh.conf ", " /etc/modules\-load.d/qsh.conf
+Written by
+.B qsh\-server tune \-\-apply
+only.
+.TP
+.I /var/lib/qsh/tune.json
+What tune changed, with what undoes it (mode 0644, no secrets); read by
+.BR "tune \-\-revert" .
+.TP
+.IR /usr/lib/firewalld/services/qsh.xml ", " /etc/ufw/applications.d/qsh
+The firewalld service and the ufw application profile
+.B qsh
+(UDP and TCP 60443-60542), installed by the packages and never enabled by them.
 .SH EXIT STATUS
 .B bootstrap
 exits 0 after a success reply, 1 after an error reply, 2 when invoked wrongly.
 .B status
-exits 3 when no daemon runs. Status 42 is never used: it means
-"no qsh-server" to clients.
+exits 3 when no daemon runs.
+.B doctor
+exits 0 when no check failed, 1 when one did, 2 when it could not run.
+.B tune
+exits 0 after a dry run or a completed change, 1 when it changed nothing it was asked to (no
+root, no confirmation) or a change failed (what was done before is recorded). Status 42 is
+never used: it means "no qsh-server" to clients.
 .SH SEE ALSO
 .BR qsh (1),
 .BR qsh_config (5)
