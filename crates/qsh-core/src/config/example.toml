@@ -1,0 +1,22 @@
+# ~/.config/qsh/config
+
+# The build machines are behind a firewall that drops UDP and TCP: use the ssh pipe
+[host."build*"]
+transports = ["ssh"]
+
+# Hosts of the company, except its lab: no QUIC, no escapes, qsh-server in /opt
+[host."*.corp.example.com,!*.lab.corp.example.com"]
+transports = ["tls", "ssh"]
+escape_char = "none"
+server_command = "/opt/qsh/bin/qsh-server"
+
+# Everywhere else
+[defaults]
+escape_char = "^]"
+keepalive = 25
+ssh_options = ["-o", "ServerAliveInterval=30"]
+
+# The daemon that qsh-server starts on this machine
+[server]
+ports = "61000-61099"
+detached_ttl = "1d"

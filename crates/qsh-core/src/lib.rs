@@ -7,6 +7,8 @@
 //! - [`server::Daemon`] is the per-user daemon that owns sessions; [`server::bootstrap`] and
 //!   [`server::pipe`] are what the client runs over ssh.
 //! - [`hub`] (feature `hub`) keeps one connection per server for many terminals, for embedders.
+//! - [`config`] reads qsh_config(5); [`netwatch`] reports network changes so connections can
+//!   migrate at once.
 //!
 //! The wire protocol is specified in `docs/protocol.md` (qsh/1); [`proto`] implements it.
 //! Paths follow FHS and XDG ([`paths::Paths`]), and embedders can override every one.
@@ -16,11 +18,13 @@
 #![warn(missing_docs)]
 
 pub mod client;
+pub mod config;
 pub mod crypto;
 #[cfg(feature = "hub")]
 pub mod hub;
 pub mod log;
 pub mod mux;
+pub mod netwatch;
 pub mod paths;
 pub mod proto;
 pub mod server;

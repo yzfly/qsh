@@ -33,7 +33,7 @@ build-box:~$ cargo build --release      # close the lid, change networks, open i
 | Typing on a 300 ms link      | laggy | predictive echo                   | laggy            | predictive echo *(planned, M3)* |
 | Flood of output, then Ctrl-C | slow  | instant                           | slow             | instant: smart catch-up *(planned, M2)* |
 | Port forwarding, file copy   | yes   | no                                | forwarding       | over QUIC streams *(planned, M3)* |
-| Server setup                 | sshd  | mosh-server, UDP 60000–61000 open | etserver as root | `qsh-server`: no root, no config; `qsh` offers to install it *(M1)* |
+| Server setup                 | sshd  | mosh-server, UDP 60000–61000 open | etserver as root | `qsh-server`: no root, no config; `qsh` offers to install it |
 | Maintained                   | yes   | last release 2022                 | slow             | yes |
 
 What qsh does not do: it does not replace sshd or your authentication. Every session starts with
@@ -56,7 +56,7 @@ read it first? It is [scripts/install.sh](scripts/install.sh).
 
 ```sh
 cargo install --locked qsh-cli                          # qsh and qsh-server
-cargo install --locked qsh-cli --features self-install  # plus `qsh install HOST` (M1)
+cargo install --locked qsh-cli --features self-install  # plus `qsh install HOST`
 ```
 
 **Packages**: `.deb`, `.rpm` and `.apk` packages are attached to every
@@ -91,24 +91,49 @@ it into `~/.local/bin` on the host with the same script:
 ssh myserver 'curl -fsSL https://github.com/yzfly/qsh/releases/latest/download/install.sh | sh -s -- --server-only'
 ```
 
-When a host does not have it, qsh says so and prints that command. From M1, `qsh` offers to
-install it for you the first time (`qsh install myserver`).
+Or let qsh do it: the first time you connect to a host without `qsh-server`, qsh asks once
+whether to install it, then connects; `qsh install myserver` does it on its own. qsh looks at the
+host's system over ssh, then copies its own `qsh-server` when it was built for that system, or
+downloads the matching release archive on your machine, checks it against the release's
+`SHA256SUMS` and copies it over, so the host needs no internet access. Builds without the
+`self-install` feature (distribution packages) never download anything: they print the command
+above instead.
 
 qsh listens on the first free UDP and TCP port from 60443–60542 on the server. If a firewall
 blocks them, qsh still works: it falls back to TLS over TCP, then to a pipe through ssh itself.
 `qsh doctor myserver` *(planned, M2)* tells you which transports work and what to open for the
 fastest one.
 
-### Sessions outlive the client *(M1)*
+### Sessions outlive the client
 
 ```sh
-qsh myserver          # ... then type  ~d  to detach; the session keeps running
-qsh ls myserver       # sessions on myserver
-qsh attach myserver   # back in, with the output produced while you were away
-qsh kill myserver ID  # end a session
+qsh myserver            # ... then type  ~d  to detach; the session keeps running
+qsh ls                  # the sessions saved on this machine, every host (no network)
+qsh ls myserver         # the sessions on myserver: id, name, state, kind, age, command
+qsh attach myserver     # back in, with the output produced while you were away
+qsh attach myserver 3f2a  # a given session: its id, a unique prefix of it, or its name
+qsh kill myserver 3f2a  # end a session (--all: every session there)
 ```
 
+```
+$ qsh ls myserver
+ID        NAME  STATE     KIND  CREATED    COMMAND
+3f2a9c1e  -     detached  tty   2 h ago    make -j8
+77c0d1aa  -     attached  tty   5 min ago  (login shell)
+```
+
+The credentials of each session are saved in `$XDG_STATE_HOME/qsh/sessions/` (mode 0600), so
+`qsh attach` goes straight to the server, without ssh, even after your laptop rebooted or the
+client was killed. If they are no longer valid, qsh gets new ones over ssh. With several
+detached sessions and none named, qsh asks which (or, in a script, lists them and fails);
+`qsh ls --json` is for scripts.
+
 A detached or disconnected session is kept for 6 hours (1 hour after its program exits).
+
+When the connection is lost for more than 3 seconds, qsh says so on one line: in a full-screen
+program (vim, htop) on the bottom line, drawn over the screen and removed, with a full repaint,
+when the connection is back; in a shell as an ordinary line. qsh notices network changes
+(netlink on Linux, the routing socket on macOS) and moves the connection at once.
 
 ### Escapes
 
@@ -118,7 +143,7 @@ At the start of a line, like ssh:
 | ---- | ------ |
 | `~.` | end the session |
 | `~d` | detach (the session keeps running on the server) |
-| `~s` | connection status: transport, round-trip time, loss, bytes |
+| `~s` | connection status: transport, round-trip time, bytes, time attached, how each transport fared |
 | `~?` | list the escapes |
 | `~~` | send a literal `~` |
 

@@ -64,9 +64,11 @@ fn a_host_without_qsh_server_exits_42_with_a_hint() {
     assert_eq!(out.status.code(), Some(42));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("qsh-server is not installed on nosrv") && stderr.contains("ssh nosrv 'curl -fsSL https://github.com/yzfly/qsh/releases/latest/download/install.sh | sh -s -- --server-only'"),
+        stderr.contains("qsh-server is not installed on user@nosrv") && stderr.contains("ssh user@nosrv 'curl -fsSL https://github.com/yzfly/qsh/releases/latest/download/install.sh | sh -s -- --server-only'"),
         "{stderr}"
     );
+    // Never a question without a terminal
+    assert!(!stderr.contains("[Y/n]"), "{stderr}");
     // ssh failing itself is 255
     let mut w = World::new("nossh");
     w.set("PATH", "/usr/bin:/bin");
@@ -262,4 +264,249 @@ fn the_terminal_mode_comes_back_when_qsh_is_killed() {
     signal(tty.child.id() as i32, "-TERM");
     assert_eq!(tty.exit_code(Duration::from_secs(10)), 143);
     assert!(tty.cooked(), "the terminal was left in raw mode");
+}
+
+/// The id prefix `qsh` prints in "back with: qsh attach srv ID".
+fn attach_hint(text: &str) -> String {
+    let at = text.find("back with: qsh attach srv ").expect("the attach hint") + "back with: qsh attach srv ".len();
+    text[at..].chars().take_while(|c| c.is_ascii_hexdigit()).collect()
+}
+
+/// `~d`, then `qsh attach srv`: everything the program printed while nobody watched arrives,
+/// from the start of the session (FRESH, output from 0), with no ssh involved.
+#[test]
+fn attach_after_detach_replays_the_missed_output() {
+    let world = World::new("reattach");
+    let mut tty = Tty::spawn(world.qsh(&["srv", TICKER]));
+    tty.wait_for("tick-3\r", Duration::from_secs(20));
+    tty.send(b"\r~d");
+    assert_eq!(tty.exit_code(Duration::from_secs(10)), 0);
+    let text = tty.text();
+    let seen = ticks(&text).last().copied().unwrap();
+    let id = attach_hint(&text);
+    assert_eq!(id.len(), 8, "{text:?}");
+    // The credentials are saved, in a private file
+    let saved = world.saved();
+    assert_eq!(saved.len(), 1, "{saved:?}");
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        std::fs::metadata(&saved[0]).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        std::fs::metadata(world.sessions_dir()).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    // `qsh ls` without a host: the saved sessions, no network
+    let (code, out, _) = world.run(&["ls"]);
+    assert_eq!(code, 0);
+    assert!(
+        out.contains("DESTINATION") && out.contains(&id) && out.contains("saved"),
+        "{out}"
+    );
+    std::thread::sleep(Duration::from_secs(1));
+    let bootstraps = world.bootstraps();
+    let mut tty = Tty::spawn(world.qsh(&["attach", "srv"]));
+    tty.wait_for(&format!("tick-{}\r", seen + 30), Duration::from_secs(20));
+    let all = ticks(&tty.text());
+    assert_eq!(all[0], 1, "the buffer is replayed from the start");
+    let expected: Vec<u64> = (1..=*all.last().unwrap()).collect();
+    assert_eq!(all, expected, "ticks lost or repeated");
+    assert_eq!(world.bootstraps(), bootstraps, "no ssh: {}", world.ssh_log());
+    // While attached, `qsh ls` says so
+    let (_, out, _) = world.run(&["ls"]);
+    assert!(out.contains("attached here"), "{out}");
+    tty.send(b"\r~s");
+    tty.wait_for(&format!("session {id}"), Duration::from_secs(5));
+    // The program ends: the saved session is gone with it
+    tty.send(b"\x03");
+    assert_eq!(tty.exit_code(Duration::from_secs(15)), 130);
+    assert!(world.saved().is_empty(), "{:?}", world.saved());
+    let (_, out, _) = world.run(&["ls", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["sessions"].as_array().unwrap().len(), 0, "{v}");
+}
+
+/// A client killed with SIGKILL leaves its session behind; `qsh attach` takes it back with the
+/// saved credentials, at once (the newest attachment wins), without ssh.
+#[test]
+fn attach_after_the_client_was_killed() {
+    let world = World::new("killed");
+    let mut tty = Tty::spawn(world.qsh(&["srv", TICKER]));
+    tty.wait_for("tick-3\r", Duration::from_secs(20));
+    kill(tty.child.id() as i32);
+    let _ = tty.exit_code(Duration::from_secs(5));
+    let seen = ticks(&tty.text()).last().copied().unwrap();
+    let bootstraps = world.bootstraps();
+    let mut tty = Tty::spawn(world.qsh(&["attach", "srv"]));
+    tty.wait_for(&format!("tick-{}\r", seen + 20), Duration::from_secs(20));
+    let all = ticks(&tty.text());
+    let expected: Vec<u64> = (1..=*all.last().unwrap()).collect();
+    assert_eq!(all, expected, "ticks lost or repeated");
+    assert_eq!(world.bootstraps(), bootstraps, "no ssh: {}", world.ssh_log());
+    tty.send(b"\x03");
+    assert_eq!(tty.exit_code(Duration::from_secs(10)), 130);
+    assert!(world.saved().is_empty());
+}
+
+/// Saved credentials that are no longer valid (an old copy of the state file: the key was
+/// rotated since) are refused by the server (AUTH_FAILED); qsh gets new ones over ssh
+/// (bootstrap op `attach`) and attaches the same session.
+#[test]
+fn attach_falls_back_to_ssh_when_the_saved_key_is_stale() {
+    let world = World::new("stale");
+    let mut tty = Tty::spawn(world.qsh(&["srv", "echo ready; exec cat"]));
+    tty.wait_for("ready", Duration::from_secs(20));
+    tty.send(b"\r~d");
+    assert_eq!(tty.exit_code(Duration::from_secs(10)), 0);
+    let file = world.saved().pop().unwrap();
+    let old = std::fs::read(&file).unwrap();
+    // Attaching rotates the key and saves the new one
+    let mut tty = Tty::spawn(world.qsh(&["attach", "srv"]));
+    tty.wait_for("ready", Duration::from_secs(20));
+    tty.send(b"\r~d");
+    assert_eq!(tty.exit_code(Duration::from_secs(10)), 0);
+    assert_ne!(std::fs::read(&file).unwrap(), old, "the new key was saved");
+    // Back to the old key
+    std::fs::write(&file, &old).unwrap();
+    let bootstraps = world.bootstraps();
+    let mut tty = Tty::spawn(world.qsh(&["attach", "srv"]));
+    tty.wait_for("ready", Duration::from_secs(20));
+    tty.send(b"hello\r");
+    tty.wait_for("hello", Duration::from_secs(10));
+    let log = world.ssh_log();
+    assert_eq!(world.bootstraps(), bootstraps + 1, "one bootstrap: {log}");
+    assert!(
+        world.stats()["attach_failures"].as_u64().unwrap() >= 1,
+        "{}",
+        world.stats()
+    );
+    assert_ne!(std::fs::read(&file).unwrap(), old, "the re-issued key was saved");
+    tty.send(b"\r~.");
+    assert_eq!(tty.exit_code(Duration::from_secs(10)), 129);
+}
+
+/// `qsh ls srv` lists the host's sessions, `qsh kill` ends them, one or all.
+#[test]
+fn ls_and_kill_over_ssh() {
+    let world = World::new("lskill");
+    let mut ids = Vec::new();
+    for word in ["first", "second"] {
+        let mut tty = Tty::spawn(world.qsh(&["srv", &format!("echo {word}; exec sleep 1000")]));
+        tty.wait_for(word, Duration::from_secs(20));
+        tty.send(b"\r~d");
+        assert_eq!(tty.exit_code(Duration::from_secs(10)), 0);
+        ids.push(attach_hint(&tty.text()));
+    }
+    let (code, out, err) = world.run(&["ls", "srv"]);
+    assert_eq!(code, 0, "{err}");
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 3, "{out}");
+    assert!(
+        lines[0].starts_with("ID ") && lines[0].contains("STATE") && lines[0].contains("COMMAND"),
+        "{out}"
+    );
+    for (line, (id, word)) in lines[1..].iter().zip(ids.iter().zip(["first", "second"])) {
+        assert!(line.starts_with(id.as_str()), "oldest first: {out}");
+        assert!(
+            line.contains("detached") && line.contains("tty") && line.contains(word),
+            "{out}"
+        );
+    }
+    let (_, out, _) = world.run(&["ls", "--json", "srv"]);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let sessions = v["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 2, "{v}");
+    assert_eq!(sessions[0]["attached"], false);
+    assert_eq!(sessions[0]["session"].as_str().unwrap().len(), 32);
+    assert!(!out.contains("key"), "never a key: {out}");
+    // A prefix, and the saved file goes with the session
+    let (code, out, err) = world.run(&["kill", "srv", &ids[0][..6]]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains(&format!("ended session {}", ids[0])), "{out}");
+    assert_eq!(world.saved().len(), 1);
+    let (_, out, _) = world.run(&["ls", "srv"]);
+    assert!(!out.contains(&ids[0]) && out.contains(&ids[1]), "{out}");
+    // Unknown
+    let (code, _, err) = world.run(&["kill", "srv", "0123456789abcdef0123456789abcdef"]);
+    assert_eq!(code, 255);
+    assert!(err.contains("no session 01234567 on srv"), "{err}");
+    let (code, _, err) = world.run(&["kill", "srv", "nosuchname"]);
+    assert_eq!(code, 255);
+    assert!(err.contains("no session nosuchname on srv"), "{err}");
+    // Everything
+    let (code, out, err) = world.run(&["kill", "srv", "--all"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains(&format!("ended session {}", ids[1])), "{out}");
+    let (_, out, _) = world.run(&["ls", "srv"]);
+    assert_eq!(out.trim(), "no sessions on srv");
+    assert!(world.saved().is_empty());
+    wait_until(
+        Duration::from_secs(5),
+        || world.status().unwrap()["sessions"].as_array().unwrap().is_empty(),
+        "the sessions to end",
+        true,
+    );
+}
+
+/// Without saved credentials (another machine started them), `qsh attach` asks the host:
+/// one detached session is taken, several are a choice, which a script cannot make.
+#[test]
+fn attach_without_saved_credentials_asks_the_host() {
+    let world = World::new("nosaved");
+    for word in ["alpha", "beta"] {
+        let mut tty = Tty::spawn(world.qsh(&["srv", &format!("echo {word}; exec cat")]));
+        tty.wait_for(word, Duration::from_secs(20));
+        tty.send(b"\r~d");
+        assert_eq!(tty.exit_code(Duration::from_secs(10)), 0);
+    }
+    for f in world.saved() {
+        std::fs::remove_file(f).unwrap();
+    }
+    let (code, _, err) = world.run(&["attach", "srv"]);
+    assert_eq!(code, 255);
+    assert!(
+        err.contains("2 detached sessions on srv") && err.contains("alpha") && err.contains("beta"),
+        "{err}"
+    );
+    // On a terminal: a question
+    let mut tty = Tty::spawn(world.qsh(&["attach", "srv"]));
+    tty.wait_for("Attach which? [1-2]", Duration::from_secs(20));
+    tty.send(b"2\r");
+    tty.wait_for("beta", Duration::from_secs(20));
+    tty.send(b"typed\r");
+    tty.wait_for("typed\r\ntyped", Duration::from_secs(10));
+    tty.send(b"\r~d");
+    assert_eq!(tty.exit_code(Duration::from_secs(10)), 0);
+    // Now saved here: by name or prefix, without ssh
+    assert_eq!(world.saved().len(), 1);
+    let id = attach_hint(&tty.text());
+    let bootstraps = world.bootstraps();
+    let mut tty = Tty::spawn(world.qsh(&["attach", "srv", &id]));
+    tty.wait_for("typed", Duration::from_secs(20));
+    assert_eq!(world.bootstraps(), bootstraps);
+    tty.send(b"\r~.");
+    assert_eq!(tty.exit_code(Duration::from_secs(10)), 129);
+    // One detached session left, not saved here: taken without a question
+    let mut tty = Tty::spawn(world.qsh(&["attach", "srv"]));
+    tty.wait_for("alpha", Duration::from_secs(20));
+    tty.send(b"\r~.");
+    assert_eq!(tty.exit_code(Duration::from_secs(10)), 129);
+    let (code, _, err) = world.run(&["attach", "srv"]);
+    assert_eq!(code, 255);
+    assert!(err.contains("no sessions on srv"), "{err}");
+}
+
+/// A host named like a subcommand is reached with `--`.
+#[test]
+fn a_host_named_ls_is_reached_with_double_dash() {
+    let world = World::new("hostls");
+    let (code, out, err) = world.run(&["--", "ls", "echo", "host-named-ls"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out, "host-named-ls\n");
+    assert!(
+        world.ssh_log().lines().any(|l| l.starts_with("ls ")),
+        "{}",
+        world.ssh_log()
+    );
 }

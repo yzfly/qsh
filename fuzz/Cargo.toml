@@ -48,3 +48,17 @@ path = "fuzz_targets/bootstrap.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "config"
+path = "fuzz_targets/config.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "netwatch"
+path = "fuzz_targets/netwatch.rs"
+test = false
+doc = false
+bench = false

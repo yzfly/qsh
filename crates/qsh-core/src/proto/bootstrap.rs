@@ -108,6 +108,26 @@ impl Request {
         }
     }
 
+    /// A `list` request: the user's sessions.
+    pub fn list() -> Request {
+        Request {
+            op: Op::List,
+            versions: Vec::new(),
+            cols: None,
+            rows: None,
+            ..Request::new_session(1, 1)
+        }
+    }
+
+    /// A `kill` request: end `session`.
+    pub fn kill(session: &str) -> Request {
+        Request {
+            op: Op::Kill,
+            session: Some(session.into()),
+            ..Request::list()
+        }
+    }
+
     /// Check what the server needs before it acts: required members and their ranges.
     pub fn validate(&self) -> Result<(), ErrorReply> {
         if self.qsh != BOOTSTRAP_VERSION {
@@ -489,6 +509,20 @@ mod tests {
         let r: Request = serde_json::from_str(r#"{"qsh":1,"op":"kill","session":"xyz"}"#).unwrap();
         assert_eq!(r.validate().unwrap_err().error, ErrorKind::BadRequest);
         assert!(serde_json::from_str::<Request>(r#"{"qsh":1,"op":"dance"}"#).is_err());
+        // list and kill carry only what they need
+        let list = serde_json::to_string(&Request::list()).unwrap();
+        assert_eq!(
+            list,
+            r#"{"qsh":1,"op":"list","client":"qsh/0"}"#.replace("qsh/0", crate::proto::IMPLEMENTATION)
+        );
+        assert!(Request::list().validate().is_ok());
+        let kill = Request::kill(&"ab".repeat(16));
+        assert_eq!(kill.op, Op::Kill);
+        assert!(kill.validate().is_ok() && kill.versions.is_empty() && kill.cols.is_none());
+        assert_eq!(
+            Request::kill("xyz").validate().unwrap_err().error,
+            ErrorKind::BadRequest
+        );
         let mut r = Request::new_session(80, 24);
         r.env.insert("LANG".into(), "C.UTF-8".into());
         r.env.insert("LC_ALL".into(), "x\0".into());

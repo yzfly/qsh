@@ -21,8 +21,10 @@ pub const QSH: &str = env!("CARGO_BIN_EXE_qsh");
 pub const QSH_SERVER: &str = env!("CARGO_BIN_EXE_qsh-server");
 
 /// ssh for tests: runs the remote command on this machine. Destinations containing `nosrv`
-/// have no qsh-server. FAKE_SSH_UDP / FAKE_SSH_TCP rewrite the ports in the bootstrap reply,
-/// to send the client to a port that is blocked.
+/// have no qsh-server; those containing `bare` have none in PATH, but a HOME whose
+/// `~/.local/bin` the discovery command looks in (where `qsh install` puts it). FAKE_SSH_UDP /
+/// FAKE_SSH_TCP rewrite the ports in the bootstrap reply, to send the client to a port that is
+/// blocked. Every remote command is appended to FAKE_SSH_LOG, if set.
 pub const FAKE_SSH: &str = r#"#!/bin/sh
 if [ "$1" = -G ]; then echo "hostname 127.0.0.1"; exit 0; fi
 while [ $# -gt 0 ]; do
@@ -35,8 +37,10 @@ while [ $# -gt 0 ]; do
 done
 dest=$1; shift
 cmd="$*"
+[ -n "$FAKE_SSH_LOG" ] && printf '%s %s\n' "$dest" "$cmd" >> "$FAKE_SSH_LOG"
 case "$dest" in
   *nosrv*) exec env PATH=/usr/bin:/bin HOME=/nonexistent sh -c "$cmd" ;;
+  *bare*) exec env PATH="$(dirname "$0"):/usr/bin:/bin" sh -c "$cmd" ;;
 esac
 case "$cmd" in
   *" bootstrap;"*)
@@ -82,6 +86,7 @@ impl World {
             ("XDG_STATE_HOME".into(), dir.join("state").display().to_string()),
             ("XDG_CONFIG_HOME".into(), dir.join("config").display().to_string()),
             ("QSH_SERVER_PORTS".into(), format!("{port}-{port}")),
+            ("FAKE_SSH_LOG".into(), dir.join("ssh.log").display().to_string()),
             (
                 "PATH".into(),
                 format!("{}:{}:/usr/bin:/bin", dir.join("bin").display(), bin_dir.display()),
@@ -145,6 +150,44 @@ impl World {
 
     pub fn stats(&self) -> Value {
         self.status().expect("a daemon")["stats"].clone()
+    }
+
+    /// The remote commands the fake ssh ran so far, one per line.
+    pub fn ssh_log(&self) -> String {
+        fs::read_to_string(self.dir.join("ssh.log")).unwrap_or_default()
+    }
+
+    /// How many bootstraps (of any op) ran over ssh so far.
+    pub fn bootstraps(&self) -> usize {
+        self.ssh_log().lines().filter(|l| l.contains(" bootstrap;")).count()
+    }
+
+    /// Where qsh keeps saved sessions in this world.
+    pub fn sessions_dir(&self) -> PathBuf {
+        self.dir.join("state/qsh/sessions")
+    }
+
+    /// The saved session files.
+    pub fn saved(&self) -> Vec<PathBuf> {
+        let Ok(entries) = fs::read_dir(self.sessions_dir()) else {
+            return Vec::new();
+        };
+        let mut files: Vec<PathBuf> = entries
+            .filter_map(|e| Some(e.ok()?.path()))
+            .filter(|p| p.extension().is_some_and(|e| e == "json"))
+            .collect();
+        files.sort();
+        files
+    }
+
+    /// Run qsh without a terminal and return (exit code, stdout, stderr).
+    pub fn run(&self, args: &[&str]) -> (i32, String, String) {
+        let out = self.qsh(args).stdin(Stdio::null()).output().unwrap();
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
     }
 }
 

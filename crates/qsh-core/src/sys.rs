@@ -1,5 +1,6 @@
 //! The operating system calls the rest of qsh needs and the standard library does not offer:
-//! pseudo terminals, terminal modes, process groups, file locks and a dual-stack UDP socket.
+//! pseudo terminals, terminal modes, process groups, file locks, a dual-stack UDP socket, the
+//! addresses of network interfaces and the kernel's notifications of network changes.
 //!
 //! This is the only module of qsh with `unsafe` code. Every block is a plain libc call with
 //! arguments that are valid for the duration of the call; each one says why it is sound.
@@ -616,6 +617,161 @@ fn udp_dual_stack(port: u16) -> io::Result<std::net::UdpSocket> {
     Ok(socket)
 }
 
+/// The rtnetlink multicast groups [`route_socket`] joins (`RTMGRP_*` of linux/rtnetlink.h,
+/// kernel ABI; spelled out because the libc crate has them for Linux but not for Android):
+/// links, IPv4 and IPv6 addresses, IPv4 and IPv6 routes.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const RTNETLINK_GROUPS: u32 = 0x1 | 0x10 | 0x40 | 0x100 | 0x400;
+
+/// A socket on which the kernel announces changes of network interfaces, addresses and
+/// routes: rtnetlink (`NETLINK_ROUTE`) on Linux and Android, a routing socket (`PF_ROUTE`) on
+/// macOS; `Unsupported` elsewhere. Non-blocking and close-on-exec; each read(2) returns one
+/// datagram of messages (see [`crate::netwatch`] for what is read from them).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn route_socket() -> io::Result<OwnedFd> {
+    // SAFETY: socket has no memory effects; the result is checked below.
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_NETLINK,
+            libc::SOCK_RAW | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+            libc::NETLINK_ROUTE,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fd is a new descriptor this process owns; the OwnedFd closes it on every path.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    // SAFETY: sockaddr_nl is plain old data; all zeroes is valid (port id 0: the kernel picks).
+    let mut address: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+    address.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+    address.nl_groups = RTNETLINK_GROUPS;
+    // SAFETY: the address points to a sockaddr_nl that lives across the call, with its size.
+    let r = unsafe {
+        libc::bind(
+            fd.as_raw_fd(),
+            &address as *const libc::sockaddr_nl as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+        )
+    };
+    if r != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(fd)
+}
+
+/// A socket on which the kernel announces changes of network interfaces, addresses and
+/// routes: a routing socket (`PF_ROUTE`). Non-blocking and close-on-exec; each read(2)
+/// returns one routing message (see [`crate::netwatch`] for what is read from them).
+#[cfg(target_os = "macos")]
+pub fn route_socket() -> io::Result<OwnedFd> {
+    // SAFETY: socket has no memory effects; the result is checked below. AF_UNSPEC as the
+    // protocol: messages about every address family.
+    let fd = unsafe { libc::socket(libc::PF_ROUTE, libc::SOCK_RAW, libc::AF_UNSPEC) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fd is a new descriptor this process owns; the OwnedFd closes it on every path.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    // No SOCK_CLOEXEC on macOS: set right after; a program spawned in between by another
+    // thread could only inherit a socket that reads routing messages.
+    set_cloexec(fd.as_raw_fd())?;
+    set_nonblocking(&fd)?;
+    Ok(fd)
+}
+
+/// Kernel notifications of network changes are not implemented on this system: always
+/// `Unsupported` ([`crate::netwatch`] polls instead).
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+pub fn route_socket() -> io::Result<OwnedFd> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "no route change notifications on this system",
+    ))
+}
+
+/// An IPv4 or IPv6 address of a network interface, from getifaddrs(3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterfaceAddress {
+    /// The interface's name (`eth0`, `wlan0`, `en0`).
+    pub interface: String,
+    /// The address.
+    pub address: std::net::IpAddr,
+    /// The interface is up and running (`IFF_UP` and `IFF_RUNNING`).
+    pub up: bool,
+    /// The interface is a loopback interface.
+    pub loopback: bool,
+}
+
+/// The IPv4 and IPv6 addresses of every network interface.
+pub fn interface_addresses() -> io::Result<Vec<InterfaceAddress>> {
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs stores a pointer to a list it allocated into `head`, which lives
+    // across the call; the list is freed below with freeifaddrs, once.
+    if unsafe { libc::getifaddrs(&mut head) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let up = (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_uint;
+    let loopback = libc::IFF_LOOPBACK as libc::c_uint;
+    let mut addresses = Vec::new();
+    let mut node = head;
+    while !node.is_null() {
+        // SAFETY: `node` is an element of the list getifaddrs returned, which stays valid
+        // until freeifaddrs below; nothing borrowed from it outlives this loop.
+        let entry = unsafe { &*node };
+        node = entry.ifa_next;
+        // SAFETY: ifa_addr is null or points to a complete socket address of the list.
+        let Some(address) = (unsafe { socket_address_ip(entry.ifa_addr) }) else {
+            continue;
+        };
+        if entry.ifa_name.is_null() {
+            continue;
+        }
+        // SAFETY: ifa_name is a NUL-terminated string of the list (above).
+        let interface = unsafe { CStr::from_ptr(entry.ifa_name) }.to_string_lossy().into_owned();
+        addresses.push(InterfaceAddress {
+            interface,
+            address,
+            up: entry.ifa_flags & up == up,
+            loopback: entry.ifa_flags & loopback != 0,
+        });
+    }
+    // SAFETY: `head` came from getifaddrs and is freed exactly once; no reference into the
+    // list is left (the loop above copied what it needed).
+    unsafe { libc::freeifaddrs(head) };
+    Ok(addresses)
+}
+
+/// The IP address in a socket address; None for other families (link layer, …).
+///
+/// # Safety
+///
+/// `address` must be null or point to a valid socket address whose structure for its family
+/// is complete (getifaddrs gives complete `sockaddr_in` and `sockaddr_in6`).
+unsafe fn socket_address_ip(address: *const libc::sockaddr) -> Option<std::net::IpAddr> {
+    if address.is_null() {
+        return None;
+    }
+    // SAFETY: non-null, and valid by the caller's promise; sa_family is in every sockaddr.
+    // (sa_family_t is u16 on Linux, u8 on macOS: i32::from takes both.)
+    let family = i32::from(unsafe { (*address).sa_family });
+    match family {
+        libc::AF_INET => {
+            // SAFETY: an AF_INET address is a complete sockaddr_in (caller's promise);
+            // read_unaligned makes no assumption about its alignment.
+            let v4 = unsafe { std::ptr::read_unaligned(address as *const libc::sockaddr_in) };
+            // s_addr is in network byte order: its bytes in memory are the address
+            Some(std::net::Ipv4Addr::from(v4.sin_addr.s_addr.to_ne_bytes()).into())
+        }
+        libc::AF_INET6 => {
+            // SAFETY: as above, for an AF_INET6 address and sockaddr_in6.
+            let v6 = unsafe { std::ptr::read_unaligned(address as *const libc::sockaddr_in6) };
+            Some(std::net::Ipv6Addr::from(v6.sin6_addr.s6_addr).into())
+        }
+        _ => None,
+    }
+}
+
 /// The terminal mode of stdin before [`RawMode::enable`], for [`restore_terminal`].
 static SAVED_TERMIOS: std::sync::Mutex<Option<libc::termios>> = std::sync::Mutex::new(None);
 
@@ -762,5 +918,25 @@ mod tests {
     fn udp_socket_binds_an_ephemeral_port() {
         let s = udp_any(0).unwrap();
         assert_ne!(s.local_addr().unwrap().port(), 0);
+    }
+
+    #[test]
+    fn interface_addresses_include_loopback() {
+        let addresses = interface_addresses().unwrap();
+        assert!(
+            addresses.iter().any(|a| a.loopback && a.address.is_loopback()),
+            "{addresses:?}"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn route_socket_opens() {
+        // No root needed for either kind of socket; a sandbox may forbid them, then polling is
+        // what netwatch falls back to
+        match route_socket() {
+            Ok(fd) => assert!(fd.as_raw_fd() >= 0),
+            Err(e) => eprintln!("route socket unavailable here: {e}"),
+        }
     }
 }

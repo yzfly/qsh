@@ -22,6 +22,7 @@ qsh：基于 QUIC 的现代远程 shell，「你能 `ssh host`，就能 `qsh hos
 - 所有 cargo build / test / clippy 都排队、降优先级：`flock /tmp/heavy.lock nice -n 10 cargo ...`，并加 `-j 2`。
 - 开发时用 dev profile，不要在本地跑 release + fat LTO 构建（交给 CI）。
 - 2026-09-28 多个 agent 同时构建把机器拖到失联重启过。
+- 磁盘也紧（根分区常只剩几 GB，2026-10-06 写满导致链接器 bus error）：构建一律 `CARGO_INCREMENTAL=0`；构建前 `df -h /`，剩余不到 3G 先清 `target/debug/incremental` 和自己 scratchpad 里的 target，别的项目的文件不要动。
 
 ## 测试隔离
 

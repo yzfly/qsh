@@ -6,8 +6,43 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use qsh_cli::cli::{parse_ports, DaemonArgs, ServerArgs, ServerCommand};
+use qsh_core::config::{Config, ConfigPaths, ServerSettings};
 use qsh_core::server::{self, Daemon, DaemonLauncher, ServerConfig, StartError, ON_DEMAND_IDLE_EXIT};
 use qsh_core::{log, Paths};
+
+/// Print what is wrong with the configuration files, for people (`qsh-server status`).
+fn report_config(paths: &Paths) {
+    match Config::load(&ConfigPaths::standard(paths)) {
+        Ok((_, warnings)) => {
+            for w in warnings {
+                eprintln!("qsh-server: {w}");
+            }
+        }
+        Err(e) => eprintln!("qsh-server: {e}; the daemon uses the defaults"),
+    }
+}
+
+/// The `[server]` settings of the configuration files, with `QSH_SERVER_PORTS` over them.
+/// A file that cannot be used is reported, and the defaults are used: a broken
+/// /etc/qsh/qsh_config must not lock users out of their sessions.
+fn server_settings(paths: &Paths) -> ServerSettings {
+    let mut settings = match Config::load(&ConfigPaths::standard(paths)) {
+        Ok((config, warnings)) => {
+            for w in warnings {
+                log::info(format_args!("{w}"));
+            }
+            config.server()
+        }
+        Err(e) => {
+            log::info(format_args!("{e}; using the defaults"));
+            ServerSettings::default()
+        }
+    };
+    for w in settings.apply_process_env() {
+        log::info(format_args!("{w}"));
+    }
+    settings
+}
 
 fn main() -> ExitCode {
     let args = match ServerArgs::try_parse() {
@@ -79,38 +114,51 @@ async fn run(command: ServerCommand) -> u8 {
             }
         }
         ServerCommand::Daemon(args) => daemon(paths, launcher, args).await,
-        ServerCommand::Status => match server::request_status(&paths).await {
-            Ok(Some(status)) => {
-                use std::io::Write;
-                // Ignore a closed pipe (`qsh-server status | head`)
-                let _ = writeln!(std::io::stdout(), "{status:#}");
-                0
-            }
-            Ok(None) => {
-                println!("qsh-server: no daemon is running");
-                3
-            }
-            Err(e) => {
-                eprintln!("qsh-server: {e}");
-                1
-            }
-        },
-        ServerCommand::Stop => match server::request_stop(&paths).await {
-            Ok(true) => 0,
-            Ok(false) => {
-                eprintln!("qsh-server: no daemon is running");
-                0
-            }
-            Err(e) => {
-                eprintln!("qsh-server: {e}");
-                1
-            }
-        },
+        ServerCommand::Status => {
+            report_config(&paths);
+            status(&paths).await
+        }
+        ServerCommand::Stop => stop(&paths).await,
+    }
+}
+
+async fn status(paths: &Paths) -> u8 {
+    match server::request_status(paths).await {
+        Ok(Some(status)) => {
+            use std::io::Write;
+            // Ignore a closed pipe (`qsh-server status | head`)
+            let _ = writeln!(std::io::stdout(), "{status:#}");
+            0
+        }
+        Ok(None) => {
+            println!("qsh-server: no daemon is running");
+            3
+        }
+        Err(e) => {
+            eprintln!("qsh-server: {e}");
+            1
+        }
+    }
+}
+
+async fn stop(paths: &Paths) -> u8 {
+    match server::request_stop(paths).await {
+        Ok(true) => 0,
+        Ok(false) => {
+            eprintln!("qsh-server: no daemon is running");
+            0
+        }
+        Err(e) => {
+            eprintln!("qsh-server: {e}");
+            1
+        }
     }
 }
 
 async fn daemon(paths: Paths, mut launcher: DaemonLauncher, args: DaemonArgs) -> u8 {
     let mut config = ServerConfig::new(paths.clone());
+    server_settings(&paths).apply(&mut config);
+    // The command line (or QSH_SERVER_PORTS through it) over the files
     if let Some(text) = &args.ports {
         match parse_ports(text) {
             Some(range) => config.ports = range,

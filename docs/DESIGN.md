@@ -141,7 +141,7 @@ qsh-server doctor | tune [--apply]     host checks; tuning shows a diff and asks
 - Escapes after Enter, like ssh: `~.` end the session, `~d` detach (it keeps running), `~s` connection status (transport, RTT, loss, bytes), `~?` help, `~~` a literal `~`.
 - Server without qsh: on a tty, one question to install it, then connect. Without a tty, exit code 42 and one line (embedders fall back to ssh).
 - A detached or lost client leaves the session on the server for 6 h (1 h after its program exits). Session credentials live in `$XDG_STATE_HOME/qsh/sessions/` (0600) so `qsh attach` works after the client process died.
-- Config: `/etc/qsh/qsh_config` then `~/.config/qsh/config` (TOML), `[defaults]` and `[host."pattern"]` tables, documented in qsh_config(5).
+- Config: `~/.config/qsh/config` then `/etc/qsh/qsh_config` (TOML), `[host."pattern"]` tables (ssh-style patterns, matched against the host as typed and ssh's `HostName`), `[defaults]` and `[server]`, documented in qsh_config(5). First value wins, as in ssh_config: command line > environment > user file > system file > built-in default. Unknown keys are warnings (newer configs work with older qsh); bad values, and files others may write, are errors.
 - Exit codes: the remote program's code; 255 for qsh errors (like ssh); 42 server has no qsh-server; documented in qsh(1).
 
 ## 7. Self-optimizing connections

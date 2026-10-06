@@ -22,18 +22,21 @@ path = "src/bin/qsh-server.rs"
 
 [features]
 default = []
-# `qsh install HOST`: download release binaries (M1); distributions build without it
+# `qsh install HOST` and the offer to install qsh-server: copies this machine's qsh-server or
+# downloads the release archive (with curl or wget, checked against SHA256SUMS). Release builds
+# turn it on; distributions build without it, so that qsh never downloads anything
 self-install = []
 
 [dependencies]
 qsh-core.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-std", "io-util", "signal", "sync", "time"] }
 clap.workspace = true
+# `qsh ls --json`; already in the tree through qsh-core
+serde_json.workspace = true
 
 [dev-dependencies]
 # The hub's end-to-end test drives the library directly
 qsh-core = { workspace = true, features = ["hub"] }
-serde_json.workspace = true
 
 [lints]
 workspace = true

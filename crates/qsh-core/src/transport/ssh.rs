@@ -67,16 +67,32 @@ impl SshCommand {
 
     /// Options qsh adds to every ssh it runs (protocol.md 10.1): no pty, and none of the
     /// forwardings configured for interactive logins.
+    const COMMON: [&'static str; 7] = [
+        "-T",
+        "-o",
+        "ClearAllForwardings=yes",
+        "-o",
+        "ForwardAgent=no",
+        "-o",
+        "ForwardX11=no",
+    ];
+
     fn common(cmd: &mut Command) {
-        cmd.args([
-            "-T",
-            "-o",
-            "ClearAllForwardings=yes",
-            "-o",
-            "ForwardAgent=no",
-            "-o",
-            "ForwardX11=no",
-        ]);
+        cmd.args(Self::COMMON);
+    }
+
+    /// `ssh -T … destination <remote>`, a one-off remote command (`qsh install`) as a blocking
+    /// command, with the options of [`SshCommand::bootstrap`]: interactive unless `batch`. The
+    /// caller sets up stdin, stdout and stderr. `remote` goes through the user's login shell,
+    /// whatever it is: a single-quoted `sh -c` program with the properties of protocol.md 10.2.
+    pub fn one_off(&self, remote: &str, batch: bool) -> std::process::Command {
+        let mut cmd = std::process::Command::new(&self.program);
+        cmd.args(Self::COMMON);
+        if batch {
+            cmd.args(["-o", "BatchMode=yes"]);
+        }
+        cmd.args(&self.options).arg("--").arg(&self.destination).arg(remote);
+        cmd
     }
 
     /// `ssh -T … destination '<discovery> bootstrap'`, interactive: ssh asks for passwords and

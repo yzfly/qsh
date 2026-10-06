@@ -200,14 +200,19 @@ Have accounts on the same host and can run arbitrary programs, bind free ports, 
 
 ### 4.4 Other local users on the client
 
-- **Session state files (milestone M1, `qsh attach`).** They live in
-  `$XDG_STATE_HOME/qsh/sessions/` (directory 0700, files 0600, both created with explicit
-  modes). A state file holds the host, ports, certificate fingerprint, session id, session kind
-  and session key. The client writes them atomically (a temporary file with mode 0600 in the same
-  directory, then rename) so a crash never leaves a truncated key. Until state files exist, and
-  for embedders that keep none, credentials live only in the client's memory and are confirmed
-  at once (protocol §6.5); losing the process then means re-issuing the key over ssh (bootstrap
-  op `attach`).
+- **Session state files (`qsh attach`).** They live in `$XDG_STATE_HOME/qsh/sessions/`
+  (directory 0700, files 0600, both created with explicit modes; a directory or file that others
+  may read, or that belongs to someone else, is refused, never quietly tightened). A state file
+  holds the destination and ssh options, the daemon's host, ports and certificate fingerprint,
+  the session id, the session kind and the session key; no offsets (a new client attaches with
+  FRESH). The client writes them atomically (a temporary file with mode 0600 in the same
+  directory, synced, renamed, then the directory synced) so a crash never leaves a truncated
+  key, and stores every rotated key there before it sends KEY_CONFIRM (protocol §6.5). It
+  deletes the file when the session ends or the server does not know it. A `.lock` file next to
+  it is held (`flock`) by the `qsh` process using the session, which is how `qsh ls` and
+  `qsh attach` tell a session in use on this machine from a detached one. Embedders that keep no
+  state files (the hub) keep credentials only in memory and confirm keys at once; losing the
+  process then means re-issuing the key over ssh (bootstrap op `attach`).
 - The client passes nothing secret to ssh on its command line; the request goes to ssh's stdin.
 - A resident client process shared by embedders (the hub, DESIGN §4) listens on a unix socket
   of mode 0600 in a 0700 directory. Trust is mutual, as for the daemon's control socket

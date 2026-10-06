@@ -126,9 +126,6 @@ fn error_value(kind: ErrorKind, message: impl Into<String>) -> Value {
     serde_json::to_value(ErrorReply::new(kind, message)).unwrap_or(Value::Null)
 }
 
-/// The most sessions a daemon keeps.
-const MAX_SESSIONS: usize = 1000;
-
 /// Carry out a bootstrap request (protocol.md 10.3).
 fn bootstrap_op(shared: &Shared, request: &Request) -> Value {
     if let Err(e) = request.validate() {
@@ -137,7 +134,7 @@ fn bootstrap_op(shared: &Shared, request: &Request) -> Value {
     let session_id = request.session.as_deref().and_then(SessionId::from_hex);
     match request.op {
         Op::New => {
-            if shared.sessions.len() >= MAX_SESSIONS {
+            if shared.sessions.len() >= shared.config.max_sessions {
                 return error_value(ErrorKind::Limit, "too many sessions");
             }
             let spawn = Spawn {
@@ -178,6 +175,7 @@ fn bootstrap_op(shared: &Shared, request: &Request) -> Value {
             credentials(shared, &session.id, &key, session.pipe)
         }
         Op::List => {
+            // Oldest first (`all` sorts them), as `qsh ls` shows them
             let sessions: Vec<SessionInfo> = shared
                 .sessions
                 .all()

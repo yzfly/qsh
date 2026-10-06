@@ -31,7 +31,7 @@ build-box:~$ cargo build --release      # 合上盖子，换个网络，再打�
 | 300 ms 链路上打字         | 卡顿 | 预测回显                      | 卡顿             | 预测回显 *（计划中，M3）* |
 | 大量输出后按 Ctrl-C       | 慢   | 立即                          | 慢               | 立即：智能追帧 *（计划中，M2）* |
 | 端口转发、文件复制        | 有   | 没有                          | 转发             | 走 QUIC 流 *（计划中，M3）* |
-| 服务器端准备              | sshd | mosh-server，开放 UDP 60000–61000 | 以 root 运行 etserver | `qsh-server`：不要 root，不要配置；`qsh` 会提议替你安装 *（M1）* |
+| 服务器端准备              | sshd | mosh-server，开放 UDP 60000–61000 | 以 root 运行 etserver | `qsh-server`：不要 root，不要配置；`qsh` 会提议替你安装 |
 | 维护状态                  | 活跃 | 最后一次发布在 2022 年        | 缓慢             | 活跃 |
 
 qsh 不做的事：它不替代 sshd，也不替代你的认证方式。每个会话都从一次普通的 ssh 登录开始，
@@ -54,7 +54,7 @@ curl -fsSL https://github.com/yzfly/qsh/releases/latest/download/install.sh | sh
 
 ```sh
 cargo install --locked qsh-cli                          # qsh 和 qsh-server
-cargo install --locked qsh-cli --features self-install  # 再加上 `qsh install HOST`（M1）
+cargo install --locked qsh-cli --features self-install  # 再加上 `qsh install HOST`
 ```
 
 **软件包**：每个[发布](https://github.com/yzfly/qsh/releases)都附带 `.deb`、`.rpm` 和 `.apk`。
@@ -89,22 +89,34 @@ qsh myserver -- htop            # 在会话里运行一个命令
 ssh myserver 'curl -fsSL https://github.com/yzfly/qsh/releases/latest/download/install.sh | sh -s -- --server-only'
 ```
 
-主机上没有它时，qsh 会提示并给出这条命令。从 M1 起，第一次连接时 `qsh` 会直接提议替你安装（`qsh install myserver`）。
+也可以交给 qsh：第一次连接一台没有 `qsh-server` 的主机时，qsh 会问一次要不要替你安装，装好后接着连接；
+`qsh install myserver` 单独做这件事。qsh 先经 ssh 看清主机的系统，若本机的 `qsh-server` 正是为该系统构建的
+就直接拷过去，否则在你这台机器上下载对应的发布包、用发布的 `SHA256SUMS` 校验后再拷过去，所以主机不需要能上网。
+不带 `self-install` 特性的构建（发行版软件包）从不下载任何东西，只会给出上面那条命令。
 
 qsh 在服务器上监听 60443–60542 中第一个空闲的 UDP 和 TCP 端口。即使防火墙挡住了它们，qsh
 仍然可用：先退到 TCP 上的 TLS，再退到经由 ssh 本身的管道。`qsh doctor myserver`
 *（计划中，M2）* 会告诉你哪些传输方式可用、要打开什么才能用上最快的那个。
 
-### 会话比客户端活得久 *（M1）*
+### 会话比客户端活得久
 
 ```sh
-qsh myserver          # ……然后输入  ~d  断开（detach），会话继续运行
-qsh ls myserver       # myserver 上的会话
-qsh attach myserver   # 重新接上，离开期间产生的输出一并补上
-qsh kill myserver ID  # 结束一个会话
+qsh myserver              # ……然后输入  ~d  断开（detach），会话继续运行
+qsh ls                    # 本机保存的会话，所有主机（不联网）
+qsh ls myserver           # myserver 上的会话：编号、名字、状态、类型、创建时间、命令
+qsh attach myserver       # 重新接上，离开期间产生的输出一并补上
+qsh attach myserver 3f2a  # 指定会话：编号、编号的唯一前缀或名字
+qsh kill myserver 3f2a    # 结束一个会话（--all：那台主机上的全部会话）
 ```
 
+每个会话的凭据保存在 `$XDG_STATE_HOME/qsh/sessions/`（权限 0600），所以 `qsh attach` 直接连服务器，
+不经过 ssh，即使笔记本重启过、客户端进程被杀掉也一样；凭据失效时 qsh 会经 ssh 换一份新的。
+有多个断开的会话又没指定时，qsh 会问你接哪个（在脚本里则列出它们并报错）；脚本请用 `qsh ls --json`。
+
 断开或掉线的会话保留 6 小时（其中的程序退出后保留 1 小时）。
+
+连接中断超过 3 秒时，qsh 用一行字告诉你：全屏程序（vim、htop）里画在最底行，连接恢复后擦掉并让程序整屏重画；
+在 shell 里就是普通的一行输出。qsh 会察觉网络变化（Linux 用 netlink，macOS 用路由套接字），立刻迁移连接。
 
 ### 转义键
 
@@ -114,7 +126,7 @@ qsh kill myserver ID  # 结束一个会话
 | ---- | ---- |
 | `~.` | 结束会话 |
 | `~d` | 断开（detach），会话在服务器上继续运行 |
-| `~s` | 连接状态：传输方式、往返时延、丢包、字节数 |
+| `~s` | 连接状态：传输方式、往返时延、字节数、本次接入时长、各传输方式的尝试结果 |
 | `~?` | 列出转义键 |
 | `~~` | 输入一个 `~` |
 

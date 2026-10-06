@@ -3,7 +3,7 @@
 //! | what | default |
 //! |---|---|
 //! | configuration | `$XDG_CONFIG_HOME/qsh`, else `~/.config/qsh` |
-//! | state (daemon identity, saved sessions, logs of on-demand daemons) | `$XDG_STATE_HOME/qsh`, else `~/.local/state/qsh` |
+//! | state (daemon identity, saved sessions in `sessions/`, logs of on-demand daemons) | `$XDG_STATE_HOME/qsh`, else `~/.local/state/qsh` |
 //! | runtime (control socket, daemon lock) | `$XDG_RUNTIME_DIR/qsh`, else `/tmp/qsh-$UID` |
 //!
 //! Every field is public: an embedder (TokenSSH keeps everything under its own directory)
@@ -87,6 +87,12 @@ impl Paths {
     /// Where a daemon started on demand (by a bootstrap) writes its log.
     pub fn daemon_log(&self) -> PathBuf {
         self.state.join("daemon.log")
+    }
+
+    /// Where `qsh` keeps the credentials of its sessions (`qsh attach`, `qsh ls`): one file per
+    /// session, mode 0600, in a directory of mode 0700 ([`crate::client::store`]).
+    pub fn sessions_dir(&self) -> PathBuf {
+        self.state.join("sessions")
     }
 
     /// The hub's unix socket (feature `hub`).
@@ -208,7 +214,9 @@ pub fn check_peer(stream: &UnixStream) -> io::Result<()> {
     Ok(())
 }
 
-/// Write a file only the user may read, atomically (a temporary file renamed into place).
+/// Write a file only the user may read, atomically and durably: a temporary file of mode 0600
+/// in the same directory, written and synced, renamed into place, then the directory synced, so
+/// that a crash leaves either the old or the new content, never a truncated file.
 pub fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
@@ -219,9 +227,20 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
         .truncate(true)
         .mode(0o600)
         .open(&tmp)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    fs::rename(tmp, path)
+    let written = file.write_all(bytes).and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(e) = written.and_then(|()| fs::rename(&tmp, path)) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    // The rename itself is durable once the directory is: best effort, some file systems
+    // cannot sync a directory
+    if let Some(dir) = path.parent() {
+        if let Ok(dir) = fs::File::open(dir) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

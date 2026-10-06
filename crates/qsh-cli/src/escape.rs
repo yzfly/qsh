@@ -8,7 +8,8 @@
 //! | `~?` | help |
 //! | `~~` | a literal `~` |
 //!
-//! Any other key after `~` sends both, as ssh does.
+//! Any other key after `~` sends both, as ssh does. The escape character can be another one,
+//! or none (qsh_config(5) `escape_char`).
 
 /// What the user's keystrokes amount to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,38 +26,59 @@ pub enum Action {
     Help,
 }
 
-/// The escape character.
+/// The default escape character.
 pub const ESCAPE: u8 = b'~';
 
-/// The help text for `~?`, with terminal line ends.
-pub const HELP: &str = "Supported escape sequences:\r\n \
-  ~.  end the session\r\n \
-  ~d  detach (the session keeps running on the server)\r\n \
-  ~s  connection status\r\n \
-  ~?  this help\r\n \
-  ~~  send ~\r\n\
-(Escapes are only recognized right after Enter.)\r\n";
+/// How people write the escape character `c`: itself, or `^X` for a control character.
+pub fn escape_name(c: u8) -> String {
+    match c {
+        0x7f => "^?".into(),
+        0..=0x1f => format!("^{}", char::from(c + 0x40)),
+        c => char::from(c).to_string(),
+    }
+}
+
+/// The help text for `~?` with escape character `c`, with terminal line ends.
+pub fn help(c: u8) -> String {
+    let e = escape_name(c);
+    format!(
+        "Supported escape sequences:\r\n \
+  {e}.  end the session\r\n \
+  {e}d  detach (the session keeps running on the server)\r\n \
+  {e}s  connection status\r\n \
+  {e}?  this help\r\n \
+  {e}{e}  send {e}\r\n\
+(Escapes are only recognized right after Enter.)\r\n"
+    )
+}
 
 /// Splits keyboard input into bytes to send and escape actions.
 #[derive(Debug, Clone)]
 pub struct EscapeFilter {
+    escape: Option<u8>,
     at_line_start: bool,
     pending: bool,
 }
 
 impl Default for EscapeFilter {
     fn default() -> Self {
-        EscapeFilter {
-            at_line_start: true,
-            pending: false,
-        }
+        EscapeFilter::with(Some(ESCAPE))
     }
 }
 
 impl EscapeFilter {
-    /// A filter at the start of a line.
+    /// A filter at the start of a line, with `~`.
     pub fn new() -> EscapeFilter {
         EscapeFilter::default()
+    }
+
+    /// A filter with escape character `escape`; None: no escapes, everything is sent.
+    pub fn with(escape: Option<u8>) -> EscapeFilter {
+        EscapeFilter {
+            escape,
+            at_line_start: true,
+            pending: false,
+        }
     }
 
     /// Process keyboard input. Bytes between actions keep their order.
@@ -68,6 +90,12 @@ impl EscapeFilter {
                 actions.push(Action::Send(std::mem::take(send)));
             }
         };
+        let Some(escape) = self.escape else {
+            if !input.is_empty() {
+                actions.push(Action::Send(input.to_vec()));
+            }
+            return actions;
+        };
         for &b in input {
             if self.pending {
                 self.pending = false;
@@ -76,13 +104,13 @@ impl EscapeFilter {
                     b'd' => Some(Action::Detach),
                     b's' => Some(Action::Status),
                     b'?' => Some(Action::Help),
-                    ESCAPE => {
-                        send.push(ESCAPE);
+                    _ if b == escape => {
+                        send.push(escape);
                         self.at_line_start = false;
                         None
                     }
                     _ => {
-                        send.push(ESCAPE);
+                        send.push(escape);
                         send.push(b);
                         self.at_line_start = b == b'\r' || b == b'\n';
                         None
@@ -96,7 +124,7 @@ impl EscapeFilter {
                 }
                 continue;
             }
-            if b == ESCAPE && self.at_line_start {
+            if b == escape && self.at_line_start {
                 self.pending = true;
                 continue;
             }
@@ -137,6 +165,19 @@ mod tests {
         let mut f = EscapeFilter::new();
         assert_eq!(f.feed(b"x\r~"), vec![send("x\r")]);
         assert_eq!(f.feed(b"."), vec![Action::End]);
+    }
+
+    #[test]
+    fn another_escape_character_or_none() {
+        let mut f = EscapeFilter::with(Some(0x1d));
+        assert_eq!(f.feed(b"~."), vec![send("~.")]);
+        assert_eq!(f.feed(b"\r\x1d."), vec![send("\r"), Action::End]);
+        assert_eq!(f.feed(b"\x1d\x1d"), vec![send("\x1d")]);
+        let mut f = EscapeFilter::with(None);
+        assert_eq!(f.feed(b"~.\r~d"), vec![send("~.\r~d")]);
+        assert_eq!(escape_name(b'~'), "~");
+        assert_eq!(escape_name(0x1d), "^]");
+        assert!(help(0x1d).contains("^]d  detach"));
     }
 
     #[test]

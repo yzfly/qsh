@@ -69,7 +69,12 @@ pub struct ServerConfig {
     pub output_replay: usize,
     /// Limits on unauthenticated connections (protocol.md 6.6).
     pub preauth: PreauthLimits,
+    /// The most sessions the daemon keeps; a bootstrap `new` beyond it gets `limit`.
+    pub max_sessions: usize,
 }
+
+/// The default of [`ServerConfig::max_sessions`].
+pub const MAX_SESSIONS: usize = 1000;
 
 impl ServerConfig {
     /// The defaults for `paths`.
@@ -83,6 +88,7 @@ impl ServerConfig {
             shell: None,
             output_replay: crate::session::OUTPUT_REPLAY,
             preauth: PreauthLimits::default(),
+            max_sessions: MAX_SESSIONS,
         }
     }
 }

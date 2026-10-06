@@ -7,6 +7,12 @@
 //!
 //! The terminal side is a pair of channels ([`Terminal`]): input and window sizes in, output
 //! out. The `qsh` command line connects them to its tty; an embedder to anything it likes.
+//!
+//! Credentials live where [`ClientConfig::store`] says: in a [`store::SessionStore`] (what `qsh`
+//! does, so that `qsh attach` works after the client process is gone), or, for embedders that
+//! keep none, in memory only (protocol.md 6.5).
+
+pub mod store;
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -20,9 +26,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
 use crate::crypto::{self, Fingerprint, SessionKey};
-use crate::proto::bootstrap::{self, Credentials, Reply, Request};
+use crate::netwatch::NetWatch;
+use crate::proto::bootstrap::{self, Credentials, ErrorKind, Reply, Request, SessionInfo};
 use crate::proto::limits::{ATTACH_TIMEOUT, RESEND_CHUNK};
-use crate::proto::message::{ATTACH_FRESH, MAX_CONTROL, MAX_HELLO, MAX_TERMINAL, PREFERRED_DATA};
+use crate::proto::message::{ATTACH_FRESH, LATEST, MAX_CONTROL, MAX_HELLO, MAX_TERMINAL, PREFERRED_DATA};
 use crate::proto::varint;
 use crate::proto::{read_message, write_message, ErrorCode, ExitStatus, FramingError, Message, WindowSize};
 use crate::session::{Inbound, ReplayBuffer, INPUT_REPLAY};
@@ -30,6 +37,7 @@ use crate::transport::quic::QuicClient;
 use crate::transport::ssh::{SshCommand, EXIT_CANNOT_EXECUTE, EXIT_COMMAND_NOT_FOUND};
 use crate::transport::{Connection, Race, RaceConfig, RaceError, RecvStream, SendStream, Target, Transport};
 use crate::{log, proto};
+use store::{SavedSession, SessionLock, SessionStore};
 
 /// Exit status of `qsh` when the server has no qsh-server (protocol.md 10.2).
 pub const EXIT_NO_SERVER: i32 = proto::EXIT_NO_SERVER;
@@ -53,6 +61,8 @@ const ACK_DELAY: Duration = Duration::from_millis(200);
 const STABLE_AFTER: Duration = Duration::from_secs(10);
 const BACKOFF_FIRST: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// After a network change, a connection that answers nothing for this long is dead.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// What to run and how to reach the server.
 #[derive(Debug, Clone)]
@@ -78,6 +88,15 @@ pub struct ClientConfig {
     /// whose program has pipes instead of a terminal, so that input and output are carried
     /// byte for byte and stderr apart, as with `ssh host command` without a pty.
     pub tty: bool,
+    /// Where the session's credentials are saved, so that it can be attached again after this
+    /// process is gone (`qsh attach`); every new key is saved there before it is confirmed
+    /// (protocol.md 6.5). None: in memory only, the session can then be reached again only
+    /// through ssh (bootstrap op `attach`).
+    pub store: Option<SessionStore>,
+    /// Attaching a session this process has no stream state for (`qsh attach`, a new client):
+    /// true replays the output the server still buffers (FRESH from offset 0), false starts at
+    /// the current end (LATEST), skipping the backlog. A new session always starts at 0.
+    pub replay_on_attach: bool,
 }
 
 impl ClientConfig {
@@ -93,6 +112,8 @@ impl ClientConfig {
             race: RaceConfig::default(),
             interactive: true,
             tty: true,
+            store: None,
+            replay_on_attach: true,
         }
     }
 }
@@ -159,6 +180,11 @@ pub struct Status {
     pub reconnects: u32,
     /// Output bytes skipped (OUTPUT_GAP).
     pub skipped: u64,
+    /// The session id.
+    pub session: Option<[u8; 16]>,
+    /// How each transport fared in the race of the current connection: "used", "failed: why",
+    /// "not needed" (the race ended before it answered), "off" or "no port".
+    pub attempts: Vec<(Transport, String)>,
 }
 
 /// How a session ended without an error.
@@ -234,8 +260,37 @@ pub fn exit_code(status: &ExitStatus) -> i32 {
     }
 }
 
-/// Run `qsh-server bootstrap` over ssh with `request` on its stdin, and read the reply.
+/// Run `qsh-server bootstrap` over ssh with `request` on its stdin, and read the reply. An
+/// error reply is an error ([`ClientError::Bootstrap`]); see [`bootstrap_reply`] to tell them
+/// apart.
 pub async fn bootstrap(ssh: &SshCommand, request: &Request, interactive: bool) -> Result<Reply, ClientError> {
+    match bootstrap_reply(ssh, request, interactive).await? {
+        Reply::Error(e) => Err(ClientError::Bootstrap(e.to_string())),
+        reply => Ok(reply),
+    }
+}
+
+/// The user's sessions on the host (bootstrap op `list`, protocol.md 10.3).
+pub async fn list_sessions(ssh: &SshCommand, interactive: bool) -> Result<Vec<SessionInfo>, ClientError> {
+    match bootstrap(ssh, &Request::list(), interactive).await? {
+        Reply::Sessions(sessions) => Ok(sessions),
+        other => Err(ClientError::Bootstrap(format!("unexpected reply {other:?}"))),
+    }
+}
+
+/// End a session on the host (bootstrap op `kill`): true when it was ended, false when the
+/// server has no such session.
+pub async fn kill_session(ssh: &SshCommand, session: &str, interactive: bool) -> Result<bool, ClientError> {
+    match bootstrap_reply(ssh, &Request::kill(session), interactive).await? {
+        Reply::Ok => Ok(true),
+        Reply::Error(e) if e.error == ErrorKind::NoSession => Ok(false),
+        Reply::Error(e) => Err(ClientError::Bootstrap(e.to_string())),
+        other => Err(ClientError::Bootstrap(format!("unexpected reply {other:?}"))),
+    }
+}
+
+/// [`bootstrap()`], with an error reply as [`Reply::Error`].
+pub async fn bootstrap_reply(ssh: &SshCommand, request: &Request, interactive: bool) -> Result<Reply, ClientError> {
     let mut child = ssh.bootstrap(!interactive)?;
     let mut stdin = child
         .stdin
@@ -290,7 +345,6 @@ pub async fn bootstrap(ssh: &SshCommand, request: &Request, interactive: bool) -
     // The reply holds the session key
     zeroize::Zeroize::zeroize(&mut output);
     match reply {
-        Ok(Reply::Error(e)) => Err(ClientError::Bootstrap(e.to_string())),
         Ok(reply) => Ok(reply),
         Err(e) => match status.code() {
             Some(0) | Some(1) | None => Err(ClientError::Bootstrap(e.to_string())),
@@ -312,6 +366,8 @@ pub struct Conn {
     shutdown: AtomicBool,
     started: Instant,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// How each transport fared in the race that produced this connection.
+    attempts: Mutex<Vec<(Transport, String)>>,
 }
 
 impl fmt::Debug for Conn {
@@ -385,6 +441,7 @@ impl Conn {
             shutdown: AtomicBool::new(false),
             started,
             tasks: Mutex::new(Vec::new()),
+            attempts: Mutex::new(Vec::new()),
         });
         // The tasks hold only a weak reference: the connection ends when its users drop it
         let writer = tokio::spawn(async move {
@@ -430,6 +487,27 @@ impl Conn {
     fn ping(&self) {
         let _ = self.control.send(Message::Ping {
             data: micros(self.started),
+        });
+    }
+
+    /// Check the path now (the network changed): PING, and close the connection when nothing
+    /// at all arrives within `within`. The sessions on it then race the transports again
+    /// instead of waiting for the dead path timers (protocol.md 12.3, 12.4).
+    pub(crate) fn probe(self: &Arc<Self>, within: Duration) {
+        let sent = Instant::now();
+        self.ping();
+        let conn = Arc::downgrade(self);
+        tokio::spawn(async move {
+            tokio::time::sleep(within).await;
+            if let Some(conn) = conn.upgrade() {
+                if conn.last_received() < sent && !conn.connection.is_closed() {
+                    log::info(format_args!(
+                        "no answer over {} after the network changed; reconnecting",
+                        conn.transport()
+                    ));
+                    conn.close(ErrorCode::NO_ERROR, "path lost");
+                }
+            }
         });
     }
 
@@ -506,10 +584,30 @@ struct Slot {
 
 /// Connections to servers, one per daemon, shared by the sessions to it (a hub carries all
 /// its terminals to a server on one connection). One connection attempt per server at a time.
-#[derive(Debug)]
+///
+/// Inside a tokio runtime a pool watches the network ([`NetWatch`]): when it changes, the QUIC
+/// endpoint moves to the new network, every connection is probed, and sessions waiting to
+/// reconnect try at once ([`Pool::network_changed`]).
 pub struct Pool {
     quic: Arc<QuicClient>,
     slots: Mutex<HashMap<ServerKey, Arc<tokio::sync::Mutex<Slot>>>>,
+    /// Sessions waiting out a back-off wait on this.
+    network: Arc<tokio::sync::Notify>,
+    watcher: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl fmt::Debug for Pool {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Pool").field("quic", &self.quic).finish_non_exhaustive()
+    }
+}
+
+impl Drop for Pool {
+    fn drop(&mut self) {
+        if let Some(watcher) = self.watcher.lock().unwrap().take() {
+            watcher.abort();
+        }
+    }
 }
 
 impl Pool {
@@ -518,12 +616,51 @@ impl Pool {
         Pool::with_quic(Arc::new(QuicClient::new()))
     }
 
-    /// A pool using `quic`'s endpoint.
+    /// A pool using `quic`'s endpoint. Within a tokio runtime it watches the network.
     pub fn with_quic(quic: Arc<QuicClient>) -> Arc<Pool> {
-        Arc::new(Pool {
+        let pool = Arc::new(Pool {
             quic,
             slots: Mutex::new(HashMap::new()),
-        })
+            network: Arc::new(tokio::sync::Notify::new()),
+            watcher: Mutex::new(None),
+        });
+        if tokio::runtime::Handle::try_current().is_ok() {
+            match NetWatch::spawn() {
+                Ok(net) => {
+                    log::debug(format_args!("watching the network ({})", net.mechanism()));
+                    let task = tokio::spawn(watch_network(Arc::downgrade(&pool), net));
+                    *pool.watcher.lock().unwrap() = Some(task);
+                }
+                Err(e) => log::debug(format_args!("not watching the network: {e}")),
+            }
+        }
+        pool
+    }
+
+    /// The network changed (the pool's own watcher calls this; an embedder that hears of
+    /// changes first, such as an Android app, may too): move the QUIC endpoint to a socket on
+    /// the new network, which migrates every QUIC connection; PING every connection and drop
+    /// those that answer nothing within 2 s, so their sessions race the transports again; and
+    /// wake the sessions waiting to reconnect, regardless of their back-off (protocol.md 12.2).
+    pub fn network_changed(&self) {
+        match self.quic.rebind() {
+            Ok(true) => log::debug(format_args!("QUIC moved to {:?}", self.quic.local_addr())),
+            Ok(false) => {}
+            Err(e) => log::info(format_args!("cannot move QUIC to the new network: {e}")),
+        }
+        for conn in self.live() {
+            conn.probe(PROBE_TIMEOUT);
+        }
+        self.network.notify_waiters();
+    }
+
+    fn live(&self) -> Vec<Arc<Conn>> {
+        let slots: Vec<_> = self.slots.lock().unwrap().values().cloned().collect();
+        slots
+            .into_iter()
+            .filter_map(|slot| slot.try_lock().ok().and_then(|s| s.current.clone()))
+            .filter(|c| c.usable())
+            .collect()
     }
 
     /// The QUIC endpoint, e.g. to rebind it when the network changed.
@@ -613,15 +750,30 @@ impl Pool {
     }
 }
 
+/// Follow the network for `pool` until it is dropped.
+async fn watch_network(pool: std::sync::Weak<Pool>, mut net: NetWatch) {
+    loop {
+        let change = net.changed().await;
+        let Some(pool) = pool.upgrade() else { return };
+        log::info(format_args!("the network changed: {}", change.snapshot));
+        if !change.snapshot.is_online() {
+            // No route anywhere: nothing to try until the next change
+            continue;
+        }
+        pool.network_changed();
+    }
+}
+
 /// Race the transports and keep the first connection whose hello succeeds within 5 s
 /// (section 12.1); the others are dropped.
-async fn establish(target: &Target, quic: &Arc<QuicClient>, race: &RaceConfig) -> Result<Arc<Conn>, RaceError> {
-    let mut race = Race::start(target, quic, race);
+async fn establish(target: &Target, quic: &Arc<QuicClient>, config: &RaceConfig) -> Result<Arc<Conn>, RaceError> {
+    let mut race = Race::start(target, quic, config);
     while let Some(connection) = race.next().await {
         let transport = connection.transport();
         match tokio::time::timeout(ATTACH_TIMEOUT, Conn::hello(connection)).await {
             Ok(Ok(conn)) => {
                 log::debug(format_args!("connected over {transport}"));
+                *conn.attempts.lock().unwrap() = attempts(target, config, transport, race.errors());
                 return Ok(conn);
             }
             Ok(Err(e)) => race.failed(transport, e),
@@ -629,6 +781,77 @@ async fn establish(target: &Target, quic: &Arc<QuicClient>, race: &RaceConfig) -
         }
     }
     Err(race.take_errors())
+}
+
+/// How each transport fared in a race that `winner` won, for the status line.
+fn attempts(target: &Target, config: &RaceConfig, winner: Transport, errors: &RaceError) -> Vec<(Transport, String)> {
+    [
+        (Transport::Quic, config.quic, target.udp != 0),
+        (Transport::Tls, config.tls, target.tcp != 0),
+        (Transport::Ssh, config.ssh, true),
+    ]
+    .into_iter()
+    .map(|(transport, delay, port)| {
+        let outcome = if transport == winner {
+            "used".to_string()
+        } else if delay.is_none() {
+            "off".to_string()
+        } else if !port {
+            "no port".to_string()
+        } else if let Some((_, e)) = errors.errors.iter().rev().find(|(t, _)| *t == transport) {
+            format!("failed: {e}")
+        } else {
+            "not needed".to_string()
+        };
+        (transport, outcome)
+    })
+    .collect()
+}
+
+/// Where a session's credentials are saved, and the lock that shows it in use by this process.
+struct Persist {
+    store: SessionStore,
+    record: SavedSession,
+    lock: Option<SessionLock>,
+}
+
+impl Persist {
+    fn new(store: SessionStore, record: SavedSession) -> Persist {
+        let lock = store.lock(&record.destination, &record.session).ok().flatten();
+        Persist { store, record, lock }
+    }
+
+    /// Write the record, durably. Takes the lock if another process held it before.
+    fn save(&mut self) -> io::Result<()> {
+        if self.lock.is_none() {
+            self.lock = self
+                .store
+                .lock(&self.record.destination, &self.record.session)
+                .ok()
+                .flatten();
+        }
+        self.store.save(&self.record)
+    }
+
+    /// Save after a change, telling the user (with -v) when it failed.
+    fn save_or_log(&mut self) -> bool {
+        match self.save() {
+            Ok(()) => true,
+            Err(e) => {
+                log::info(format_args!(
+                    "cannot save the session's credentials in {}: {e}",
+                    self.store.dir().display()
+                ));
+                false
+            }
+        }
+    }
+
+    fn forget(&self) {
+        if let Err(e) = self.store.remove(&self.record.destination, &self.record.session) {
+            log::debug(format_args!("cannot remove the saved session: {e}"));
+        }
+    }
 }
 
 /// The client's state of one session, across connections.
@@ -653,6 +876,12 @@ struct State {
     /// The user asked to end the session; deliver HANGUP on the next attachment.
     hangup: bool,
     input_closed: bool,
+    /// Where the credentials are saved; None: in memory only.
+    persist: Option<Persist>,
+    /// The session is known to be gone (it ended, or the server does not know it).
+    gone: bool,
+    /// A FRESH attach replays the server's buffer (offset 0) rather than starting at LATEST.
+    replay: bool,
 }
 
 impl State {
@@ -769,6 +998,8 @@ enum End {
     Lost(String),
     /// The session cannot go on this way.
     Fatal(ClientError),
+    /// The session is gone for good: it ended, or the server does not know it.
+    Gone(ClientError),
 }
 
 /// One terminal session.
@@ -816,13 +1047,64 @@ impl Session {
             Reply::Credentials(c) => c,
             other => return Err(ClientError::Bootstrap(format!("unexpected reply {other:?}"))),
         };
-        let host = config
-            .ssh
-            .resolve_host()
-            .await
-            .unwrap_or_else(|| host_of(&config.ssh.destination));
-        let state = state_from(&credentials, host, &config.ssh, config.size)?;
-        self.run_attached(state, terminal).await
+        let host = self.daemon_host().await;
+        let mut state = state_from(&credentials, host, &config.ssh, config.size)?;
+        self.persist(&mut state, config.name.clone(), config.command.clone(), store::now());
+        self.drive(state, terminal).await
+    }
+
+    /// Attach a session whose credentials were saved (`qsh attach`): straight to the daemon,
+    /// no ssh needed. The output the server still buffers is replayed (FRESH from offset 0).
+    /// When the key is no longer valid or the daemon's certificate changed, new credentials are
+    /// issued over ssh (bootstrap op `attach`).
+    pub async fn attach_saved(&self, saved: SavedSession, terminal: Terminal) -> Result<Outcome, ClientError> {
+        let target = Target {
+            host: saved.host.clone(),
+            udp: saved.udp,
+            tcp: saved.tcp,
+            fingerprint: saved.fingerprint,
+            ssh: self.config.ssh.clone(),
+        };
+        let mut state = State::new(saved.session, saved.key.clone(), target, saved.pipe, self.config.size);
+        state.replay = self.config.replay_on_attach;
+        if let Some(store) = self.config.store.clone() {
+            state.persist = Some(Persist::new(store, saved));
+        }
+        self.drive(state, terminal).await
+    }
+
+    /// Attach session `session` (32 hex digits) with credentials issued over ssh (bootstrap op
+    /// `attach`): for a session whose credentials are not saved here. It replaces the session's
+    /// keys, so a client attached elsewhere is taken over. `info`, from `list`, is saved with
+    /// the credentials.
+    pub async fn attach_over_ssh(
+        &self,
+        session: &str,
+        info: Option<&SessionInfo>,
+        terminal: Terminal,
+    ) -> Result<Outcome, ClientError> {
+        let config = &self.config;
+        let request = Request::attach(session, config.size.cols, config.size.rows);
+        let credentials = match bootstrap_reply(&config.ssh, &request, config.interactive).await? {
+            Reply::Credentials(c) => c,
+            Reply::Error(e) if e.error == ErrorKind::NoSession => {
+                if let (Some(store), Some(id)) = (&config.store, crypto::unhex::<16>(session)) {
+                    let _ = store.remove(&config.ssh.destination, &id);
+                }
+                return Err(ClientError::SessionLost(format!("no session {session} on the host")));
+            }
+            Reply::Error(e) => return Err(ClientError::Bootstrap(e.to_string())),
+            other => return Err(ClientError::Bootstrap(format!("unexpected reply {other:?}"))),
+        };
+        let host = self.daemon_host().await;
+        let mut state = state_from(&credentials, host, &config.ssh, config.size)?;
+        state.replay = config.replay_on_attach;
+        let (name, command, created) = match info {
+            Some(i) => (i.name.clone(), i.command.clone(), i.created),
+            None => (None, None, store::now()),
+        };
+        self.persist(&mut state, name, command, created);
+        self.drive(state, terminal).await
     }
 
     /// Bootstrap and run, as an exit status: the program's, 0 after detaching, or the
@@ -835,13 +1117,59 @@ impl Session {
         }
     }
 
-    async fn run_attached(&self, mut state: State, mut terminal: Terminal) -> Result<Outcome, ClientError> {
+    /// The host of the daemon for QUIC and TLS: where ssh connects.
+    async fn daemon_host(&self) -> String {
+        let ssh = &self.config.ssh;
+        ssh.resolve_host().await.unwrap_or_else(|| host_of(&ssh.destination))
+    }
+
+    /// Start saving the credentials of a session that has none saved yet.
+    fn persist(&self, state: &mut State, name: Option<String>, command: Option<String>, created: u64) {
+        let Some(store) = self.config.store.clone() else { return };
+        let record = SavedSession {
+            destination: self.config.ssh.destination.clone(),
+            ssh_options: self
+                .config
+                .ssh
+                .options
+                .iter()
+                .map(|o| o.to_string_lossy().into_owned())
+                .collect(),
+            host: state.target.host.clone(),
+            udp: state.target.udp,
+            tcp: state.target.tcp,
+            fingerprint: state.target.fingerprint,
+            session: state.session,
+            key: state.key.clone(),
+            pipe: state.pipe,
+            name,
+            command,
+            created,
+        };
+        let mut persist = Persist::new(store, record);
+        persist.save_or_log();
+        state.persist = Some(persist);
+    }
+
+    /// Run the session, then forget its saved credentials if it is gone.
+    async fn drive(&self, mut state: State, mut terminal: Terminal) -> Result<Outcome, ClientError> {
+        self.status.lock().unwrap().session = Some(state.session);
+        let result = self.run_attached(&mut state, &mut terminal).await;
+        if state.gone || matches!(result, Ok(Outcome::Exited(_))) {
+            if let Some(persist) = &state.persist {
+                persist.forget();
+            }
+        }
+        result
+    }
+
+    async fn run_attached(&self, state: &mut State, terminal: &mut Terminal) -> Result<Outcome, ClientError> {
         let mut backoff = BACKOFF_FIRST;
         let mut wait: Option<Duration> = None;
         let mut retries = Retries::default();
         loop {
             if let Some(d) = wait.take() {
-                if let Some(outcome) = offline(&mut state, &mut terminal, d).await {
+                if let Some(outcome) = offline(state, terminal, d, &self.pool.network).await {
                     return Ok(outcome);
                 }
             }
@@ -851,20 +1179,20 @@ impl Session {
                     log::debug(format_args!("no connection: {e}"));
                     if e.pin_mismatch() && retries.may_reissue() {
                         // The daemon's identity changed: a new pin over ssh, keeping the session
-                        self.reissue(&mut state).await?;
+                        self.reissue(state).await?;
                         continue;
                     }
                     if state.hangup {
                         return Ok(Outcome::Abandoned);
                     }
-                    notify(&terminal, Event::Disconnected(e.to_string()));
+                    notify(terminal, Event::Disconnected(e.to_string()));
                     wait = Some(jitter(backoff));
                     backoff = (backoff * 2).min(BACKOFF_MAX);
                     continue;
                 }
             };
             let attached_at = Instant::now();
-            let end = self.attach(&conn, &mut state, &mut terminal).await?;
+            let end = self.attach(&conn, state, terminal).await?;
             retries.attachment_ended(attached_at.elapsed());
             match end {
                 End::Exited(status) => return Ok(Outcome::Exited(status)),
@@ -873,6 +1201,7 @@ impl Session {
                     // The daemon is stopping and its sessions with it (7.13): no reconnect, and
                     // above all no ssh pipe, whose qsh-server would start a new daemon
                     conn.close(ErrorCode::NO_ERROR, "");
+                    state.gone = true;
                     return Err(ClientError::SessionLost("the server stopped".into()));
                 }
                 End::Lost(why) => {
@@ -884,7 +1213,7 @@ impl Session {
                         status.connected_since = None;
                         status.reconnects += 1;
                     }
-                    notify(&terminal, Event::Disconnected(why));
+                    notify(terminal, Event::Disconnected(why));
                     if attached_at.elapsed() >= STABLE_AFTER {
                         backoff = BACKOFF_FIRST;
                     } else {
@@ -894,7 +1223,8 @@ impl Session {
                 }
                 End::Fatal(ClientError::SessionLost(why)) if why == "AUTH_FAILED" && retries.may_reissue() => {
                     // The key is not valid any more: new credentials over ssh (section 6.4)
-                    self.reissue(&mut state).await?;
+                    log::info(format_args!("the session key was refused; getting a new one over ssh"));
+                    self.reissue(state).await?;
                 }
                 End::Fatal(ClientError::SessionLost(why))
                     if why == "SEQUENCE_ERROR" && retries.may_retry_sequence() =>
@@ -902,22 +1232,38 @@ impl Session {
                     // Attach once more; then give up on the session (section 11.2)
                 }
                 End::Fatal(e) => return Err(e),
+                End::Gone(e) => {
+                    state.gone = true;
+                    return Err(e);
+                }
             }
         }
     }
 
-    /// New credentials for the session over ssh (bootstrap op `attach`).
+    /// New credentials for the session over ssh (bootstrap op `attach`), saved before use.
     async fn reissue(&self, state: &mut State) -> Result<(), ClientError> {
         let request = Request::attach(&crypto::hex(&state.session), state.size.cols, state.size.rows);
-        let credentials = match bootstrap(&self.config.ssh, &request, self.config.interactive).await {
+        let credentials = match bootstrap_reply(&self.config.ssh, &request, self.config.interactive).await {
             Ok(Reply::Credentials(c)) => c,
+            Ok(Reply::Error(e)) => {
+                state.gone = e.error == ErrorKind::NoSession;
+                return Err(ClientError::SessionLost(e.to_string()));
+            }
             Ok(other) => return Err(ClientError::Bootstrap(format!("unexpected reply {other:?}"))),
             Err(ClientError::Bootstrap(e)) => return Err(ClientError::SessionLost(e)),
             Err(e) => return Err(e),
         };
         let fresh = state_from(&credentials, state.target.host.clone(), &self.config.ssh, state.size)?;
-        state.key = fresh.key;
-        state.target = fresh.target;
+        state.key = fresh.key.clone();
+        state.target = fresh.target.clone();
+        if let Some(persist) = state.persist.as_mut() {
+            let record = &mut persist.record;
+            record.key = fresh.key.clone();
+            record.udp = fresh.target.udp;
+            record.tcp = fresh.target.tcp;
+            record.fingerprint = fresh.target.fingerprint;
+            persist.save_or_log();
+        }
         Ok(())
     }
 
@@ -930,8 +1276,18 @@ impl Session {
         let mut recv = BufReader::new(recv);
         let cb = conn.connection.channel_binding(&state.session, &conn.nonce)?;
         let key = state.key.clone();
-        let output_received = if state.fresh { 0 } else { state.output.received() };
-        let error_received = if state.fresh { 0 } else { state.errors.received() };
+        // FRESH: from the start of what the server buffers, or from its current end (7.2)
+        let fresh_start = if state.replay { 0 } else { LATEST };
+        let output_received = if state.fresh {
+            fresh_start
+        } else {
+            state.output.received()
+        };
+        let error_received = if state.fresh {
+            fresh_start
+        } else {
+            state.errors.received()
+        };
         let attach = Message::Attach {
             session: state.session,
             proof: key.proof(&cb),
@@ -1003,11 +1359,23 @@ impl Session {
             state.fresh = false;
         }
         state.input.ack(input_received);
-        // This client keeps credentials in memory only, by design: its memory is where the
-        // credentials live, so the key is stored and confirmed at once (section 6.5)
+        // Section 6.5: the new key is stored where the credentials live before it is confirmed.
+        // Without a store, memory is where they live, and the key is confirmed at once. When it
+        // cannot be saved, it is not confirmed: the old key stays valid on the server, so a
+        // client restarted from the saved state can still attach
         let key_id = next_key.id();
+        let confirm = match state.persist.as_mut() {
+            None => true,
+            Some(persist) => {
+                persist.record.key = next_key.clone();
+                persist.save_or_log()
+            }
+        };
         state.key = next_key;
-        let mut first = vec![Message::KeyConfirm { key_id }];
+        let mut first = Vec::new();
+        if confirm {
+            first.push(Message::KeyConfirm { key_id });
+        }
         let (mut offset, pending) = state.input.read_from(input_received, usize::MAX);
         for chunk in pending.chunks(RESEND_CHUNK) {
             first.push(Message::Input {
@@ -1040,6 +1408,7 @@ impl Session {
             status.remote = conn.connection.remote_address();
             status.connected_since = Some(Instant::now());
             status.bytes_out += pending.len() as u64;
+            status.attempts = conn.attempts.lock().unwrap().clone();
         }
         notify(terminal, Event::Connected(conn.transport()));
         let had_pending = !pending.is_empty();
@@ -1246,13 +1615,21 @@ impl Session {
 }
 
 /// While no connection is up: keep taking input (it is sent after the next attach), sizes
-/// and detach requests, for `duration`.
-async fn offline(state: &mut State, terminal: &mut Terminal, duration: Duration) -> Option<Outcome> {
+/// and detach requests, for `duration`, or until the network changes.
+async fn offline(
+    state: &mut State,
+    terminal: &mut Terminal,
+    duration: Duration,
+    network: &tokio::sync::Notify,
+) -> Option<Outcome> {
     let deadline = tokio::time::Instant::now() + duration;
+    let changed = network.notified();
+    tokio::pin!(changed);
     loop {
         let room = state.input.len() < INPUT_REPLAY;
         tokio::select! {
             _ = tokio::time::sleep_until(deadline) => return None,
+            _ = &mut changed => return None,
             input = terminal.input.recv(), if room && !state.input_closed => match input {
                 // Kept, and sent after the next attach
                 Some(input @ (Input::Data(_) | Input::Eof)) => {
@@ -1333,8 +1710,8 @@ fn attach_error(code: ErrorCode, message: String) -> End {
         format!("{code}: {message}")
     };
     match code {
-        ErrorCode::SESSION_UNKNOWN => End::Fatal(ClientError::SessionLost("it ended, or the server restarted".into())),
-        ErrorCode::SESSION_ENDED => End::Fatal(ClientError::SessionLost("it was ended".into())),
+        ErrorCode::SESSION_UNKNOWN => End::Gone(ClientError::SessionLost("it ended, or the server restarted".into())),
+        ErrorCode::SESSION_ENDED => End::Gone(ClientError::SessionLost("it was ended".into())),
         ErrorCode::SESSION_TAKEN_OVER => End::Fatal(ClientError::TakenOver),
         ErrorCode::AUTH_FAILED => End::Fatal(ClientError::SessionLost("AUTH_FAILED".into())),
         ErrorCode::SEQUENCE_ERROR => End::Fatal(ClientError::SessionLost("SEQUENCE_ERROR".into())),
@@ -1364,28 +1741,39 @@ fn state_from(c: &Credentials, host: String, ssh: &SshCommand, size: WindowSize)
     let session = crypto::unhex::<16>(&c.session).ok_or_else(invalid)?;
     let key = SessionKey::from_hex(&c.key).ok_or_else(invalid)?;
     let fingerprint = Fingerprint::from_hex(&c.cert_sha256).ok_or_else(invalid)?;
-    Ok(State {
-        session,
-        key,
-        target: Target {
-            host,
-            udp: c.udp,
-            tcp: c.tcp,
-            fingerprint,
-            ssh: ssh.clone(),
-        },
-        fresh: true,
-        output: Inbound::default(),
-        pipe: c.pipe(),
-        errors: Inbound::default(),
-        // Twice the limit: input is taken while below it, and never dropped
-        input: ReplayBuffer::new(INPUT_REPLAY * 2),
-        input_eof: None,
-        last_input: None,
-        size,
-        hangup: false,
-        input_closed: false,
-    })
+    let target = Target {
+        host,
+        udp: c.udp,
+        tcp: c.tcp,
+        fingerprint,
+        ssh: ssh.clone(),
+    };
+    Ok(State::new(session, key, target, c.pipe(), size))
+}
+
+impl State {
+    /// A session this process has no stream state for yet: the first ATTACH is FRESH.
+    fn new(session: [u8; 16], key: SessionKey, target: Target, pipe: bool, size: WindowSize) -> State {
+        State {
+            session,
+            key,
+            target,
+            fresh: true,
+            output: Inbound::default(),
+            pipe,
+            errors: Inbound::default(),
+            // Twice the limit: input is taken while below it, and never dropped
+            input: ReplayBuffer::new(INPUT_REPLAY * 2),
+            input_eof: None,
+            last_input: None,
+            size,
+            hangup: false,
+            input_closed: false,
+            persist: None,
+            gone: false,
+            replay: true,
+        }
+    }
 }
 
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
@@ -1533,6 +1921,54 @@ mod tests {
                 error_received: None
             }
         );
+    }
+
+    /// The far end of a pipe connection that does the hello and then answers PINGs, or not.
+    async fn fake_server(conn: Connection, answer: bool) {
+        let (_, mut send, recv) = conn.accept().await.unwrap();
+        let mut recv = BufReader::new(recv);
+        let _hello = read_message(&mut recv, MAX_HELLO).await.unwrap();
+        let hello = Message::ServerHello {
+            version: u64::from(proto::VERSION),
+            nonce: [0; 32],
+            capabilities: Vec::new(),
+            implementation: "test".into(),
+        };
+        write_message(&mut send, &hello).await.unwrap();
+        while let Ok(Some(m)) = read_message(&mut recv, MAX_CONTROL).await {
+            if let (Message::Ping { data }, true) = (m, answer) {
+                write_message(&mut send, &Message::Pong { data }).await.unwrap();
+            }
+        }
+    }
+
+    /// After a network change every connection is probed: one that answers is kept, one that
+    /// answers nothing is closed (its sessions then race the transports again), and sessions
+    /// waiting out a back-off are woken.
+    #[tokio::test]
+    async fn a_network_change_probes_connections_and_wakes_waiting_sessions() {
+        for answer in [true, false] {
+            let (a, b) = tokio::io::duplex(1 << 16);
+            let (ar, aw) = tokio::io::split(a);
+            let (br, bw) = tokio::io::split(b);
+            let client = Connection::pipe(crate::mux::Role::Client, ar, aw, None, None);
+            let server = Connection::pipe(crate::mux::Role::Server, br, bw, None, None);
+            let far = tokio::spawn(fake_server(server, answer));
+            let conn = Conn::hello(client).await.unwrap();
+            conn.probe(Duration::from_millis(300));
+            tokio::time::sleep(Duration::from_millis(700)).await;
+            assert_eq!(conn.connection.is_closed(), !answer, "answer: {answer}");
+            far.abort();
+        }
+        let pool = Pool::new();
+        let network = pool.network.clone();
+        let waiting = tokio::spawn(async move { network.notified().await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        pool.network_changed();
+        tokio::time::timeout(Duration::from_secs(2), waiting)
+            .await
+            .expect("woken")
+            .unwrap();
     }
 
     /// Review L4: a bootstrap whose shell start-up files print more than 1 MiB (here 3 MiB on

@@ -31,6 +31,9 @@ libc = "0.2.150"
 # Wipes session keys from memory when they are dropped. Tiny, no dependencies, packaged by
 # Debian and Fedora, and already in the build through rustls.
 zeroize = { version = "1.7", default-features = false, features = ["alloc"] }
+# qsh_config(5) is TOML. Only the parser: its spanned document tree (toml::de::DeTable) gives
+# the line of every key for warnings, without serde. rust-toml in Debian and Fedora.
+toml = { version = "1", default-features = false, features = ["std", "parse"] }
 clap = { version = "4.5", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "env"] }
 
 [workspace.lints.rust]

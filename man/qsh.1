@@ -6,7 +6,7 @@ qsh \- Remote shell over QUIC: sessions survive network changes, sleep and roami
 .SH SYNOPSIS
 \fBqsh\fR [\fB\-p \fR] [\fB\-l \fR] [\fB\-i \fR] [\fB\-J \fR] [\fB\-F \fR] [\fB\-o \fR] [\fB\-4 \fR] [\fB\-6 \fR] [\fB\-v \fR]... [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] <\fIDESTINATION\fR> [\fICOMMAND\fR] 
 .SH DESCRIPTION
-qsh starts a session on HOST through your own ssh (keys, agent, ~/.ssh/config, passwords and second factors all work), then keeps it alive over QUIC, TLS or an ssh pipe, whichever works, reconnecting and replaying missed output as the network comes and goes.
+qsh starts a session on HOST through your own ssh (keys, agent, ~/.ssh/config, passwords and second factors all work), then keeps it alive over QUIC, TLS or an ssh pipe, whichever works, reconnecting and replaying missed output as the network comes and goes. Detached sessions keep running: qsh ls lists them, qsh attach takes you back.
 .SH OPTIONS
 .TP
 \fB\-p\fR \fI<PORT>\fR
@@ -52,11 +52,98 @@ Escapes (after Enter): ~. end the session, ~d detach, ~s status, ~? help, ~~ a l
 
 Exit status: the remote program\*(Aqs status (128 + N when it was killed by signal N); 255 when
 qsh or ssh failed; 42 when the host has no qsh\-server.
+
+A host named like a subcommand: qsh \-\- ls
 .SH VERSION
 v0.1.1
+.SH SUBCOMMANDS
+ssh options may come before or after the subcommand.
+.TP
+.B qsh attach <DESTINATION> [SESSION]
+Reattach a session that is detached (~d), or whose client was lost. With saved credentials qsh connects straight to the server, without ssh; otherwise, or when they are no longer valid, it gets new ones over ssh. Without SESSION: the only detached session, or a choice among them.
+.RS
+.TP
+.B DESTINATION
+[user@]host the session runs on
+.RE
+.RS
+.TP
+.B SESSION
+Session id (or a unique prefix of it) or name, as qsh ls shows them
+.RE
+.TP
+.B qsh ls [OPTIONS] [DESTINATION]
+List sessions: on DESTINATION (over ssh), or the saved ones of every host
+.RS
+.TP
+.B DESTINATION
+[user@]host to ask; without it, the sessions saved on this machine (no network)
+.RE
+.RS
+.TP
+.B \-\-json
+Print JSON, for scripts
+.RE
+.TP
+.B qsh kill [OPTIONS] <DESTINATION> [SESSION]
+End a session: its programs get SIGHUP
+.RS
+.TP
+.B DESTINATION
+[user@]host the session runs on
+.RE
+.RS
+.TP
+.B SESSION
+Session id (or a unique prefix of it) or name, as qsh ls shows them
+.RE
+.RS
+.TP
+.B \-\-all
+End every session on DESTINATION
+.RE
+.TP
+.B qsh install [OPTIONS] <DESTINATION>
+Install qsh\-server, of this qsh's version, into ~/.local/bin on DESTINATION; no root needed. qsh finds the host's system over ssh, then copies a matching qsh\-server from this machine, or downloads the release archive here, checks it against the release's SHA256SUMS and copies it over; as a last resort it runs the install script on the host. Only in builds with the cargo feature self\-install.
+.RS
+.TP
+.B DESTINATION
+[user@]host to install on
+.RE
+.RS
+.TP
+.B \-\-from FILE
+Copy this qsh\-server binary instead (built for the host's system)
+.RE
+.SH SESSIONS
+A session lives on the server; the client is a replaceable window on it. Detach with
+.BR ~d ,
+or lose the client altogether, and the session keeps running: for 6 hours without a client,
+1 hour after its program exited.
+.B qsh ls
+lists the sessions saved on this machine,
+.B qsh ls
+.I HOST
+those on the host;
+.B qsh attach
+.I HOST
+takes you back, with the output produced meanwhile;
+.B qsh kill
+ends one. Sessions are named by their id, any unique prefix of it, or their name.
+.PP
+The credentials of every session are saved (see FILES), so
+.B qsh attach
+reaches it again without ssh, even after the client process died. When they are no longer
+valid (another client attached it meanwhile, or the daemon's certificate changed), qsh gets new
+ones over ssh.
 .SH ESCAPES
 Typed right after Enter, as with
-.BR ssh (1):
+.BR ssh (1)
+(the escape character is ~ unless
+.B escape_char
+in
+.BR qsh_config (5)
+says otherwise):
 .TP
 .B ~.
 End the session: its programs get SIGHUP.
@@ -65,7 +152,9 @@ End the session: its programs get SIGHUP.
 Detach: the session keeps running on the server.
 .TP
 .B ~s
-Show the connection: transport, round-trip time, bytes, reconnects.
+Show the connection: transport and address, round-trip time, bytes, how long this attachment
+has lasted, reconnects, how each transport fared when the connection was made, and the
+session id.
 .TP
 .B ~?
 List the escapes.
@@ -79,7 +168,25 @@ The remote program's exit status, or 128 plus the signal number when a signal ki
 when qsh or ssh failed;
 .B 42
 when the host has no
-.BR qsh\-server .
+.B qsh\-server
+(on a terminal, builds with
+.B qsh install
+offer to install it first, unless
+.B install = "never"
+in
+.BR qsh_config (5)).
+.SH FILES
+.TP
+.I $XDG_STATE_HOME/qsh/sessions/
+Saved session credentials, one file per session (mode 0600, directory 0700; default
+.IR ~/.local/state/qsh/sessions/ ).
+Each holds the destination and ssh options, the server's ports and certificate fingerprint,
+and the session key: as sensitive as an ssh private key while the session lives. qsh removes a
+file when its session ends, and refuses files and directories other users may read.
+.TP
+.IR $XDG_CONFIG_HOME/qsh/config ", " /etc/qsh/qsh_config
+Configuration, see
+.BR qsh_config (5).
 .SH ENVIRONMENT
 .TP
 .B QSH_TRANSPORTS
@@ -87,6 +194,12 @@ Comma-separated transports to use, of quic, tls and ssh; all when unset.
 .TP
 .B QSH_SSH
 The ssh program to run instead of ssh from PATH.
+.TP
+.B QSH_DOWNLOAD_URL
+Where
+.B qsh install
+downloads releases from, instead of https://github.com/yzfly/qsh/releases (a mirror;
+https:// or file:// only).
 .TP
 .BR LANG ", " LANGUAGE ", " LC_* ", " COLORTERM ", " TERM
 Passed to the session.

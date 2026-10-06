@@ -2,18 +2,16 @@
 .SH NAME
 qsh_config \- qsh configuration files
 .SH SYNOPSIS
-.I /etc/qsh/qsh_config
-.br
 .I $XDG_CONFIG_HOME/qsh/config
+.RI ( ~/.config/qsh/config )
+.br
+.I /etc/qsh/qsh_config
 .SH DESCRIPTION
-This version of
 .BR qsh (1)
-reads no configuration file. The paths above are reserved for a later version, which will
-read a TOML file with a
-.B [defaults]
-table and
-.B [host."pattern"]
-tables, the user's file overriding the system's.
+and
+.BR qsh\-server (1)
+need no configuration. These files only change their defaults: the user's file first,
+then the system's. Neither has to exist.
 .PP
 Everything about reaching a host comes from
 .BR ssh (1)
@@ -24,33 +22,256 @@ host aliases, users, ports, keys, agents, jump hosts and known hosts work for
 .B qsh
 exactly as for
 .BR ssh .
+These files hold only what is particular to qsh.
+.PP
+The files are TOML (https://toml.io), with three kinds of table:
+.TP
+.BI [host." pattern "]
+Settings for the hosts that match
+.I pattern
+(see
+.BR PATTERNS ).
+A file may have any number of them.
+.TP
+.B [defaults]
+Settings for every host.
+.TP
+.B [server]
+Settings of the
+.BR qsh\-server (1)
+daemon on the machine whose file this is (see
+.BR "SERVER SETTINGS" ).
+.SH PRECEDENCE
+For each setting, the first value found is used, as in
+.BR ssh_config (5):
+the user's file is read before the system's, and in each file the matching
+.B [host]
+tables are read in the order they appear, then
+.BR [defaults] .
+Put specific tables before general ones. A setting in the user's
+.B [defaults]
+thus wins over one in a
+.B [host]
+table of the system's file.
+.PP
+Environment variables (see
+.BR ENVIRONMENT )
+override both files, and command line options override everything:
+.PP
+.RS
+command line > environment > user's file > system's file > built-in default
+.RE
+.SH PATTERNS
+The name of a
+.B [host]
+table is a list of patterns separated by commas or spaces. In a pattern,
+.B *
+matches any run of characters and
+.B ?
+exactly one; letters match regardless of case. A pattern that starts with
+.B !
+is negated.
+.PP
+The table applies to a connection when one of its patterns matches the host as typed on the
+command line (without the user name and port) or the host name that
+.BR ssh (1)
+resolves it to (its
+.B HostName
+setting), and no negated pattern matches either of them. A list of negated patterns alone
+matches nothing.
+.PP
+.RS
+.nf
+[host."web*"]                      # web, web1, WEB\-db
+[host."*.example.com,!*.lab.example.com"]
+[host."jump? gateway"]             # jump1, jumpx, gateway
+.fi
+.RE
+.SH CLIENT SETTINGS
+These may appear in
+.B [host]
+tables and in
+.BR [defaults] .
+.TP
+.B transports
+The transports to try, in order of preference, of \fB"quic"\fR (QUIC over UDP),
+\fB"tls"\fR (TLS over TCP) and \fB"ssh"\fR (a pipe through
+.BR ssh (1)).
+They are raced: the first starts at once, each next one 400 ms after the one before, but the
+ssh pipe, which costs an ssh login, not before 3 seconds unless it comes first. Transports
+not listed are not used. Default: \fB["quic", "tls", "ssh"]\fR.
+.TP
+.B server_command
+The path of
+.B qsh\-server
+on the host, for installations outside the search path. Default: search
+.B PATH
+and
+.IR ~/.local/bin .
+.TP
+.B escape_char
+The escape character (see
+.BR qsh (1)):
+one character, \fB"^\fIX\fB"\fR for a control character (\fB"^]"\fR), or \fB"none"\fR to
+turn escapes off. Default: \fB"~"\fR.
+.TP
+.B predict
+Predictive local echo: \fB"auto"\fR, \fB"always"\fR or \fB"never"\fR. Reserved: this
+version never predicts. Default: \fB"auto"\fR.
+.TP
+.B status_line
+Show a status line while the connection is lost: \fBtrue\fR or \fBfalse\fR. Default:
+\fBtrue\fR.
+.TP
+.B ssh
+The ssh program to run. Default: \fBssh\fR, from
+.BR PATH .
+.TP
+.B ssh_options
+Options for
+.BR ssh (1),
+an array of strings such as \fB["\-o", "ServerAliveInterval=30"]\fR. They are given after
+the options of the command line, so those win (ssh uses the first value it gets). Default:
+none.
+.TP
+.B keepalive
+How often to send something on an idle connection, so that NAT routers keep it open: a time
+(see
+.BR "TIME AND SIZE FORMATS" )
+of 1 second to 1 hour, or \fB"auto"\fR for qsh's own interval. Default: \fB"auto"\fR.
+.TP
+.B install
+What to do when the host has no
+.BR qsh\-server :
+\fB"ask"\fR offers once, on a terminal, to install it; \fB"never"\fR exits with status 42.
+Default: \fB"ask"\fR.
+.TP
+.B replay_on_attach
+When a new client attaches to a running session, show the output the server kept for it:
+\fBtrue\fR or \fBfalse\fR. Default: \fBtrue\fR.
+.SH SERVER SETTINGS
+These go in the
+.B [server]
+table and its
+.B [server.preauth]
+table. They are read by
+.BR qsh\-server (1)
+from the files of the user it runs as (each user has a daemon of their own), the user's file
+again before the system's.
+.TP
+.B ports
+The ports the daemon may listen on: it uses the first one free on both UDP and TCP, so that
+every user of a shared host gets one. \fB"\fIFIRST\fB\-\fILAST\fB"\fR or a port number.
+Default: \fB"60443\-60542"\fR.
+.TP
+.B extra_ports
+More ports to listen on, for networks that block the first, as an array of port numbers.
+Reserved: this version does not use it.
+.TP
+.B max_sessions
+The most sessions one daemon keeps, from 1 to 100000. Default: 1000.
+.TP
+.B detached_ttl
+How long a session nobody is attached to is kept (its programs then get SIGHUP), a time of
+at most a year. Default: \fB"6h"\fR.
+.TP
+.B exited_ttl
+How long a session whose program exited is kept for its client to collect the output, a
+time of at most a year. Default: \fB"1h"\fR.
+.TP
+.B replay_bytes
+How much output each session keeps for clients that come back, a size from 1 MiB to 1 GiB.
+Default: \fB"8M"\fR.
+.PP
+.B [server.preauth]
+limits the connections that have not authenticated yet:
+.TP
+.B connections
+Unauthenticated connections per daemon, from 1 to 65536. Default: 64.
+.TP
+.B per_source
+Unauthenticated connections per source address (IPv6: per /64), from 1 to 65536. Default: 8.
+.TP
+.B failure_burst
+Failed authentications a source may cause in a burst before it is refused for a while, from
+1 to 10000. Default: 10.
+.TP
+.B failure_refill
+After a burst, one more failure is allowed per this much time, from 1 second to a day.
+Default: \fB"6s"\fR.
+.SH TIME AND SIZE FORMATS
+A time is a number of seconds, or a string of numbers each followed by a unit,
+.B s
+(seconds),
+.B m
+(minutes),
+.B h
+(hours),
+.B d
+(days) or
+.B w
+(weeks), which are added up: \fB30\fR, \fB"90s"\fR, \fB"10m"\fR, \fB"1h30m"\fR.
+.PP
+A size is a number of bytes, or a string of a number followed by
+.BR K ,
+.B M
+or
+.B G
+(powers of 1024; \fBKiB\fR, \fBMiB\fR and \fBGiB\fR mean the same): \fB"8M"\fR.
+.SH ERRORS AND COMPATIBILITY
+A setting this version does not know, and a transport it does not know, are reported as
+warnings with the file and line, and ignored: a file written for a newer version of qsh
+works with an older one.
+.PP
+Any other problem stops qsh with a message that names the file and line: a syntax error, a
+value of the wrong type or out of range, a file that is not a regular file, is larger than
+1 MiB or is not UTF\-8.
+.PP
+Like
+.BR ssh (1)
+with its own files, qsh refuses a file that belongs to a user other than the one running it
+or root, or that its group or others may write to, since the file names programs that qsh
+runs.
+.B chmod go\-w
+.I file
+fixes the latter. A file that exists but cannot be read is ignored with a warning.
 .SH ENVIRONMENT
 .TP
 .B QSH_TRANSPORTS
-Comma-separated transports
-.B qsh
-may use, of
-.BR quic ,
-.B tls
-and
-.BR ssh ;
-all three when unset. For diagnosing networks.
+Comma-separated transports, as
+.BR transports ;
+overrides the files. For diagnosing networks.
 .TP
 .B QSH_SSH
-The ssh program
-.B qsh
-runs, instead of
-.B ssh
-from
-.BR PATH .
+The ssh program, as
+.BR ssh ;
+overrides the files.
 .TP
 .B QSH_SERVER_PORTS
 The port range
 .RI ( FIRST\-LAST )
 of a
 .BR qsh\-server (1)
-daemon started on demand; 60443\-60542 when unset.
+daemon, as
+.B ports
+in
+.BR [server] ;
+overrides the files.
+.TP
+.B XDG_CONFIG_HOME
+Where the user's file is:
+.IR $XDG_CONFIG_HOME/qsh/config ,
+with
+.I ~/.config
+when unset.
 .SH FILES
+.TP
+.I $XDG_CONFIG_HOME/qsh/config
+.RI ( ~/.config/qsh/config )
+The user's configuration file.
+.TP
+.I /etc/qsh/qsh_config
+The system's configuration file.
 .TP
 .I $XDG_STATE_HOME/qsh/
 .RI ( ~/.local/state/qsh/ )
@@ -63,6 +284,31 @@ and the log of a daemon started on demand
 .RI ( /tmp/qsh\- UID
 when unset)
 The daemon's control socket and lock; mode 0700, owned by the user.
+.SH EXAMPLES
+.nf
+# ~/.config/qsh/config
+
+# The build machines are behind a firewall that drops UDP and TCP: use the ssh pipe
+[host."build*"]
+transports = ["ssh"]
+
+# Hosts of the company, except its lab: no QUIC, no escapes, qsh\-server in /opt
+[host."*.corp.example.com,!*.lab.corp.example.com"]
+transports = ["tls", "ssh"]
+escape_char = "none"
+server_command = "/opt/qsh/bin/qsh\-server"
+
+# Everywhere else
+[defaults]
+escape_char = "^]"
+keepalive = 25
+ssh_options = ["\-o", "ServerAliveInterval=30"]
+
+# The daemon that qsh\-server starts on this machine
+[server]
+ports = "61000\-61099"
+detached_ttl = "1d"
+.fi
 .SH SEE ALSO
 .BR qsh (1),
 .BR qsh\-server (1),
