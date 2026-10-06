@@ -1,0 +1,54 @@
+# Maintainer: yzfly <zphyix@gmail.com>
+#
+# Starting point for the AUR (then extra). Placeholders: pkgver, sha256sums (updpkgsums).
+# Follows https://wiki.archlinux.org/title/Rust_package_guidelines. The cargo feature
+# self-install (downloads release binaries at runtime) is off by default and stays off.
+
+pkgname=qsh
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Remote shell over QUIC whose sessions survive network changes'
+arch=('x86_64' 'aarch64' 'armv7h' 'riscv64')
+url='https://github.com/yzfly/qsh'
+license=('MIT OR Apache-2.0')
+depends=('gcc-libs' 'glibc')
+makedepends=('cargo')
+optdepends=('openssh: to start sessions (qsh bootstraps over ssh)')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
+sha256sums=('SKIP') # placeholder: run updpkgsums
+
+prepare() {
+	cd "$pkgname-$pkgver"
+	export RUSTUP_TOOLCHAIN=stable
+	cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+	cd "$pkgname-$pkgver"
+	export RUSTUP_TOOLCHAIN=stable
+	export CARGO_TARGET_DIR=target
+	cargo build --frozen --release --package qsh-cli --bins
+}
+
+check() {
+	cd "$pkgname-$pkgver"
+	export RUSTUP_TOOLCHAIN=stable
+	cargo test --frozen --workspace
+}
+
+package() {
+	cd "$pkgname-$pkgver"
+	install -Dm0755 -t "$pkgdir/usr/bin/" target/release/qsh target/release/qsh-server
+	install -Dm0644 -t "$pkgdir/usr/lib/systemd/user/" packaging/systemd/qsh-server.service
+
+	install -Dm0644 -t "$pkgdir/usr/share/man/man1/" man/qsh.1 man/qsh-server.1
+	install -Dm0644 -t "$pkgdir/usr/share/man/man5/" man/qsh_config.5
+
+	install -Dm0644 completions/qsh.bash "$pkgdir/usr/share/bash-completion/completions/qsh"
+	install -Dm0644 completions/qsh-server.bash "$pkgdir/usr/share/bash-completion/completions/qsh-server"
+	install -Dm0644 -t "$pkgdir/usr/share/zsh/site-functions/" completions/_qsh completions/_qsh-server
+	install -Dm0644 -t "$pkgdir/usr/share/fish/vendor_completions.d/" completions/qsh.fish completions/qsh-server.fish
+
+	install -Dm0644 -t "$pkgdir/usr/share/doc/$pkgname/" README.md docs/DESIGN.md docs/protocol.md docs/security.md
+	install -Dm0644 -t "$pkgdir/usr/share/licenses/$pkgname/" LICENSE-MIT LICENSE-APACHE
+}

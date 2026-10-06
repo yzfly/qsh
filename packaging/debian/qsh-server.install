@@ -1,0 +1,4 @@
+usr/bin/qsh-server
+packaging/systemd/qsh-server.service usr/lib/systemd/user/
+completions/_qsh-server usr/share/zsh/vendor-completions/
+completions/qsh-server.fish usr/share/fish/vendor_completions.d/

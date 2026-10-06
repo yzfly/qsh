@@ -1,0 +1,78 @@
+# Contributor: yzfly <zphyix@gmail.com>
+# Maintainer: yzfly <zphyix@gmail.com>
+#
+# Starting point for aports (testing/qsh). Placeholders: pkgver, sha512sums (abuild checksum).
+# The cargo feature self-install (downloads release binaries at runtime) is off by default and
+# stays off.
+pkgname=qsh
+pkgver=0.1.0
+pkgrel=0
+pkgdesc="Remote shell over QUIC whose sessions survive network changes"
+url="https://github.com/yzfly/qsh"
+# ring (via rustls and quinn) builds on every architecture Alpine has rust on
+arch="all"
+license="MIT OR Apache-2.0"
+depends="openssh-client"
+makedepends="cargo cargo-auditable"
+subpackages="
+	$pkgname-doc
+	$pkgname-server
+	$pkgname-server-openrc:server_openrc:noarch
+	$pkgname-bash-completion
+	$pkgname-zsh-completion
+	$pkgname-fish-completion
+	"
+source="$pkgname-$pkgver.tar.gz::https://github.com/yzfly/qsh/archive/v$pkgver/qsh-$pkgver.tar.gz"
+options="net" # cargo fetch
+
+prepare() {
+	default_prepare
+
+	cargo fetch --target="$CTARGET" --locked
+}
+
+build() {
+	cargo auditable build --frozen --release --package qsh-cli --bins
+}
+
+check() {
+	cargo test --frozen --workspace
+}
+
+package() {
+	install -Dm755 target/release/qsh target/release/qsh-server -t "$pkgdir"/usr/bin/
+
+	install -Dm644 man/qsh.1 man/qsh-server.1 -t "$pkgdir"/usr/share/man/man1/
+	install -Dm644 man/qsh_config.5 -t "$pkgdir"/usr/share/man/man5/
+
+	install -Dm644 completions/qsh.bash "$pkgdir"/usr/share/bash-completion/completions/qsh
+	install -Dm644 completions/qsh-server.bash "$pkgdir"/usr/share/bash-completion/completions/qsh-server
+	install -Dm644 completions/_qsh completions/_qsh-server -t "$pkgdir"/usr/share/zsh/site-functions/
+	install -Dm644 completions/qsh.fish completions/qsh-server.fish \
+		-t "$pkgdir"/usr/share/fish/vendor_completions.d/
+
+	install -Dm755 packaging/openrc/qsh-server "$pkgdir"/etc/init.d/qsh-server
+
+	install -Dm644 README.md docs/DESIGN.md docs/protocol.md docs/security.md \
+		-t "$pkgdir"/usr/share/doc/$pkgname/
+	install -Dm644 LICENSE-MIT LICENSE-APACHE -t "$pkgdir"/usr/share/licenses/$pkgname/
+}
+
+server() {
+	pkgdesc="$pkgdesc (server)"
+	depends=""
+
+	amove usr/bin/qsh-server
+}
+
+server_openrc() {
+	pkgdesc="$pkgdesc (server OpenRC script)"
+	install_if="openrc $pkgname-server=$pkgver-r$pkgrel"
+	depends=""
+
+	amove etc/init.d/qsh-server
+}
+
+sha512sums="
+0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000  qsh-0.1.0.tar.gz
+"

@@ -1,0 +1,342 @@
+# Release: on a tag vX.Y.Z (matching the workspace version in Cargo.toml), build static binaries
+# for every supported target, package them, and publish a GitHub Release with SHA256SUMS, the
+# install script, .deb/.rpm/.apk packages and a signed build-provenance attestation.
+#
+# Run by hand (Actions -> Release -> Run workflow) to build and package without publishing; the
+# result is the `dist` artifact of the run.
+#
+# Assets of release vX.Y.Z:
+#   qsh-X.Y.Z-<target>.tar.gz   qsh-X.Y.Z-<target>/{qsh, qsh-server, LICENSE-*, README.md, man/, completions/}
+#   qsh_X.Y.Z-1_{amd64,arm64}.deb, qsh-X.Y.Z-1.{x86_64,aarch64}.rpm, qsh_X.Y.Z-r1_{x86_64,aarch64}.apk
+#   install.sh, SHA256SUMS
+# scripts/install.sh depends on these names.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # Tool versions, pinned so that a release can be rebuilt bit for bit.
+  ZIG_VERSION: "0.14.1"
+  NFPM_VERSION: "v2.47.0"
+
+jobs:
+  prepare:
+    name: prepare
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      publish: ${{ steps.version.outputs.publish }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+      source_date_epoch: ${{ steps.version.outputs.source_date_epoch }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Version
+        id: version
+        run: |
+          crate_version=$(cargo metadata --no-deps --format-version 1 |
+            jq -r '.packages[] | select(.name == "qsh-cli") | .version')
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="${GITHUB_REF_NAME#v}"
+            if [[ "$version" != "$crate_version" ]]; then
+              echo "::error::tag $GITHUB_REF_NAME does not match the workspace version $crate_version in Cargo.toml"
+              exit 1
+            fi
+            publish=true
+          else
+            version="$crate_version-dev.${GITHUB_SHA::8}"
+            publish=false
+          fi
+          if [[ "$version" == *-* ]]; then prerelease=true; else prerelease=false; fi
+          {
+            echo "version=$version"
+            echo "publish=$publish"
+            echo "prerelease=$prerelease"
+            echo "source_date_epoch=$(git log -1 --format=%ct)"
+          } >> "$GITHUB_OUTPUT"
+          echo "qsh $version (publish: $publish, prerelease: $prerelease)"
+
+      - name: Release notes from CHANGELOG.md
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          PUBLISH: ${{ steps.version.outputs.publish }}
+        run: |
+          mkdir -p extras
+          # The section "## [X.Y.Z] - date" up to the next "## [".
+          awk -v v="$VERSION" '
+            /^## \[/ { if (found) exit; if (index($0, "## [" v "]") == 1) { found = 1; next } }
+            found { print }
+          ' CHANGELOG.md | sed -e '/./,$!d' > extras/notes.md
+          if [[ ! -s extras/notes.md ]]; then
+            if [[ "$PUBLISH" == true ]]; then
+              echo "::error file=CHANGELOG.md::no section '## [$VERSION]' in CHANGELOG.md"
+              exit 1
+            fi
+            echo "Development build, not a release." > extras/notes.md
+          fi
+          cat >> extras/notes.md <<EOF
+
+          ### Install
+
+          \`\`\`sh
+          curl -fsSL https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}/install.sh | sh -s -- --version ${VERSION}
+          \`\`\`
+
+          Verify a download: \`sha256sum -c SHA256SUMS --ignore-missing\`, and its build provenance:
+          \`gh attestation verify qsh-${VERSION}-x86_64-unknown-linux-musl.tar.gz --repo ${GITHUB_REPOSITORY}\`.
+          EOF
+          cat extras/notes.md
+
+      # Man pages and completions are generated from the command-line definitions and committed
+      # (CI checks they are current); a release ships what is committed. Either may be absent in
+      # early versions.
+      - name: Man pages and completions
+        run: |
+          for d in man completions; do
+            if [[ -d "$d" ]] && [[ -n "$(ls -A "$d")" ]]; then
+              cp -r "$d" extras/
+            fi
+          done
+          ls -R extras
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: extras
+          path: extras/
+          if-no-files-found: error
+
+  # Static musl binaries, cross-compiled on one x86_64 runner with cargo-zigbuild.
+  #
+  # Why cargo-zigbuild and not cross: zig ships clang and the musl libc headers for every target,
+  # so ring's C and assembly (the only non-Rust code in the tree) build the same way for x86_64,
+  # aarch64, armv7 and riscv64, with Rust's own musl std from rustup. cross needs a docker image
+  # per target, and riscv64gc-unknown-linux-musl has had no maintained cross image; docker in the
+  # runner is also slower. If a target ever fails under zig, set its `builder` to `cross` below:
+  # the build step supports both.
+  build-linux:
+    name: build ${{ matrix.target }}
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            builder: zigbuild
+          - target: aarch64-unknown-linux-musl
+            builder: zigbuild
+          - target: armv7-unknown-linux-musleabihf
+            builder: zigbuild
+          - target: riscv64gc-unknown-linux-musl
+            builder: zigbuild
+    env:
+      SOURCE_DATE_EPOCH: ${{ needs.prepare.outputs.source_date_epoch }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - if: matrix.builder == 'zigbuild'
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: ${{ matrix.builder == 'zigbuild' && 'cargo-zigbuild' || 'cross' }}
+
+      # No build cache in release builds: every release is built from the lock file alone.
+      - name: Build
+        env:
+          TARGET: ${{ matrix.target }}
+          BUILDER: ${{ matrix.builder }}
+        run: |
+          # Paths of this runner must not end up in the binaries (panic messages, debug info).
+          export RUSTFLAGS="--remap-path-prefix=$GITHUB_WORKSPACE=qsh --remap-path-prefix=$HOME/.cargo=cargo"
+          args=(--release --locked --target "$TARGET" --package qsh-cli --bins --features self-install)
+          case "$BUILDER" in
+            zigbuild) cargo zigbuild "${args[@]}" ;;
+            cross) cross build "${args[@]}" ;;
+          esac
+          file "target/$TARGET/release/qsh" "target/$TARGET/release/qsh-server"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bin-${{ matrix.target }}
+          path: |
+            target/${{ matrix.target }}/release/qsh
+            target/${{ matrix.target }}/release/qsh-server
+          if-no-files-found: error
+
+  build-macos:
+    name: build ${{ matrix.target }}
+    needs: prepare
+    # Apple silicon runner; the x86_64 build is a native cross-compile with the same Xcode SDK.
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+      SOURCE_DATE_EPOCH: ${{ needs.prepare.outputs.source_date_epoch }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          export RUSTFLAGS="--remap-path-prefix=$GITHUB_WORKSPACE=qsh --remap-path-prefix=$HOME/.cargo=cargo"
+          cargo build --release --locked --target "$TARGET" --package qsh-cli --bins --features self-install
+          file "target/$TARGET/release/qsh" "target/$TARGET/release/qsh-server"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bin-${{ matrix.target }}
+          path: |
+            target/${{ matrix.target }}/release/qsh
+            target/${{ matrix.target }}/release/qsh-server
+          if-no-files-found: error
+
+  # Archives, distribution packages and checksums, all made on one Linux runner with GNU tar so
+  # they are byte-for-byte reproducible from the binaries.
+  package:
+    name: package
+    needs: [prepare, build-linux, build-macos]
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      SOURCE_DATE_EPOCH: ${{ needs.prepare.outputs.source_date_epoch }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache: false
+
+      - name: Archives
+        run: |
+          mkdir -p dist stage
+          for bin in artifacts/bin-*; do
+            target="${bin#artifacts/bin-}"
+            name="qsh-$VERSION-$target"
+            mkdir -p "stage/$name"
+            install -m 0755 "$bin/qsh" "$bin/qsh-server" "stage/$name/"
+            install -m 0644 LICENSE-MIT LICENSE-APACHE README.md "stage/$name/"
+            for d in man completions; do
+              if [[ -d "artifacts/extras/$d" ]]; then
+                cp -r "artifacts/extras/$d" "stage/$name/"
+                find "stage/$name/$d" -type f -exec chmod 0644 {} +
+              fi
+            done
+            tar --sort=name --mtime="@$SOURCE_DATE_EPOCH" --owner=0 --group=0 --numeric-owner \
+              --format=gnu -C stage -cf - "$name" | gzip -9n > "dist/$name.tar.gz"
+          done
+          ls -l dist
+
+      - name: Distribution packages (nfpm)
+        run: |
+          go install "github.com/goreleaser/nfpm/v2/cmd/nfpm@$NFPM_VERSION"
+          gopath=$(go env GOPATH)
+          export PATH="$gopath/bin:$PATH"
+          nfpm --version
+          for pair in amd64:x86_64-unknown-linux-musl arm64:aarch64-unknown-linux-musl; do
+            arch="${pair%%:*}"
+            target="${pair#*:}"
+            rm -rf dist/pkg
+            mkdir -p dist/pkg
+            install -m 0755 "artifacts/bin-$target/qsh" "artifacts/bin-$target/qsh-server" dist/pkg/
+            cp packaging/nfpm.yaml dist/nfpm.yaml
+            if [[ -d artifacts/extras/man ]]; then
+              for page in artifacts/extras/man/*.[1-8]; do
+                section="${page##*.}"
+                mkdir -p "dist/pkg/man/man$section"
+                out="dist/pkg/man/man$section/${page##*/}.gz"
+                gzip -9nc "$page" > "$out"
+              done
+            else
+              sed -i '/# BEGIN man/,/# END man/d' dist/nfpm.yaml
+            fi
+            if [[ -d artifacts/extras/completions ]]; then
+              cp -r artifacts/extras/completions dist/pkg/
+            else
+              sed -i '/# BEGIN completions/,/# END completions/d' dist/nfpm.yaml
+            fi
+            find dist/pkg -type d -exec chmod 0755 {} +
+            find dist/pkg/man dist/pkg/completions -type f -exec chmod 0644 {} + 2>/dev/null || true
+            find dist/pkg -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
+            for format in deb rpm apk; do
+              QSH_VERSION="$VERSION" NFPM_ARCH="$arch" nfpm package -f dist/nfpm.yaml -p "$format" -t dist/
+            done
+          done
+          rm -rf dist/pkg dist/nfpm.yaml
+          ls -l dist
+
+      - name: install.sh and SHA256SUMS
+        run: |
+          install -m 0644 scripts/install.sh dist/install.sh
+          cd dist
+          find . -maxdepth 1 -type f -printf '%P\n' | LC_ALL=C sort > ../assets.txt
+          xargs sha256sum < ../assets.txt > ../SHA256SUMS
+          mv ../SHA256SUMS SHA256SUMS
+          cat SHA256SUMS
+          sha256sum -c SHA256SUMS
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: publish
+    needs: [prepare, package]
+    if: needs.prepare.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release
+      id-token: write # sign the attestation (Sigstore)
+      attestations: write
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist
+      - uses: actions/download-artifact@v8
+        with:
+          name: extras
+          path: extras
+
+      # SLSA build provenance for every asset: `gh attestation verify FILE --repo yzfly/qsh`
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/*
+
+      - name: GitHub Release
+        run: |
+          flags=()
+          if [[ "$PRERELEASE" == true ]]; then flags+=(--prerelease); fi
+          gh release create "v$VERSION" --verify-tag --title "qsh $VERSION" \
+            --notes-file extras/notes.md "${flags[@]}" dist/*

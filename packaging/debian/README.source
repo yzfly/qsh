@@ -1,0 +1,26 @@
+qsh for Debian
+==============
+
+This directory is upstream's starting point for the Debian package; it lives in the upstream
+repository as packaging/debian/ and is copied to debian/ to build:
+
+    cp -r packaging/debian debian
+    dpkg-buildpackage -us -uc                       # dependencies from librust-*-dev
+    DEB_BUILD_PROFILES=pkg.qsh.vendored \
+      dpkg-buildpackage -us -uc                     # dependencies from vendor/ (cargo vendor)
+
+Binary packages: qsh-client (qsh) and qsh-server (qsh-server and its systemd user unit), split
+like openssh-client / openssh-server and mosh, so servers need not carry the client.
+
+Generated files: man/*.1, man/*.5 and completions/* are generated from the command-line
+definitions upstream and committed to the repository; the release tarball contains them.
+
+Dependencies: every crate qsh uses (tokio, quinn, rustls with ring, rcgen, clap, serde,
+serde_json, libc) is packaged in Debian; the version bounds in debian/control follow the
+workspace Cargo.toml. With the pkg.qsh.vendored profile the vendored crates are built instead
+and debian/copyright must be extended to cover them (see the vendor/* stanza).
+
+The cargo feature self-install (`qsh install HOST`, which downloads release binaries) is not
+enabled: the Debian build performs no network access at build time or at runtime.
+
+ -- yzfly <zphyix@gmail.com>, placeholder date

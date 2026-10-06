@@ -1,0 +1,97 @@
+# End-to-end tests against the Linux distributions qsh supports (DESIGN.md section 7): the static
+# x86_64 musl build of qsh-server in ~/.local/bin of a user on each distribution's stock image
+# with sshd, and the client on the runner. Each distribution also runs with UDP blocked (TLS over
+# TCP must take over) and with only ssh reachable (the ssh pipe must take over).
+# The per-distribution setup is packaging/test/ (Dockerfile, setup.sh, entrypoint.sh, e2e.sh).
+name: Distributions
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "41 3 * * 0"
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "packaging/test/**"
+      - ".github/workflows/distros.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: distros-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  TARGET: x86_64-unknown-linux-musl
+
+jobs:
+  build:
+    name: build (x86_64 musl)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.TARGET }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ env.TARGET }}
+      # x86_64 musl needs only musl-gcc for ring's C code; no zig or docker for this one target.
+      - run: sudo apt-get update -q && sudo apt-get install -y -q musl-tools
+      - name: Build
+        # The release profile is the one users get; fat LTO makes it slower, which is fine weekly.
+        run: cargo build --release --locked --target "$TARGET" --package qsh-cli --bins
+      - uses: actions/upload-artifact@v7
+        with:
+          name: qsh-${{ env.TARGET }}
+          path: |
+            target/${{ env.TARGET }}/release/qsh
+            target/${{ env.TARGET }}/release/qsh-server
+          if-no-files-found: error
+          retention-days: 7
+
+  e2e:
+    name: ${{ matrix.image }}
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - ubuntu:20.04
+          - ubuntu:24.04
+          - debian:12
+          - fedora:latest
+          # Rocky's own namespace: the Docker "library" image is no longer updated
+          - rockylinux/rockylinux:9
+          - alpine:latest
+          - archlinux:latest
+          - opensuse/tumbleweed
+          - amazonlinux:2023
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: qsh-${{ env.TARGET }}
+          path: bin
+      - run: chmod 0755 bin/qsh bin/qsh-server
+      - name: End-to-end
+        env:
+          QSH_BIN_DIR: ${{ github.workspace }}/bin
+          IMAGE: ${{ matrix.image }}
+        run: packaging/test/e2e.sh "$IMAGE"
+      - name: Server-side logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-${{ strategy.job-index }}
+          path: packaging/test/.work/
+          if-no-files-found: ignore
+          retention-days: 7

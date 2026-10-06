@@ -1,0 +1,54 @@
+#!/sbin/openrc-run
+# qsh-server per-user daemon for OpenRC (Alpine, Gentoo, Artix, ...).
+#
+# You usually do not need this: `qsh host` starts the daemon on demand over ssh. It is for hosts
+# where the daemon, and detached sessions, should be running from boot.
+#
+# The daemon belongs to one user, so the service is multiplexed by name, one instance per user:
+#
+#   ln -s qsh-server /etc/init.d/qsh-server.alice
+#   rc-update add qsh-server.alice default
+#   rc-service qsh-server.alice start
+#
+# Settings in /etc/conf.d/qsh-server.alice (or /etc/conf.d/qsh-server for every instance):
+#   QSH_SERVER_OPTS   extra arguments for `qsh-server daemon`
+#
+# Without systemd-logind nothing creates XDG_RUNTIME_DIR, so this script provides one with the
+# permissions logind would use (/run/user/UID, 0700, owned by the user).
+
+description="qsh-server, remote shell sessions over QUIC (per-user daemon)"
+
+qsh_user="${RC_SVCNAME#*.}"
+
+command="/usr/bin/qsh-server"
+command_args="daemon --foreground ${QSH_SERVER_OPTS:-}"
+command_background="yes"
+command_user="${qsh_user}"
+pidfile="/run/${RC_SVCNAME}.pid"
+output_logger="logger -t ${RC_SVCNAME} -p daemon.info"
+error_logger="logger -t ${RC_SVCNAME} -p daemon.err"
+retry="TERM/15/KILL/5"
+
+depend() {
+	need localmount
+	after net firewall
+	use logger
+}
+
+start_pre() {
+	if [ "${RC_SVCNAME}" = "qsh-server" ] || [ -z "${qsh_user}" ]; then
+		eerror "qsh-server runs as one user: start it as qsh-server.USER"
+		eerror "  ln -s qsh-server /etc/init.d/qsh-server.USER"
+		return 1
+	fi
+	if ! qsh_uid=$(id -u "${qsh_user}" 2>/dev/null); then
+		eerror "no such user: ${qsh_user}"
+		return 1
+	fi
+	qsh_home=$(getent passwd "${qsh_user}" | cut -d: -f6)
+	qsh_runtime="/run/user/${qsh_uid}"
+	checkpath --directory --mode 0700 --owner "${qsh_user}" "${qsh_runtime}" || return 1
+	export HOME="${qsh_home}" USER="${qsh_user}" LOGNAME="${qsh_user}" XDG_RUNTIME_DIR="${qsh_runtime}"
+	SHELL=$(getent passwd "${qsh_user}" | cut -d: -f7)
+	export SHELL
+}

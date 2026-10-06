@@ -1,0 +1,26 @@
+# https://editorconfig.org
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+[*.{yml,yaml,toml,json,rb}]
+indent_size = 2
+
+[*.md]
+# Two trailing spaces are a line break in Markdown.
+trim_trailing_whitespace = false
+
+[{Makefile,makefile,*.mk,packaging/debian/rules}]
+indent_style = tab
+
+[{APKBUILD,PKGBUILD}]
+indent_style = tab
+
+[*.{1,5,8}]
+trim_trailing_whitespace = false

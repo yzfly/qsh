@@ -1,0 +1,40 @@
+# qsh-server as a systemd user service (installed to /usr/lib/systemd/user/).
+#
+# Optional: `qsh host` starts the daemon on demand over ssh, so most users never enable this.
+# Enable it to keep the daemon (and detached sessions) running independently of ssh logins:
+#
+#   systemctl --user enable --now qsh-server.service
+#   loginctl enable-linger "$USER"     # keep the user manager, and the daemon, running after logout
+#
+# Stopping the service ends every session it serves (they are processes of its cgroup).
+# With qsh-server in ~/.local/bin (the release installer), point the unit at it once:
+#   systemctl --user edit qsh-server.service    # [Service] ExecStart= / ExecStart=%h/.local/bin/qsh-server daemon --foreground
+#
+# Hardening note. This daemon is a login service: every terminal session it serves is a child of
+# it and inherits its sandbox. Options that would be standard for a network daemon would break
+# ordinary use of the shell, so they are deliberately absent:
+#   NoNewPrivileges=   breaks sudo, su, ping and every other setuid program in the session
+#   MemoryDenyWriteExecute=, SystemCallFilter=   break JITs (node, java, browsers) and debuggers
+#   RestrictNamespaces=, PrivateUsers=, ProtectHome=, ProtectSystem=, PrivateTmp=, UMask=
+#                      break containers (podman, bwrap), editing your files, shared /tmp, umask
+#   LockPersonality=, RestrictRealtime=, RestrictAddressFamilies=   break setarch, audio, AF_PACKET tools
+# The daemon itself is protected by running unprivileged as the user, by its authentication model
+# (docs/security.md) and by forbidding unsafe code outside one module.
+
+[Unit]
+Description=qsh-server: remote shell sessions over QUIC (per-user daemon)
+Documentation=man:qsh-server(1) https://github.com/yzfly/qsh
+# No ordering on network-online.target: a user manager cannot see system targets, and the
+# daemon listens on the wildcard address, so it needs no configured network to start.
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/qsh-server daemon --foreground
+# `qsh-server stop` asks the daemon to end its sessions cleanly; SIGTERM does the same.
+KillSignal=SIGTERM
+TimeoutStopSec=15s
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=default.target

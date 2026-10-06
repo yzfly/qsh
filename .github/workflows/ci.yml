@@ -1,0 +1,211 @@
+# Checks for every push and pull request. `ci-ok` at the end is the one status to require in
+# branch protection.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  # New RustSec advisories appear without a commit of ours: re-check weekly.
+  schedule:
+    - cron: "17 4 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # dtolnay/rust-toolchain is versioned by toolchain branch (@stable, @nightly, @master),
+      # not by release tags.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # Distribution builds (default features) and release builds (self-install) must both be clean.
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --locked
+      - run: cargo test --workspace --all-features --locked
+
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # The MSRV is the workspace's rust-version; distributions build and run %check with it.
+      - name: Read rust-version
+        id: msrv
+        run: |
+          msrv=$(cargo metadata --no-deps --format-version 1 |
+            jq -r '[.packages[] | select(.name == "qsh-cli") | .rust_version][0] // empty')
+          if [ -z "$msrv" ]; then
+            echo "::error file=Cargo.toml::rust-version is not set for qsh-cli"
+            exit 1
+          fi
+          echo "MSRV $msrv"
+          echo "version=$msrv" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo +${{ steps.msrv.outputs.version }} test --workspace --locked
+
+  deny:
+    name: cargo deny (${{ matrix.checks }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        checks: [advisories, bans licenses sources]
+    # A newly published advisory must not block unrelated pull requests; it still fails on main
+    # and in the weekly run, where it is acted on.
+    continue-on-error: ${{ matrix.checks == 'advisories' && github.event_name == 'pull_request' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check ${{ matrix.checks }}
+
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # install.sh runs under any POSIX sh (dash, busybox, macOS sh), so it is checked as sh.
+      - run: shellcheck --version
+      - run: shellcheck -s sh scripts/install.sh
+      - run: shellcheck -s sh packaging/test/setup.sh packaging/test/entrypoint.sh
+      - run: shellcheck -s bash packaging/test/e2e.sh
+      - run: shellcheck -s sh -e SC2034 packaging/openrc/qsh-server
+      # The installer must also run under the shells it meets in the wild.
+      - name: install.sh --help under dash and busybox
+        run: |
+          sudo apt-get install -y -q dash busybox >/dev/null
+          dash scripts/install.sh --help >/dev/null
+          busybox sh scripts/install.sh --help >/dev/null
+
+  docs:
+    name: docs
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --workspace --no-deps --all-features --locked
+      # Man pages and completions are generated from the command-line definitions and committed;
+      # fail when they are stale. Active once the workspace has an `xtask` alias.
+      - name: Generated files are up to date
+        run: |
+          if ! cargo xtask --help >/dev/null 2>&1; then
+            echo "no cargo xtask yet: skipping the generated-files check"
+            exit 0
+          fi
+          cargo xtask gen
+          if ! git diff --exit-code -- man completions; then
+            echo "::error::man/ or completions/ are stale: run 'cargo xtask gen' and commit the result"
+            exit 1
+          fi
+          if [ -n "$(git status --porcelain -- man completions)" ]; then
+            git status --porcelain -- man completions
+            echo "::error::'cargo xtask gen' created files that are not committed"
+            exit 1
+          fi
+
+  # List the fuzz targets from fuzz/Cargo.toml, so each one runs as its own job.
+  fuzz-targets:
+    name: fuzz targets
+    runs-on: ubuntu-latest
+    outputs:
+      targets: ${{ steps.list.outputs.targets }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: list
+        run: |
+          if [ -f fuzz/Cargo.toml ]; then
+            targets=$(python3 -c 'import json, tomllib; print(json.dumps([b["name"] for b in tomllib.load(open("fuzz/Cargo.toml", "rb")).get("bin", [])]))')
+          else
+            targets='[]'
+          fi
+          echo "fuzz targets: $targets"
+          echo "targets=$targets" >> "$GITHUB_OUTPUT"
+
+  fuzz:
+    name: fuzz ${{ matrix.target }}
+    needs: fuzz-targets
+    if: needs.fuzz-targets.outputs.targets != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.fuzz-targets.outputs.targets) }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - name: cargo fuzz run ${{ matrix.target }} (60 s)
+        run: cargo fuzz run "$TARGET" -- -max_total_time=60
+        env:
+          TARGET: ${{ matrix.target }}
+      - name: Upload the crashing input
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore
+
+  ci-ok:
+    name: ci-ok
+    if: always()
+    needs: [fmt, clippy, test, msrv, deny, shellcheck, docs, fuzz-targets, fuzz]
+    runs-on: ubuntu-latest
+    steps:
+      - name: All required jobs passed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          echo "$NEEDS" | jq -e 'to_entries | map(.value.result) | all(. == "success" or . == "skipped")' >/dev/null

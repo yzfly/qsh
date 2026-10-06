@@ -1,0 +1,22 @@
+# Build output
+/target/
+/fuzz/target/
+
+# cargo-fuzz: crashes and coverage reports (seed corpora under fuzz/corpus/ are kept)
+/fuzz/artifacts/
+/fuzz/coverage/
+
+# Release and packaging work trees
+/dist/
+/vendor/
+/packaging/test/.work/
+
+# Debian builds run from a copy of packaging/debian at the top level
+/debian/
+
+# Editors and operating systems
+*.swp
+*~
+.DS_Store
+.idea/
+.vscode/

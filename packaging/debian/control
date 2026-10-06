@@ -1,0 +1,72 @@
+Source: qsh
+Section: net
+Priority: optional
+Maintainer: yzfly <zphyix@gmail.com>
+Build-Depends:
+ debhelper-compat (= 13),
+ dh-cargo (>= 31),
+ dh-sequence-bash-completion,
+ cargo (>= 1.85),
+ rustc (>= 1.85),
+ librust-clap-dev (>= 4.5) <!pkg.qsh.vendored>,
+ librust-libc-dev (>= 0.2.150) <!pkg.qsh.vendored>,
+ librust-quinn-dev (>= 0.11.11) <!pkg.qsh.vendored>,
+ librust-rcgen-dev (>= 0.13) <!pkg.qsh.vendored>,
+ librust-ring-dev (>= 0.17.8) <!pkg.qsh.vendored>,
+ librust-rustls-dev (>= 0.23.20) <!pkg.qsh.vendored>,
+ librust-serde-dev (>= 1.0.200) <!pkg.qsh.vendored>,
+ librust-serde-derive-dev (>= 1.0.200) <!pkg.qsh.vendored>,
+ librust-serde-json-dev (>= 1.0.120) <!pkg.qsh.vendored>,
+ librust-tokio-dev (>= 1.40) <!pkg.qsh.vendored>,
+ librust-tokio-rustls-dev (>= 0.26) <!pkg.qsh.vendored>,
+Standards-Version: 4.7.2
+Rules-Requires-Root: no
+Homepage: https://github.com/yzfly/qsh
+Vcs-Browser: https://github.com/yzfly/qsh
+Vcs-Git: https://github.com/yzfly/qsh.git
+X-Cargo-Crate: qsh-cli
+
+Package: qsh-client
+Architecture: any
+Multi-Arch: foreign
+Depends:
+ ${misc:Depends},
+ ${shlibs:Depends},
+Recommends:
+ openssh-client,
+Suggests:
+ qsh-server,
+Built-Using: ${cargo:Built-Using}
+Static-Built-Using: ${cargo:Static-Built-Using}
+X-Cargo-Built-Using: ${cargo:X-Cargo-Built-Using}
+Description: remote shell over QUIC whose sessions survive network changes (client)
+ qsh is used like ssh: the same destinations, ~/.ssh/config, keys, agent,
+ known_hosts and ProxyJump. The first connection runs over ssh to start the
+ session; after that the session lives on the server and the client talks to
+ it over QUIC, so it survives Wi-Fi/cellular switches, sleep and roaming, and
+ replays the output that was missed. When UDP is blocked, qsh falls back to
+ TLS over TCP or to an ssh pipe.
+ .
+ This package contains the client, qsh. The remote host needs qsh-server.
+
+Package: qsh-server
+Architecture: any
+Multi-Arch: foreign
+Depends:
+ ${misc:Depends},
+ ${shlibs:Depends},
+Recommends:
+ openssh-server,
+Built-Using: ${cargo:Built-Using}
+Static-Built-Using: ${cargo:Static-Built-Using}
+X-Cargo-Built-Using: ${cargo:X-Cargo-Built-Using}
+Description: remote shell over QUIC whose sessions survive network changes (server)
+ qsh is used like ssh: the same destinations, ~/.ssh/config, keys, agent,
+ known_hosts and ProxyJump. The first connection runs over ssh to start the
+ session; after that the session lives on the server and the client talks to
+ it over QUIC, so it survives Wi-Fi/cellular switches, sleep and roaming, and
+ replays the output that was missed.
+ .
+ This package contains qsh-server, which the client starts over ssh as the
+ logged-in user. It needs no root, no configuration and no system service;
+ a systemd user unit is included for those who want the daemon supervised.

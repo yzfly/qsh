@@ -1,0 +1,139 @@
+# nfpm (https://nfpm.goreleaser.com) configuration for the convenience .deb, .rpm and .apk packages
+# attached to each GitHub Release. They carry the static musl binaries, so one package works on
+# every release of a distribution family. Distributions build their own packages from source with
+# packaging/debian, packaging/rpm, packaging/alpine and packaging/arch instead.
+#
+# .github/workflows/release.yml stages the files under dist/pkg/ and runs, per architecture:
+#   QSH_VERSION=0.1.0 NFPM_ARCH=amd64 nfpm package -f packaging/nfpm.yaml -p deb -t dist/
+# NFPM_ARCH is amd64 or arm64; nfpm maps it to x86_64 / aarch64 for rpm and apk.
+#
+# The blocks marked BEGIN/END below are optional: the workflow deletes a block with sed when the
+# release has no man pages or no completions yet.
+
+name: qsh
+arch: ${NFPM_ARCH}
+platform: linux
+version: ${QSH_VERSION}
+version_schema: semver
+release: "1"
+section: net
+priority: optional
+maintainer: yzfly <zphyix@gmail.com>
+vendor: The qsh authors
+homepage: https://github.com/yzfly/qsh
+license: MIT OR Apache-2.0
+description: |-
+  Remote shell over QUIC whose sessions survive network changes
+  qsh is used like ssh (same destinations, ~/.ssh/config, keys and agent) but the
+  session lives on the server: it survives Wi-Fi/cellular switches, sleep and
+  roaming, and replays the output you missed. When UDP is blocked it falls back
+  to TLS over TCP or an ssh pipe. qsh-server runs as the user and needs no root.
+
+recommends:
+  - openssh-client
+suggests:
+  - openssh-server
+
+contents:
+  - src: dist/pkg/qsh
+    dst: /usr/bin/qsh
+    file_info:
+      mode: 0755
+  - src: dist/pkg/qsh-server
+    dst: /usr/bin/qsh-server
+    file_info:
+      mode: 0755
+
+  - src: packaging/systemd/qsh-server.service
+    dst: /usr/lib/systemd/user/qsh-server.service
+    file_info:
+      mode: 0644
+
+  - src: README.md
+    dst: /usr/share/doc/qsh/README.md
+    file_info:
+      mode: 0644
+  - src: CHANGELOG.md
+    dst: /usr/share/doc/qsh/CHANGELOG.md
+    file_info:
+      mode: 0644
+  - src: LICENSE-MIT
+    dst: /usr/share/doc/qsh/LICENSE-MIT
+    file_info:
+      mode: 0644
+  - src: LICENSE-APACHE
+    dst: /usr/share/doc/qsh/LICENSE-APACHE
+    file_info:
+      mode: 0644
+
+  # BEGIN man
+  # Staged by the workflow as dist/pkg/man/manN/PAGE.N.gz (gzip -9n, mode 0644, mtime
+  # SOURCE_DATE_EPOCH: a tree keeps the staged files' metadata).
+  - src: dist/pkg/man
+    dst: /usr/share/man
+    type: tree
+  # END man
+
+  # BEGIN completions
+  - src: dist/pkg/completions/qsh.bash
+    dst: /usr/share/bash-completion/completions/qsh
+    file_info:
+      mode: 0644
+  - src: dist/pkg/completions/qsh-server.bash
+    dst: /usr/share/bash-completion/completions/qsh-server
+    file_info:
+      mode: 0644
+  # Debian's zsh searches vendor-completions; Fedora, Alpine and others site-functions.
+  - src: dist/pkg/completions/_qsh
+    dst: /usr/share/zsh/vendor-completions/_qsh
+    packager: deb
+    file_info:
+      mode: 0644
+  - src: dist/pkg/completions/_qsh-server
+    dst: /usr/share/zsh/vendor-completions/_qsh-server
+    packager: deb
+    file_info:
+      mode: 0644
+  - src: dist/pkg/completions/_qsh
+    dst: /usr/share/zsh/site-functions/_qsh
+    packager: rpm
+    file_info:
+      mode: 0644
+  - src: dist/pkg/completions/_qsh-server
+    dst: /usr/share/zsh/site-functions/_qsh-server
+    packager: rpm
+    file_info:
+      mode: 0644
+  - src: dist/pkg/completions/_qsh
+    dst: /usr/share/zsh/site-functions/_qsh
+    packager: apk
+    file_info:
+      mode: 0644
+  - src: dist/pkg/completions/_qsh-server
+    dst: /usr/share/zsh/site-functions/_qsh-server
+    packager: apk
+    file_info:
+      mode: 0644
+  - src: dist/pkg/completions/qsh.fish
+    dst: /usr/share/fish/vendor_completions.d/qsh.fish
+    file_info:
+      mode: 0644
+  - src: dist/pkg/completions/qsh-server.fish
+    dst: /usr/share/fish/vendor_completions.d/qsh-server.fish
+    file_info:
+      mode: 0644
+  # END completions
+
+deb:
+  fields:
+    Bugs: https://github.com/yzfly/qsh/issues
+
+rpm:
+  group: Applications/Internet
+  summary: Remote shell over QUIC whose sessions survive network changes
+  compression: zstd
+
+apk:
+  # Unsigned: install with `apk add --allow-untrusted qsh_*.apk`, or verify the release checksums
+  # and attestation first (README.md, "Verifying a download").
+  {}

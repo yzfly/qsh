@@ -1,0 +1,80 @@
+#!/usr/bin/make -f
+# Debian build of qsh, a cargo workspace with two binaries (qsh, qsh-server) in the crate
+# qsh-cli. The usual route for Rust applications in Debian: dependencies come from the archive's
+# librust-*-dev packages through dh-cargo's cargo wrapper, built offline.
+#
+# Build profile pkg.qsh.vendored: build with the crates in vendor/ instead (`cargo vendor --locked`,
+# shipped as the orig component tarball qsh_VERSION.orig-vendor.tar.xz). For backports and for
+# derivatives whose archive lacks some librust-*-dev versions:
+#   DEB_BUILD_PROFILES=pkg.qsh.vendored dpkg-buildpackage -us -uc
+#
+# The cargo feature self-install (downloads release binaries at runtime) is off by default and
+# stays off here: Debian's qsh never fetches code from the network.
+
+include /usr/share/dpkg/pkg-info.mk
+include /usr/share/dpkg/architecture.mk
+include /usr/share/rustc/architecture.mk
+
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+export CARGO_HOME = $(CURDIR)/debian/cargo_home
+export DEB_CARGO_CRATE = qsh-cli_$(DEB_VERSION_UPSTREAM)
+
+# The profile directory: release, unless DEB_BUILD_OPTIONS=noopt made dh-cargo's wrapper build
+# a debug profile.
+CARGO_TARGET_OUT = $(firstword $(wildcard target/$(DEB_HOST_RUST_TYPE)/release target/$(DEB_HOST_RUST_TYPE)/debug))
+
+ifneq (,$(filter pkg.qsh.vendored,$(DEB_BUILD_PROFILES)))
+# Plain cargo against vendor/, with the flags dh-cargo's wrapper would add.
+CARGO = cargo
+CARGO_FLAGS = --release --frozen --target $(DEB_HOST_RUST_TYPE) \
+	$(addprefix -j,$(patsubst parallel=%,%,$(filter parallel=%,$(DEB_BUILD_OPTIONS))))
+export RUSTFLAGS = -C debuginfo=2 -C strip=none --cap-lints warn \
+	-C linker=$(DEB_HOST_GNU_TYPE)-gcc \
+	$(foreach f,$(shell dpkg-buildflags --get LDFLAGS),-C link-arg=$(f))
+else
+# dh-cargo's wrapper: --target, -j, release profile, RUSTFLAGS from dpkg-buildflags.
+CARGO = /usr/share/cargo/bin/cargo
+CARGO_FLAGS =
+endif
+
+%:
+	dh $@
+
+override_dh_auto_configure:
+ifneq (,$(filter pkg.qsh.vendored,$(DEB_BUILD_PROFILES)))
+	mkdir -p $(CARGO_HOME)
+	printf '%s\n' \
+		'[source.crates-io]' 'replace-with = "vendored-sources"' \
+		'[source.vendored-sources]' 'directory = "$(CURDIR)/vendor"' \
+		'[net]' 'offline = true' > $(CARGO_HOME)/config.toml
+else
+	$(CARGO) prepare-debian $(CURDIR)/debian/cargo_registry --link-from-system
+endif
+
+override_dh_auto_build:
+	$(CARGO) build $(CARGO_FLAGS) --package qsh-cli --bins
+
+override_dh_auto_test:
+ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
+	$(CARGO) test $(CARGO_FLAGS) --workspace
+endif
+
+# dh_install, dh_installman and dh_bash-completion take it from here (debian/qsh-*.install, ...).
+override_dh_auto_install:
+	install -d debian/tmp/usr/bin
+	install -m 0755 $(CARGO_TARGET_OUT)/qsh $(CARGO_TARGET_OUT)/qsh-server debian/tmp/usr/bin/
+
+override_dh_installsystemduser:
+	# The user unit is shipped but not enabled: qsh-server starts on demand over ssh.
+	dh_installsystemduser --no-enable
+
+override_dh_gencontrol:
+ifeq (,$(filter pkg.qsh.vendored,$(DEB_BUILD_PROFILES)))
+	/usr/share/cargo/bin/dh-cargo-built-using qsh-client
+	/usr/share/cargo/bin/dh-cargo-built-using qsh-server
+endif
+	dh_gencontrol
+
+override_dh_auto_clean:
+	dh_auto_clean
+	rm -rf target debian/cargo_home debian/cargo_registry
