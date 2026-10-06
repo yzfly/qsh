@@ -201,6 +201,12 @@ pub struct Status {
     pub snapshots: u64,
     /// Output bytes that arrived compressed (OUTPUT_ZSTD), and the bytes of their frames.
     pub compressed: (u64, u64),
+    /// Snapshots refused (protocol.md 7.8.4: the profile check, the parts, or a part's zstd
+    /// frame failed); after the first the session accepts none any more.
+    pub snapshots_refused: u32,
+    /// zstd frames refused (protocol.md 7.12) or that the decoder failed on; after the second
+    /// on one server this process does not offer it compression any more.
+    pub frames_refused: u32,
     /// The session id.
     pub session: Option<[u8; 16]>,
     /// How each transport fared in the race of the current connection: "used", "failed: why",

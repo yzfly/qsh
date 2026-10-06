@@ -152,7 +152,7 @@ fn feed_chunked(model: &mut dyn Model, rng: &mut Rng, data: &[u8]) {
 /// protocol.md A.8: the reference encoding, byte for byte.
 #[test]
 fn appendix_a8_snapshot() {
-    let mut live = Live::new(20, 3);
+    let mut live = Live::new("t", 20, 3);
     live.feed(0, b"$ ls\r\n\x1b[32ma.txt\x1b[m\r\n$ \x1b[?2004h\x1b]2;web1\x07");
     let snapshot = live.snapshot(None).unwrap();
     let expected: &[u8] = b"\x1b[!p\x1b[?1049l\x1b[1;1H$ ls\x1b[K\x1b[2;1H\x1b[32ma.txt\x1b[m\x1b[K\x1b[3;1H$\x1b[K\
@@ -173,7 +173,7 @@ fn appendix_a8_snapshot() {
 fn the_profile_checker() {
     let mut rng = Rng(3);
     for i in 0..300 {
-        let mut live = Live::new(2 + rng.below(90) as u16, 2 + rng.below(40) as u16);
+        let mut live = Live::new("t", 2 + rng.below(90) as u16, 2 + rng.below(40) as u16);
         live.feed(0, &terminal_output(&mut rng, 2000));
         let s = live.snapshot((i % 2 == 0).then_some(0)).unwrap();
         if let Err(e) = check_profile(&s.data) {
@@ -319,9 +319,9 @@ fn lazy_feeding_keeps_little() {
 fn caps() {
     assert!(fits(80, 24) && fits(1024, 256) && fits(512, 512) && fits(2, 2));
     assert!(!fits(1025, 10) && !fits(10, 513) && !fits(1024, 257) && !fits(1, 10) && !fits(10, 1));
-    let mut live = Live::new(2000, 50);
+    let mut live = Live::new("t", 2000, 50);
     assert!(!live.usable() && live.snapshot(None).is_none());
-    let mut live = Live::new(80, 24);
+    let mut live = Live::new("t", 80, 24);
     live.feed(0, b"x");
     live.resize(2000, 24);
     live.resize(80, 24);
@@ -332,7 +332,7 @@ fn caps() {
 /// fewer than rows when unsure, none for a resync snapshot.
 #[test]
 fn the_tail_counts_lines_since_the_client_offset() {
-    let mut live = Live::new(10, 5);
+    let mut live = Live::new("t", 10, 5);
     let mut offsets = Vec::new();
     let mut offset = 0;
     for i in 0..50 {
@@ -371,15 +371,135 @@ fn the_tail_counts_lines_since_the_client_offset() {
 fn handoff_reproduces_the_model() {
     let mut rng = Rng(99);
     let output = terminal_output(&mut rng, 5000);
-    let mut live = Live::new(70, 20);
+    let mut live = Live::new("t", 70, 20);
     live.feed(0, &output);
     let (cols, rows, data) = live.handoff().unwrap();
     let before = live.model.as_mut().unwrap().capture(0);
-    let mut resumed = Live::resumed(cols, rows, &data, output.len() as u64);
+    let mut resumed = Live::resumed("t", cols, rows, &data, output.len() as u64);
     // The buffer replayed into the new image's sink is skipped
     resumed.feed(0, &output);
     let after = resumed.model.as_mut().unwrap().capture(0);
     equivalent(&before, &after, false).unwrap();
     resumed.feed(output.len() as u64, b"more");
     assert_eq!(resumed.end, Some(output.len() as u64 + 4));
+}
+
+/// Which method of [`Panicky`] panics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fail {
+    Feed,
+    Held,
+    Resize,
+    Size,
+    Alternate,
+    Capture,
+}
+
+/// A model that panics in one of its methods: the containment of `Live` (crate::fault).
+struct Panicky {
+    fail: Fail,
+    inner: Vt100Model,
+}
+
+impl Panicky {
+    fn boxed(fail: Fail) -> Box<dyn Model> {
+        Box::new(Panicky {
+            fail,
+            inner: Vt100Model::new(20, 5),
+        })
+    }
+
+    fn at(&self, method: Fail) {
+        if self.fail == method {
+            panic!("injected: {method:?}");
+        }
+    }
+}
+
+impl Model for Panicky {
+    fn feed(&mut self, bytes: &[u8]) -> u64 {
+        self.at(Fail::Feed);
+        self.inner.feed(bytes)
+    }
+    fn held(&self) -> usize {
+        self.at(Fail::Held);
+        self.inner.held()
+    }
+    fn resize(&mut self, cols: u16, rows: u16) {
+        self.at(Fail::Resize);
+        self.inner.resize(cols, rows)
+    }
+    fn size(&self) -> (u16, u16) {
+        self.at(Fail::Size);
+        self.inner.size()
+    }
+    fn alternate(&self) -> bool {
+        self.at(Fail::Alternate);
+        self.inner.alternate()
+    }
+    fn capture(&mut self, tail: usize) -> Capture {
+        self.at(Fail::Capture);
+        self.inner.capture(tail)
+    }
+}
+
+/// A model that panics in any of its methods is dropped: no panic leaves `Live`, the session
+/// has no snapshots from then on, every later call is harmless, and the mutex the daemon keeps
+/// the model in is not poisoned.
+#[test]
+fn a_failing_model_is_dropped_and_nothing_else_fails() {
+    type Call = fn(&mut Live);
+    let calls: [(Fail, Call); 6] = [
+        (Fail::Feed, |l| l.feed(0, b"hello")),
+        (Fail::Held, |l| {
+            l.snapshot(None);
+        }),
+        (Fail::Resize, |l| l.resize(30, 6)),
+        (Fail::Size, |l| {
+            l.snapshot(Some(0));
+        }),
+        (Fail::Alternate, |l| {
+            l.alternate();
+        }),
+        (Fail::Capture, |l| {
+            l.handoff();
+        }),
+    ];
+    for (fail, call) in calls {
+        let live = std::sync::Mutex::new(Live::with_model("panicky", Panicky::boxed(fail)));
+        if fail != Fail::Feed {
+            live.lock().unwrap().feed(0, b"$ ls\r\n");
+            assert!(live.lock().unwrap().usable(), "{fail:?}");
+        }
+        std::thread::scope(|s| {
+            // On another thread, as the daemon's reader thread feeds the model
+            s.spawn(|| call(&mut live.lock().unwrap())).join().unwrap();
+        });
+        assert!(!live.is_poisoned(), "{fail:?}");
+        let mut live = live.lock().unwrap();
+        assert!(!live.usable(), "{fail:?}");
+        live.feed(100, b"more");
+        live.resize(40, 10);
+        assert!(!live.alternate());
+        assert!(live.snapshot(None).is_none() && live.snapshot(Some(0)).is_none());
+        assert!(live.handoff().is_none());
+    }
+}
+
+/// The `test-hooks` model fails on its marker, also when the marker comes in two chunks; a
+/// model made before the marker was added, or that never sees it, is not affected.
+#[test]
+fn the_test_hook_model_fails_on_its_marker() {
+    let mut before = Live::new("before", 20, 5);
+    crate::fault::test_hooks::panic_on(crate::fault::test_hooks::Hook::Model, b"UNIT-MODEL-MARKER");
+    let mut hit = Live::new("hit", 20, 5);
+    let mut other = Live::new("other", 20, 5);
+    hit.feed(0, b"abc UNIT-MODEL");
+    assert!(hit.usable());
+    hit.feed(14, b"-MARKER def");
+    assert!(!hit.usable());
+    other.feed(0, b"abc UNIT-MODEL marker");
+    before.feed(0, b"UNIT-MODEL-MARKER");
+    assert!(other.usable() && before.usable());
+    assert!(other.snapshot(None).is_some());
 }

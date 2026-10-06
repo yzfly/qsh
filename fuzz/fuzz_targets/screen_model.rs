@@ -1,5 +1,6 @@
 //! The screen model and the snapshot encoder (m2.md 6.2, 12.1): arbitrary output and resizes
-//! never make them panic (a panic would end the daemon); every snapshot follows the content
+//! never make them panic (the daemon contains a panic, but the session loses its snapshots;
+//! this target uses the model directly, without the containment); every snapshot follows the content
 //! profile of protocol.md 7.8.4; written after arbitrary bytes to a fresh model, it reproduces
 //! the screen (the round trip); and lazy feeding gives exactly the model of direct feeding.
 #![no_main]

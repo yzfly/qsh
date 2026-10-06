@@ -159,7 +159,7 @@ fn our_frames_round_trip() {
         inputs.push(build_log(len, len as u64));
     }
     for input in &inputs {
-        let frame = compress(input).unwrap();
+        let frame = compress(input).unwrap().unwrap();
         let header = parse_header(&frame).unwrap();
         assert_eq!(header.content_size, input.len());
         assert!(!header.checksum);
@@ -167,10 +167,10 @@ fn our_frames_round_trip() {
         assert_eq!(ruzstd_decode(&frame).as_ref(), Some(input));
     }
     let log = build_log(MAX_ZSTD_CONTENT, 9);
-    let ratio = compress(&log).unwrap().len() as f64 / log.len() as f64;
+    let ratio = compress(&log).unwrap().unwrap().len() as f64 / log.len() as f64;
     assert!(ratio < 0.4, "a build log compresses to {ratio}");
-    assert_eq!(compress(&[]), None);
-    assert_eq!(compress(&vec![0; MAX_ZSTD_CONTENT + 1]), None);
+    assert_eq!(compress(&[]), Ok(None));
+    assert_eq!(compress(&vec![0; MAX_ZSTD_CONTENT + 1]), Ok(None));
 }
 
 /// A frame whose blocks would produce far more than it declares is stopped at the declared
@@ -178,7 +178,7 @@ fn our_frames_round_trip() {
 #[test]
 fn decompression_bombs_are_stopped() {
     // 64 KiB of a short pattern compresses to a few bytes: ten literals and a long match
-    let frame = compress(&b"0123456789".repeat(6553)).unwrap();
+    let frame = compress(&b"0123456789".repeat(6553)).unwrap().unwrap();
     assert!(frame.len() < 200, "{}", frame.len());
     // Declare less (a two-byte size, minus 256): the block still fits the smaller window
     let mut bomb = frame.clone();
@@ -238,7 +238,11 @@ fn damaged_frames_fail_cleanly() {
     let mut rng = Rng(7 + soak);
     for frame in frames {
         for cut in 0..frame.len().min(600) {
-            assert!(decompress(&frame[..cut], MAX_ZSTD_CONTENT).is_err());
+            // An error, and not a contained panic
+            assert!(matches!(
+                decompress(&frame[..cut], MAX_ZSTD_CONTENT),
+                Err(e) if !matches!(e, DecodeError::Fault(_))
+            ));
         }
         for _ in 0..1500 * soak {
             let mut damaged = frame.to_vec();
@@ -246,7 +250,9 @@ fn damaged_frames_fail_cleanly() {
                 let i = rng.below(damaged.len() as u64) as usize;
                 damaged[i] ^= 1 << rng.below(8);
             }
-            if let Ok(out) = decompress(&damaged, MAX_ZSTD_CONTENT) {
+            let result = decompress(&damaged, MAX_ZSTD_CONTENT);
+            assert!(!matches!(result, Err(DecodeError::Fault(_))), "the decoder panicked");
+            if let Ok(out) = result {
                 assert_eq!(out.len(), parse_header(&damaged).unwrap().content_size);
                 if let Some(theirs) = ruzstd_decode(&damaged) {
                     assert_eq!(out, theirs);
@@ -254,4 +260,24 @@ fn damaged_frames_fail_cleanly() {
             }
         }
     }
+}
+
+/// A panic in the encoder is an error of `compress` (the caller sends the data uncompressed),
+/// one in the decoder is `DecodeError::Fault`; neither leaves the call, and both codecs work on
+/// for other data.
+#[test]
+fn codec_panics_are_contained() {
+    use crate::fault::test_hooks::{panic_on, Hook};
+    panic_on(Hook::Encoder, b"UNIT-ENCODER-MARKER");
+    panic_on(Hook::Decoder, b"UNIT-DECODER-MARKER");
+    let data = b"some output UNIT-ENCODER-MARKER and more output, and more output".repeat(10);
+    assert!(compress(&data).is_err());
+    let fine = b"some output and more output, and more output".repeat(10);
+    let frame = compress(&fine).unwrap().unwrap();
+    assert_eq!(decompress(&frame, MAX_ZSTD_CONTENT).unwrap(), fine);
+    let poisoned = compress(&b"UNIT-DECODER-MARKER ".repeat(10)).unwrap().unwrap();
+    let error = decompress(&poisoned, MAX_ZSTD_CONTENT).unwrap_err();
+    assert!(matches!(error, DecodeError::Fault(_)), "{error:?}");
+    assert!(error.to_string().starts_with("the zstd decoder failed"), "{error}");
+    assert_eq!(decompress(&frame, MAX_ZSTD_CONTENT).unwrap(), fine);
 }

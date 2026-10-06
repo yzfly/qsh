@@ -423,6 +423,9 @@ impl Pool {
         let entry = memory.entry_at(&host, &network, now);
         let planned = paths::plan(entry.as_ref(), target, &config.race, now);
         let (keepalive, _) = paths::keepalive_for(config.keepalive, entry.as_ref());
+        let mut offer = super::conn::Offer::of(config);
+        // Our zstd decoder failed on this server's output again and again (session.rs)
+        offer.zstd &= !super::session::compression_refused(&host);
         let ctx = Ctx {
             target: target.clone(),
             race: config.race.clone(),
@@ -432,7 +435,7 @@ impl Pool {
             network,
             generation: self.generation(),
             keepalive,
-            offer: super::conn::Offer::of(config),
+            offer,
         };
         match self.race(&planned, &ctx).await {
             Ok(c) => Ok((c, ctx)),

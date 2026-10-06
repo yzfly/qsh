@@ -49,3 +49,8 @@ workspace = true
 [[test]]
 name = "catchup"
 required-features = ["test-hooks"]
+
+# Faults stay local: injected panics of the screen model and the codec, a refused snapshot
+[[test]]
+name = "faults"
+required-features = ["test-hooks", "zstd"]

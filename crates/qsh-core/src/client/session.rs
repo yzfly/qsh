@@ -6,7 +6,15 @@
 //! (decompressed under the rules of protocol.md 7.12) and, on a tty session whose output goes
 //! to a terminal, SNAPSHOT: the current screen instead of a backlog (7.8), checked against the
 //! content profile and written as a whole, after a line that says what was skipped.
+//!
+//! After a refused snapshot (protocol.md 7.8.4: the profile check, its parts or a part's zstd
+//! frame failed) the session attaches again at once without snapshots, for the rest of the
+//! process, so that a server whose encoder went wrong cannot make it reconnect in a loop. A
+//! refused zstd frame, or a panic of our decoder (contained, `crate::fault`; it breaks the
+//! connection, as a protocol error would), counts against the server: after the second, this
+//! process offers it no compression any more.
 
+use std::collections::BTreeMap;
 use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -22,8 +30,9 @@ use super::{
     bootstrap, bootstrap_reply, exit_code, host_of, jitter, ClientConfig, ClientError, Event, Input, Outcome, Status,
     Terminal, EXIT_ERROR,
 };
-use crate::codec;
+use crate::codec::{self, DecodeError};
 use crate::crypto::{self, Fingerprint, SessionKey};
+use crate::fault;
 use crate::log;
 use crate::proto::bootstrap::{Credentials, ErrorKind, Reply, Request, SessionInfo};
 use crate::proto::limits::{ATTACH_TIMEOUT, RESEND_CHUNK, RESTART_RECONNECT};
@@ -62,6 +71,32 @@ const OUTBOX_FLUSH: Duration = Duration::from_secs(2);
 const STABLE_AFTER: Duration = Duration::from_secs(10);
 const BACKOFF_FIRST: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// zstd frames from one server refused (protocol.md 7.12) or failed on by the decoder (7.8.7)
+/// after which this process stops offering it compression (protocol.md 7.8.4: at the latest
+/// after the second). The first may be a fluke (the channel starts again); a second one is
+/// not, and would repeat on every attach.
+const FRAMES_REFUSED: u32 = 2;
+
+/// zstd frames refused per server host (lowercase), in this process.
+static REFUSED_FRAMES: Mutex<BTreeMap<String, u32>> = Mutex::new(BTreeMap::new());
+
+/// Whether this process offers compression to `host` (lowercase) no more: [`FRAMES_REFUSED`]
+/// of its frames were refused. The pool asks before each hello.
+pub(super) fn compression_refused(host: &str) -> bool {
+    REFUSED_FRAMES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(host)
+        .is_some_and(|&n| n >= FRAMES_REFUSED)
+}
+
+/// Count a refused frame from `host` (lowercase); whether compression is now refused for it.
+fn frame_refused_by(host: &str) -> bool {
+    let mut refused = REFUSED_FRAMES.lock().unwrap_or_else(|e| e.into_inner());
+    let n = refused.entry(host.to_string()).or_default();
+    *n += 1;
+    *n >= FRAMES_REFUSED
+}
 
 /// Where a session's credentials are saved, and the lock that shows it in use by this process.
 struct Persist {
@@ -137,6 +172,9 @@ struct State {
     gone: bool,
     /// A FRESH attach replays the server's buffer (offset 0) rather than starting at LATEST.
     replay: bool,
+    /// A snapshot from the server failed the content profile: this session accepts none
+    /// any more (for the rest of the process).
+    snapshots_refused: bool,
 }
 
 impl State {
@@ -257,6 +295,9 @@ enum End {
     Gone(ClientError),
     /// The connection is being retired ([`Conn::retire`]): attach again at once, on another.
     Moved,
+    /// The attachment was given up, not the connection (a snapshot was refused): attach again
+    /// at once, without back-off.
+    Again(String),
 }
 
 /// One terminal session.
@@ -461,6 +502,11 @@ impl Session {
                     log::debug(format_args!("moving the session off {}", conn.transport()));
                     backoff = BACKOFF_FIRST;
                 }
+                End::Again(why) => {
+                    // Bounded: what ends an attachment this way is not repeated (State)
+                    log::debug(format_args!("attaching again: {why}"));
+                    backoff = BACKOFF_FIRST;
+                }
                 End::Lost(_) if conn.server_stopping() => {
                     // The daemon is stopping and its sessions with it (7.13): no reconnect, and
                     // above all no ssh pipe, whose qsh-server would start a new daemon
@@ -564,7 +610,10 @@ impl Session {
         };
         // Snapshots on a tty session, when the server can send them and the output goes to a
         // terminal (7.8.2; `catchup` off otherwise)
-        let accept = !state.pipe && conn.capabilities.snapshot && self.config.catchup != crate::config::Catchup::Off;
+        let accept = !state.pipe
+            && !state.snapshots_refused
+            && conn.capabilities.snapshot
+            && self.config.catchup != crate::config::Catchup::Off;
         let mut flags = if state.fresh { ATTACH_FRESH } else { 0 };
         if accept {
             flags |= ATTACH_ACCEPT_SNAPSHOT;
@@ -698,6 +747,72 @@ impl Session {
             .await
     }
 
+    /// A snapshot is refused (protocol.md 7.8.4, "After a refused snapshot"): the channel
+    /// fails with `code`, and the session attaches again at once, from its unchanged
+    /// `received` (nothing of the snapshot was written), accepting no snapshots for the rest of
+    /// the process. Otherwise a server whose encoder makes such a snapshot would make the
+    /// client reconnect in a loop.
+    async fn snapshot_refused(
+        &self,
+        state: &mut State,
+        offset: u64,
+        why: &str,
+        code: ErrorCode,
+        send: &mut SendStream,
+        outbox: &mut Outbox,
+    ) -> End {
+        state.snapshots_refused = true;
+        self.status.lock().unwrap().snapshots_refused += 1;
+        let session = crypto::hex(&state.session);
+        // A warning: the client's highest level
+        log::info(format_args!(
+            "warning: session {}: the snapshot at offset {offset} was refused ({why}); this session takes no snapshots any more",
+            &session[..8]
+        ));
+        let mut fields = serde_json::Map::new();
+        fields.insert("session".into(), session.into());
+        fields.insert("offset".into(), offset.into());
+        fields.insert("why".into(), why.into());
+        transcript::record(Record::Other {
+            ev: "snapshot_refused",
+            fields: &fields,
+        });
+        outbox.push(&Message::Error {
+            code,
+            message: String::new(),
+        });
+        let _ = outbox.flush(send).await;
+        End::Again("a snapshot was refused".into())
+    }
+
+    /// A zstd frame was refused under the rules of 7.12, or the decoder failed on it (7.8.7):
+    /// counted per server for this process; whether compression is now off for it (no `zstd`
+    /// in the hellos of later connections, [`compression_refused`]).
+    fn frame_refused(&self, state: &State, error: &DecodeError) -> bool {
+        let host = state.target.host.to_lowercase();
+        let off = frame_refused_by(&host);
+        self.status.lock().unwrap().frames_refused += 1;
+        let session = crypto::hex(&state.session);
+        log::info(format_args!(
+            "warning: session {}: a zstd frame from {host} was refused ({error}){}",
+            &session[..8],
+            if off {
+                "; no compression from this server for the rest of this process"
+            } else {
+                ""
+            }
+        ));
+        let mut fields = serde_json::Map::new();
+        fields.insert("session".into(), session.into());
+        fields.insert("why".into(), error.to_string().into());
+        fields.insert("compression_off".into(), off.into());
+        transcript::record(Record::Other {
+            ev: "frame_refused",
+            fields: &fields,
+        });
+        off
+    }
+
     /// The attached terminal channel (sections 7.4 to 7.11).
     ///
     /// One task reads and writes the channel, and it never waits for a write while it could
@@ -778,8 +893,11 @@ impl Session {
                             | Message::OutputGap { .. }
                             | Message::Exit { .. }
                     );
-                    if snapshot.is_some() && output_stream {
-                        return Ok(protocol_violation(&mut send, &mut outbox).await);
+                    if let Some(assembly) = snapshot.as_ref().filter(|_| output_stream) {
+                        let offset = assembly.offset;
+                        return Ok(self
+                            .snapshot_refused(state, offset, "output between its parts", ErrorCode::PROTOCOL_VIOLATION, &mut send, &mut outbox)
+                            .await);
                     }
                     // Decompressed output is output (7.12)
                     let (message, frame) = match message {
@@ -795,7 +913,14 @@ impl Session {
                                     (Message::Output { offset, data }, Some(frame.len()))
                                 }
                                 Err(e) => {
-                                    log::debug(format_args!("OUTPUT_ZSTD refused: {e}"));
+                                    self.frame_refused(state, &e);
+                                    if matches!(e, DecodeError::Fault(_)) {
+                                        // Our own fault: a protocol error for this connection
+                                        // (7.8.7); a new one is made
+                                        let end = protocol_violation(&mut send, &mut outbox).await;
+                                        conn.close(ErrorCode::PROTOCOL_VIOLATION, "");
+                                        return Ok(end);
+                                    }
                                     return Ok(frame_error(&mut send, &mut outbox).await);
                                 }
                             }
@@ -864,7 +989,10 @@ impl Session {
                                 data: Vec::new(),
                             });
                             if (assembly.offset, assembly.cols, assembly.rows) != (offset, cols, rows) {
-                                return Ok(protocol_violation(&mut send, &mut outbox).await);
+                                let first = assembly.offset;
+                                return Ok(self
+                                    .snapshot_refused(state, first, "its parts disagree", ErrorCode::PROTOCOL_VIOLATION, &mut send, &mut outbox)
+                                    .await);
                             }
                             let part = if flags & SNAPSHOT_ZSTD != 0 {
                                 if !zstd {
@@ -873,23 +1001,45 @@ impl Session {
                                 match codec::decompress(&data, MAX_ZSTD_CONTENT) {
                                     Ok(part) => part,
                                     Err(e) => {
-                                        log::debug(format_args!("SNAPSHOT refused: {e}"));
-                                        return Ok(frame_error(&mut send, &mut outbox).await);
+                                        let off = self.frame_refused(state, &e);
+                                        let fault = matches!(e, DecodeError::Fault(_));
+                                        let (why, code) = if fault {
+                                            (e.to_string(), ErrorCode::PROTOCOL_VIOLATION)
+                                        } else {
+                                            (format!("a part: {e}"), ErrorCode::FRAME_ERROR)
+                                        };
+                                        let end = self.snapshot_refused(state, offset, &why, code, &mut send, &mut outbox).await;
+                                        if !(off || fault) {
+                                            return Ok(end);
+                                        }
+                                        // Compression is off for this server now, or our decoder
+                                        // failed: a new connection
+                                        conn.close(ErrorCode::PROTOCOL_VIOLATION, "");
+                                        return Ok(End::Lost(why));
                                     }
                                 }
                             } else {
                                 data
                             };
                             if assembly.data.len() + part.len() > MAX_SNAPSHOT {
-                                return Ok(frame_error(&mut send, &mut outbox).await);
+                                return Ok(self
+                                    .snapshot_refused(state, offset, "larger than MAX_SNAPSHOT", ErrorCode::FRAME_ERROR, &mut send, &mut outbox)
+                                    .await);
                             }
                             assembly.data.extend_from_slice(&part);
                             if flags & SNAPSHOT_FINAL != 0 {
                                 let assembly = snapshot.take().expect("assembling");
-                                // Only what the content profile allows reaches the terminal
-                                if let Err(e) = check_profile(&assembly.data) {
-                                    log::debug(format_args!("{e}"));
-                                    return Ok(protocol_violation(&mut send, &mut outbox).await);
+                                // Only what the content profile allows reaches the terminal. The
+                                // check is ours but runs on the server's data: contained too
+                                let refused = match fault::contain(|| check_profile(&assembly.data)) {
+                                    Ok(Ok(())) => None,
+                                    Ok(Err(e)) => Some(e.to_string()),
+                                    Err(fault) => Some(format!("the profile check failed ({fault})")),
+                                };
+                                if let Some(why) = refused {
+                                    return Ok(self
+                                        .snapshot_refused(state, offset, &why, ErrorCode::PROTOCOL_VIOLATION, &mut send, &mut outbox)
+                                        .await);
                                 }
                                 let skipped = offset - expected;
                                 let mut bytes = Vec::with_capacity(assembly.data.len() + 80);
@@ -1277,6 +1427,7 @@ impl State {
             persist: None,
             gone: false,
             replay: true,
+            snapshots_refused: false,
         }
     }
 }

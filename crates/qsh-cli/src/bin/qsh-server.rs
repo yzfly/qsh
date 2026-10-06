@@ -135,6 +135,21 @@ async fn run(command: ServerCommand) -> u8 {
     }
 }
 
+/// The daemon's panic hook: one line in its log (stderr: journald or `daemon.log`) with the
+/// thread and the location, before the unwinding, so that a panic can be reported. Release
+/// builds unwind (workspace `Cargo.toml`): a panic in the screen model or the codec is
+/// contained and logged by its caller with the session (`qsh_core::fault`; nothing here then),
+/// any other ends its task or thread, not the daemon. The message is left out when it may quote
+/// a session's output.
+fn log_panics() {
+    std::panic::set_hook(Box::new(|info| {
+        if qsh_core::fault::hook(info) {
+            return;
+        }
+        eprintln!("qsh-server: {}", qsh_core::fault::report(info));
+    }));
+}
+
 /// The daemon's port range and extra ports, from the configuration files and
 /// `QSH_SERVER_PORTS`, or `--ports`; quietly (`qsh-server status` reports the files'
 /// problems).
@@ -398,6 +413,7 @@ async fn stop(paths: &Paths) -> u8 {
 }
 
 async fn daemon(paths: Paths, mut launcher: DaemonLauncher, args: DaemonArgs) -> u8 {
+    log_panics();
     let mut config = ServerConfig::new(paths.clone());
     server_settings(&paths).apply(&mut config);
     // A daemon in a program of its own upgrades in place, giving the next image these options

@@ -46,6 +46,9 @@ const PING_INTERVAL: Duration = Duration::from_secs(5);
 const SNAPSHOT_PART: usize = 32 * 1024;
 /// Snapshots smaller than this are not compressed (m2.md 6.8).
 const SNAPSHOT_COMPRESS_MIN: usize = 1024;
+/// Panics of the zstd encoder after which an attachment compresses no more (each one costs
+/// only its message, but they are logged, and an encoder that fails again and again is broken).
+const ENCODER_FAULTS: u32 = 3;
 /// An authenticated connection that received nothing for this long is gone (clients PING
 /// every 15 s).
 const SILENT_CONNECTION: Duration = Duration::from_secs(90);
@@ -737,6 +740,9 @@ struct Out {
     rate: Rate,
     /// The compression policy, when `zstd` was negotiated (never for ERROR_OUTPUT).
     squeeze: Option<Squeeze>,
+    /// Panics of the zstd encoder on this attachment (contained; the message went
+    /// uncompressed). After [`ENCODER_FAULTS`] it compresses no more.
+    encoder_faults: u32,
 }
 
 impl Out {
@@ -750,6 +756,33 @@ impl Out {
             snapshot: None,
             rate: Rate::new(initial_rate),
             squeeze: (zstd && stream == Stream::Output).then(Squeeze::new),
+            encoder_faults: 0,
+        }
+    }
+
+    /// `data` compressed for this attachment, if the encoder works on it: a panic of the
+    /// encoder (contained, [`crate::fault`]) is logged, the data goes uncompressed, and after
+    /// [`ENCODER_FAULTS`] of them the attachment compresses no more.
+    fn compress(&mut self, session: &PtySession, data: &[u8]) -> Option<Vec<u8>> {
+        match codec::compress(data) {
+            Ok(frame) => frame,
+            Err(fault) => {
+                self.encoder_faults += 1;
+                let off = self.encoder_faults >= ENCODER_FAULTS;
+                if off {
+                    self.squeeze = None;
+                }
+                log::info(format_args!(
+                    "session {}: the zstd encoder failed ({fault}); {}",
+                    &session.id.to_hex()[..8],
+                    if off {
+                        "no compression on this attachment from now on"
+                    } else {
+                        "sent uncompressed"
+                    }
+                ));
+                None
+            }
         }
     }
 
@@ -822,14 +855,14 @@ impl Out {
             self.skip(start);
         }
         self.sent = start + bytes.len() as u64;
-        if let Some(squeeze) = self.squeeze.as_mut().filter(|_| compress) {
-            if bytes.len() >= pacing::COMPRESS_MIN {
-                if let Some(frame) = codec::compress(&bytes) {
+        if compress && self.squeeze.is_some() && bytes.len() >= pacing::COMPRESS_MIN {
+            if let Some(frame) = self.compress(session, &bytes) {
+                if let Some(squeeze) = self.squeeze.as_mut() {
                     squeeze.record(Instant::now(), bytes.len(), frame.len(), self.sent);
-                    if frame.len() * 10 <= bytes.len() * 9 {
-                        batch.push(Message::OutputZstd { offset: start, frame });
-                        return Some(gap);
-                    }
+                }
+                if frame.len() * 10 <= bytes.len() * 9 {
+                    batch.push(Message::OutputZstd { offset: start, frame });
+                    return Some(gap);
                 }
             }
         }
@@ -850,16 +883,37 @@ impl Out {
 /// its session's output sink and lives as long as the session.
 static MODELS: LazyLock<Mutex<HashMap<SessionId, Weak<Mutex<Live>>>>> = LazyLock::new(Default::default);
 
+/// Lock a session's model. [`Live`] contains every panic of the model, so the mutex is not
+/// poisoned by one; if it ever is (a panic in our own bookkeeping), the model is dropped and
+/// the session goes on without snapshots: a `Live` without a model is consistent whatever it
+/// was doing.
+fn lock_model(model: &Mutex<Live>) -> std::sync::MutexGuard<'_, Live> {
+    model.lock().unwrap_or_else(|poisoned| {
+        let mut live = poisoned.into_inner();
+        live.stop();
+        model.clear_poison();
+        live
+    })
+}
+
 /// Feeds a session's model with its output, under the output buffer's lock.
 struct ModelSink(Arc<Mutex<Live>>);
 
 impl OutputSink for ModelSink {
     fn output(&mut self, offset: u64, bytes: &[u8]) {
-        self.0.lock().unwrap().feed(offset, bytes);
+        lock_model(&self.0).feed(offset, bytes);
     }
 
     fn handoff(&mut self) -> Option<(u16, u16, Vec<u8>)> {
-        self.0.lock().unwrap().handoff()
+        lock_model(&self.0).handoff()
+    }
+}
+
+impl Drop for ModelSink {
+    /// A model nobody feeds any more (the sink was removed, after a fault for instance) would
+    /// give wrong snapshots to the attachments that hold it: it stops.
+    fn drop(&mut self) {
+        lock_model(&self.0).stop();
     }
 }
 
@@ -871,14 +925,15 @@ pub(crate) fn install_model(shared: &Shared, session: &PtySession) {
     if session.pipe || !shared.config.snapshot {
         return;
     }
+    let name = &session.id.to_hex()[..8];
     let live = match session.take_resumed_model() {
         Some(model) => {
             let end = session.output.lock().unwrap().end();
-            Live::resumed(model.cols, model.rows, &model.snapshot, end)
+            Live::resumed(name, model.cols, model.rows, &model.snapshot, end)
         }
         None => {
             let (cols, rows) = session.window_size().unwrap_or((80, 24));
-            Live::new(cols, rows)
+            Live::new(name, cols, rows)
         }
     };
     let live = Arc::new(Mutex::new(live));
@@ -902,7 +957,7 @@ fn resize_session(session: &PtySession, cols: u16, rows: u16) {
     }
     if let Some(model) = model_of(session) {
         let _buffer = session.output.lock().unwrap();
-        model.lock().unwrap().resize(cols, rows);
+        lock_model(&model).resize(cols, rows);
     }
     session.resize(cols, rows);
 }
@@ -923,7 +978,7 @@ fn attach_cut(session: &PtySession, model: &Mutex<Live>, start: u64, rate: f64) 
     if let Some(i) = ahead.iter().position(|&b| b == b'\n') {
         cut = at + i as u64 + 1;
     }
-    if model.lock().unwrap().alternate() {
+    if lock_model(model).alternate() {
         cut = end;
     }
     Some(cut.max(start))
@@ -933,9 +988,9 @@ fn attach_cut(session: &PtySession, model: &Mutex<Live>, start: u64, rate: f64) 
 /// yet; a resync snapshot (not `skip`) first sends it, so that it skips nothing. Parts of
 /// 32 KiB, compressed when `zstd` (7.8.3). The output buffer is locked before the model (the
 /// order of the reader thread), so the model stands exactly at the buffer's end. Returns
-/// whether the program should redraw as well. Without a usable snapshot (beyond the size
-/// limit, or the model's end before what was sent): a skip falls back to OUTPUT_GAP and a
-/// redraw (7.7), a resync is given up.
+/// whether the program should redraw as well. Without a usable snapshot (no model any more,
+/// beyond the size limit, or the model's end before what was sent): a skip falls back to
+/// OUTPUT_GAP and a redraw (7.7), a resync to a redraw (protocol.md 7.8.7).
 fn send_snapshot(
     session: &PtySession,
     model: &Mutex<Live>,
@@ -947,7 +1002,7 @@ fn send_snapshot(
 ) -> bool {
     let now = Instant::now();
     let buffer = session.output.lock().unwrap();
-    let snapshot = model.lock().unwrap().snapshot(skip.then_some(out.sent));
+    let snapshot = lock_model(model).snapshot(skip.then_some(out.sent));
     let Some(snapshot) = snapshot.filter(|s| s.offset >= out.sent) else {
         let end = buffer.end();
         drop(buffer);
@@ -961,7 +1016,8 @@ fn send_snapshot(
             return true;
         }
         catchup.abandon();
-        return false;
+        // The repaint the resync was for (after a gap, an attach at LATEST, a redraw request)
+        return !skip;
     };
     if !skip {
         let want = (snapshot.offset - out.sent) as usize;
@@ -987,8 +1043,8 @@ fn send_snapshot(
     for (i, part) in parts.iter().enumerate() {
         let mut flags = if i + 1 == parts.len() { SNAPSHOT_FINAL } else { 0 };
         let mut data = part.to_vec();
-        if zstd && snapshot.data.len() >= SNAPSHOT_COMPRESS_MIN {
-            if let Some(frame) = codec::compress(part).filter(|f| f.len() * 10 <= part.len() * 9) {
+        if zstd && snapshot.data.len() >= SNAPSHOT_COMPRESS_MIN && out.encoder_faults < ENCODER_FAULTS {
+            if let Some(frame) = out.compress(session, part).filter(|f| f.len() * 10 <= part.len() * 9) {
                 data = frame;
                 flags |= SNAPSHOT_ZSTD;
             }
@@ -1140,7 +1196,9 @@ async fn terminal(
         outs.push(Out::new(Stream::Error, error_start, initial_rate, false));
     }
     conn.ping();
-    // Smart catch-up (7.8): with a model, snapshots instead of a backlog the path cannot carry
+    // Smart catch-up (7.8): with a model, snapshots instead of a backlog the path cannot carry.
+    // A session whose model failed (protocol.md 7.8.7) or is beyond the caps keeps the
+    // triggers, with OUTPUT_GAP and a redraw where a snapshot would have been sent
     let model = snapshots.then(|| model_of(session)).flatten();
     let quic = conn.connection.transport() == Transport::Quic;
     let mut catchup = model
@@ -1175,6 +1233,9 @@ async fn terminal(
     let mut held = Held::default();
     // Input received, as the last ACK (or ATTACHED) told the client
     let mut acked_input = next_input;
+    // The last snapshot or compressed output sent: what an ERROR from the client may be about
+    // (protocol.md 7.8.4)
+    let mut encoded: Option<(&str, u64)> = None;
 
     // Messages are read by a task so that a partly read message is never lost to select!
     let (tx, mut rx) = mpsc::channel::<Result<Message, FramingError>>(64);
@@ -1325,6 +1386,14 @@ async fn terminal(
             }
         }
         if !batch.is_empty() {
+            for m in batch.iter().rev() {
+                match m {
+                    Message::Snapshot { offset, .. } => encoded = Some(("a snapshot", *offset)),
+                    Message::OutputZstd { offset, .. } => encoded = Some(("compressed output", *offset)),
+                    _ => continue,
+                }
+                break;
+            }
             if write(send, &batch).await.is_err() {
                 return Outcome::Finished;
             }
@@ -1478,7 +1547,18 @@ async fn terminal(
                     session.hang_up();
                     return ending(session, &mut outs, send).await;
                 }
-                Message::Error { .. } => return Outcome::Finished,
+                Message::Error { code, .. } => {
+                    if let (ErrorCode::PROTOCOL_VIOLATION | ErrorCode::FRAME_ERROR, Some((what, offset))) =
+                        (code, encoded)
+                    {
+                        // The only trace of an encoder bug on this side (protocol.md 7.8.4)
+                        log::info(format_args!(
+                            "session {}: the client refused the attachment ({code}) after {what} at offset {offset}",
+                            &session.id.to_hex()[..8]
+                        ));
+                    }
+                    return Outcome::Finished;
+                }
                 Message::Unknown { .. } => {}
                 _ => return Outcome::Error(ErrorCode::PROTOCOL_VIOLATION),
             }

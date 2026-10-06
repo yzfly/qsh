@@ -65,5 +65,14 @@ undocumented_unsafe_blocks = "warn"
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-panic = "abort"
+# Unwind, not abort (the default; said here because it matters): the daemon contains a panic of
+# the screen model or the codec with catch_unwind and loses one feature of one session instead
+# of every session of the user (protocol.md 7.8.7, qsh_core::fault); the upgrade fallback and
+# the client's terminal restore run from panic hooks, which work the same either way. The cost
+# is the unwind tables and landing pads: qsh-server 4.19 MB -> 4.81 MB (+0.6 MB, +15 %, x86_64,
+# measured 2026-10-06), worth one session's fault never ending them all. Distribution builds use
+# their own flags but keep the profile's panic strategy. The fuzz targets are built by
+# cargo-fuzz in their own workspace; libfuzzer-sys's panic hook aborts before any unwinding,
+# so a contained panic is still a crash there.
+panic = "unwind"
 strip = true

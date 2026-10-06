@@ -1112,8 +1112,9 @@ unsafe fn socket_address_ip(address: *const libc::sockaddr) -> Option<std::net::
 static SAVED_TERMIOS: std::sync::Mutex<Option<libc::termios>> = std::sync::Mutex::new(None);
 
 /// Put stdin's terminal back into the mode it had before [`RawMode::enable`], if raw mode is on.
-/// For the paths on which [`RawMode`]'s drop never runs: a panic (release builds abort), and
-/// signals that end the process. Safe to call more than once.
+/// For the paths on which [`RawMode`]'s drop never runs, or not soon enough: a panic (from
+/// the panic hook, before the unwinding, which may end only a task), and signals that end the
+/// process. Safe to call more than once.
 pub fn restore_terminal() {
     let saved = match SAVED_TERMIOS.try_lock() {
         Ok(mut guard) => guard.take(),

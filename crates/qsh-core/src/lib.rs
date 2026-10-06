@@ -21,6 +21,7 @@ pub mod client;
 pub mod codec;
 pub mod config;
 pub mod crypto;
+pub mod fault;
 #[cfg(feature = "hub")]
 pub mod hub;
 pub mod log;

@@ -2,6 +2,9 @@
 //! bounded decoder of `codec.rs` never panic; a frame they accept declares 1 to 65 536 bytes
 //! and produces exactly that many, and the same bytes as the reference decoder (ruzstd) when
 //! that accepts it too; and our own frames of any input decode to exactly that input.
+//!
+//! `codec` contains panics of the encoder and the decoder (`qsh_core::fault`), but this still
+//! finds them: libfuzzer-sys's panic hook aborts before anything unwinds to a `catch_unwind`.
 #![no_main]
 
 use std::io::Read as _;
@@ -34,7 +37,7 @@ fuzz_target!(|data: &[u8]| {
     }
     // Our frames, of the input as content
     let content = &data[..data.len().min(MAX_ZSTD_CONTENT)];
-    if let Some(frame) = codec::compress(content) {
+    if let Ok(Some(frame)) = codec::compress(content) {
         assert_eq!(codec::decompress(&frame, MAX_ZSTD_CONTENT).as_deref(), Ok(content));
     }
 });

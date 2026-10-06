@@ -38,8 +38,9 @@ pub const MAX_BUFFER: u64 = 1 << 30;
 /// Largest input queue in a state.
 pub const MAX_INPUT_QUEUE: usize = 64 << 20;
 
-/// Largest screen model snapshot in a state.
-pub const MAX_SNAPSHOT: usize = 16 << 20;
+/// Largest screen model snapshot in a state: what a snapshot may be on the wire (a model's
+/// state is handed over as a resync snapshot, which its writer keeps within this).
+pub use crate::proto::message::MAX_SNAPSHOT;
 
 /// Largest command in a state.
 pub const MAX_COMMAND: usize = 1 << 20;

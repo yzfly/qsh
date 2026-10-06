@@ -30,6 +30,7 @@ use tokio::sync::Notify;
 
 use super::handoff::{BufferState, ExitState, ModelState, SessionFds, SessionState, NO_FD};
 use crate::crypto::SessionKey;
+use crate::log;
 use crate::proto::ExitStatus;
 use crate::session::{Inbound, ReplayBuffer};
 use crate::sys;
@@ -60,6 +61,36 @@ pub trait OutputSink: Send {
 
 /// The installed [`OutputSink`], if any.
 struct SinkSlot(Option<Box<dyn OutputSink>>);
+
+impl SinkSlot {
+    /// [`OutputSink::output`], with a panic contained ([`crate::fault`]): the sink is then
+    /// removed (dropped unused: its state may be half updated), and the session goes on.
+    /// Neither the reader thread nor the output buffer's lock, held here, suffers from it.
+    fn output(&mut self, id: &SessionId, offset: u64, bytes: &[u8]) {
+        let Some(sink) = self.0.as_mut() else { return };
+        if let Err(fault) = crate::fault::contain(|| sink.output(offset, bytes)) {
+            self.failed(id, &fault);
+        }
+    }
+
+    /// [`OutputSink::handoff`], with a panic contained the same way.
+    fn handoff(&mut self, id: &SessionId) -> Option<(u16, u16, Vec<u8>)> {
+        let sink = self.0.as_mut()?;
+        crate::fault::contain(|| sink.handoff()).unwrap_or_else(|fault| {
+            self.failed(id, &fault);
+            None
+        })
+    }
+
+    fn failed(&mut self, id: &SessionId, fault: &crate::fault::Fault) {
+        let sink = self.0.take();
+        let _ = crate::fault::contain(move || drop(sink));
+        log::info(format_args!(
+            "session {}: the output sink failed ({fault}); removed",
+            &id.to_hex()[..8]
+        ));
+    }
+}
 
 impl std::fmt::Debug for SinkSlot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -535,7 +566,7 @@ impl PtySession {
         };
         let output = buffer(&self.output);
         let errors = buffer(&self.errors);
-        let model = self.sink.lock().unwrap().0.as_mut().and_then(|s| s.handoff());
+        let model = self.sink.lock().unwrap().handoff(&self.id);
         let exit = match (self.exit_status(), *self.exited_at.lock().unwrap()) {
             (Some(status), Some(at)) => Some(ExitState {
                 status,
@@ -686,10 +717,10 @@ impl PtySession {
         let mut slot = self.sink.lock().unwrap();
         slot.0 = sink;
         let base = buffer.base();
-        if let Some(sink) = slot.0.as_mut() {
+        if slot.0.is_some() {
             let (offset, held) = buffer.read_from(base, usize::MAX);
             if !held.is_empty() {
-                sink.output(offset, &held);
+                slot.output(&self.id, offset, &held);
             }
         }
         base
@@ -1047,9 +1078,7 @@ fn read_output(
                     buffer.push(&buf[..n]);
                     if stream == Stream::Output {
                         // Under the buffer's lock (m2.md 6.2)
-                        if let Some(sink) = s.sink.lock().unwrap().0.as_mut() {
-                            sink.output(offset, &buf[..n]);
-                        }
+                        s.sink.lock().unwrap().output(&s.id, offset, &buf[..n]);
                     }
                 }
                 s.changed.notify_waiters();
@@ -1297,6 +1326,41 @@ mod tests {
         drop(buffer);
         // Removed: no more calls
         assert_eq!(s.set_output_sink(None), 0);
+    }
+
+    /// A sink that panics is removed; the reader thread, the output buffer (whose lock it held)
+    /// and the session go on.
+    #[tokio::test]
+    async fn a_panicking_sink_is_removed_and_the_session_goes_on() {
+        struct Panicky(Arc<AtomicUsize>);
+        impl OutputSink for Panicky {
+            fn output(&mut self, _offset: u64, bytes: &[u8]) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                // One byte, so that a read cannot split it
+                if bytes.contains(&b'!') {
+                    panic!("injected");
+                }
+            }
+            fn handoff(&mut self) -> Option<(u16, u16, Vec<u8>)> {
+                panic!("injected")
+            }
+        }
+        let s = start("echo one; read x; echo boom!; read y; echo after-$y", false);
+        wait_output(&s, "one").await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        s.set_output_sink(Some(Box::new(Panicky(calls.clone()))));
+        s.write_input(b"x\n".to_vec());
+        wait_output(&s, "boom!").await;
+        let after_fault = calls.load(Ordering::SeqCst);
+        s.write_input(b"y\n".to_vec());
+        wait_output(&s, "after-y").await;
+        assert_eq!(calls.load(Ordering::SeqCst), after_fault, "removed after the panic");
+        assert!(s.sink.lock().unwrap().0.is_none());
+        assert!(!s.output.is_poisoned() && !s.sink.is_poisoned());
+        // A panic in the handoff is contained too: the session is handed over without a model
+        s.set_output_sink(Some(Box::new(Panicky(calls.clone()))));
+        assert!(s.sink.lock().unwrap().handoff(&s.id).is_none());
+        assert!(s.sink.lock().unwrap().0.is_none());
     }
 
     #[tokio::test]

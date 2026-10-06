@@ -705,7 +705,12 @@ struct Checked {
 
 /// m2.md 10.3 step 7: read and check everything, change nothing.
 fn check(config: &ServerConfig, resume: &Resume, key: &StateKey, fault: bool) -> io::Result<Checked> {
-    let state = peek(resume.state_fd as u32, |f| handoff::read_sealed(f, key))?;
+    // The parser is bounded and fuzzed; a panic in it all the same is an error like any
+    // other here (the caller falls back to the old image), not a crash
+    let state = peek(resume.state_fd as u32, |f| {
+        crate::fault::contain(|| handoff::read_sealed(f, key))
+            .unwrap_or_else(|fault| Err(io::Error::other(format!("the state parser failed ({fault})"))))
+    })?;
     if fault {
         return Err(io::Error::other("test fault"));
     }
@@ -858,7 +863,10 @@ fn commit(
 /// m2.md 10.4: when the new image cannot resume, it executes the old one again (Linux, which
 /// can execute an open file: the old executable was kept open since that image started, so a
 /// package upgrade that replaced the file does not matter). A panic before the commit does
-/// the same, from the panic hook (release builds abort on panic).
+/// the same, from the panic hook, which runs before any unwinding (release builds unwind). A
+/// panic that `crate::fault::contain` catches does not: it costs one feature of one session,
+/// and is handled where it is caught. (The models of the sessions are made in `commit`, after
+/// `disarm`; their panics are contained by `screen::Live` all the same.)
 mod fallback {
     use super::*;
 
@@ -893,7 +901,11 @@ mod fallback {
             let previous = std::panic::take_hook();
             std::panic::set_hook(Box::new(move |info| {
                 previous(info);
-                run("a panic");
+                // A panic that is contained (crate::fault) costs one feature of one session,
+                // not this image
+                if !crate::fault::contained() {
+                    run("a panic");
+                }
             }));
         });
     }

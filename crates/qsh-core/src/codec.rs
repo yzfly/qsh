@@ -18,6 +18,11 @@
 //!   allocate gigabytes. It is memory safe, allocates at most the declared size plus the
 //!   block's literals, and is fuzzed against `ruzstd` (fuzz target `zstd_frame`).
 //!
+//! Both contain a panic of the code they call ([`crate::fault`]): the encoder's is an
+//! [`Err`] of [`compress`] (the caller sends the data uncompressed), the decoder's is
+//! [`DecodeError::Fault`] (the client treats the connection as broken, and stops asking that
+//! server for compression if it happens again). A panic costs one message, never the process.
+//!
 //! Without the cargo feature `zstd` both return nothing: such a build never offers the
 //! capability ([`AVAILABLE`]).
 
@@ -28,6 +33,7 @@ mod tests;
 
 use std::fmt;
 
+use crate::fault::{self, Fault};
 use crate::proto::zstd::{FrameError, MAX_ZSTD_CONTENT};
 
 /// This build can compress and decompress (cargo feature `zstd`).
@@ -58,6 +64,9 @@ pub enum DecodeError {
     Checksum,
     /// This build has no zstd (cargo feature `zstd`).
     Unsupported,
+    /// The decoder panicked (contained, [`crate::fault`]): a bug of ours, not necessarily a bad
+    /// frame.
+    Fault(Fault),
 }
 
 impl fmt::Display for DecodeError {
@@ -73,6 +82,7 @@ impl fmt::Display for DecodeError {
             }
             DecodeError::Checksum => f.write_str("zstd frame checksum mismatch"),
             DecodeError::Unsupported => f.write_str("zstd is not supported by this build"),
+            DecodeError::Fault(fault) => write!(f, "the zstd decoder failed ({fault})"),
         }
     }
 }
@@ -88,11 +98,17 @@ impl From<FrameError> for DecodeError {
 /// `data` (1 to [`MAX_ZSTD_CONTENT`] bytes) as one independent zstd frame that follows the
 /// rules of protocol.md 7.12. None without the `zstd` feature, or for an empty or larger
 /// input. The frame may be larger than `data` (incompressible input): the caller compares.
-pub fn compress(data: &[u8]) -> Option<Vec<u8>> {
+/// A panic in the encoder is an error: the caller sends `data` uncompressed.
+pub fn compress(data: &[u8]) -> Result<Option<Vec<u8>>, Fault> {
     if data.is_empty() || data.len() > MAX_ZSTD_CONTENT {
-        return None;
+        return Ok(None);
     }
-    compress_frame(data)
+    // Contained: the encoder's state lives and dies within the call, nothing of it is reused
+    fault::contain(|| {
+        #[cfg(any(test, feature = "test-hooks"))]
+        fault::test_hooks::check(fault::test_hooks::Hook::Encoder, data);
+        compress_frame(data)
+    })
 }
 
 #[cfg(feature = "zstd")]
@@ -168,11 +184,21 @@ fn compress_frame(_data: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// Decompress one frame of OUTPUT_ZSTD or compressed SNAPSHOT data, declaring at most `max`
-/// bytes (at most [`MAX_ZSTD_CONTENT`]), under every rule of protocol.md 7.12.
+/// bytes (at most [`MAX_ZSTD_CONTENT`]), under every rule of protocol.md 7.12. A panic in
+/// the decoder is [`DecodeError::Fault`].
 pub fn decompress(frame: &[u8], max: usize) -> Result<Vec<u8>, DecodeError> {
     #[cfg(feature = "zstd")]
     {
-        decode::decode(frame, max.min(MAX_ZSTD_CONTENT))
+        // Contained: the decoder's state lives and dies within the call
+        fault::contain(|| {
+            let data = decode::decode(frame, max.min(MAX_ZSTD_CONTENT));
+            #[cfg(any(test, feature = "test-hooks"))]
+            if let Ok(data) = &data {
+                fault::test_hooks::check(fault::test_hooks::Hook::Decoder, data);
+            }
+            data
+        })
+        .unwrap_or_else(|fault| Err(DecodeError::Fault(fault)))
     }
     #[cfg(not(feature = "zstd"))]
     {

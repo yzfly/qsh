@@ -152,6 +152,21 @@ pub fn status_line(destination: &str, status: &Status) -> String {
             if status.snapshots == 1 { "" } else { "s" }
         ));
     }
+    if status.snapshots_refused > 0 {
+        // A server whose snapshots fail the client's checks (protocol.md 7.8.4)
+        parts.push(format!(
+            "{} snapshot{} refused (snapshots off)",
+            status.snapshots_refused,
+            if status.snapshots_refused == 1 { "" } else { "s" }
+        ));
+    }
+    if status.frames_refused > 0 {
+        parts.push(format!(
+            "{} zstd frame{} refused",
+            status.frames_refused,
+            if status.frames_refused == 1 { "" } else { "s" }
+        ));
+    }
     parts.join(", ")
 }
 
@@ -570,17 +585,23 @@ async fn attempt(config: ClientConfig, start: Start, options: &TerminalOptions) 
     // Let the closing connection's last packets (QUIC CONNECTION_CLOSE) leave
     tokio::time::sleep(Duration::from_millis(50)).await;
     drop(raw);
-    let status = status.lock().unwrap().clone();
+    let status = status.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let result = result.unwrap_or_else(|e| Err(ClientError::Io(std::io::Error::other(e))));
     Ended { result, status }
 }
 
-/// The terminal's mode comes back however qsh ends: a panic (release builds abort, so no drop
-/// runs) or a signal that ends it (SIGTERM, SIGHUP, SIGQUIT, SIGINT). The process then exits
-/// with 128 + the signal, as if it had died of it.
+/// The terminal's mode comes back however qsh ends: a panic (restored by the hook, before the
+/// unwinding; the session's task ends with it and qsh exits with the error) or a signal that
+/// ends it (SIGTERM, SIGHUP, SIGQUIT, SIGINT). The process then exits with 128 + the signal, as
+/// if it had died of it. A panic that qsh-core contains (its zstd decoder, `fault`) ends
+/// nothing: the hook leaves the terminal alone and prints nothing into it (the session logs the
+/// fault with `-v`).
 fn restore_on_exit() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        if qsh_core::fault::hook(info) {
+            return;
+        }
         sys::restore_terminal();
         previous(info);
     }));
@@ -646,6 +667,14 @@ mod tests {
         let line = status_line("h", &s);
         assert!(
             line.contains("(40.0 MB as 10.0 MB zstd)") && line.contains("2 screens sent instead of a backlog"),
+            "{line}"
+        );
+        assert!(!line.contains("refused"), "{line}");
+        s.snapshots_refused = 1;
+        s.frames_refused = 2;
+        let line = status_line("h", &s);
+        assert!(
+            line.contains("1 snapshot refused (snapshots off)") && line.contains("2 zstd frames refused"),
             "{line}"
         );
         assert_eq!(attempts_line(&Status::default()), None);
