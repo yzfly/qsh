@@ -261,11 +261,27 @@ f={local}${{url#https://mirror.invalid/qsh/releases}}\n[ -f \"$f\" ] || exit 22\
     let target = w.dir.join("prefix/bin/qsh-server");
     // A uname that says x86_64 Linux, as the world's
     fs::copy(w.dir.join("bin/uname"), bin.join("uname")).unwrap();
+    // install.sh verifies with minisign or OpenSSL 3; macOS ships LibreSSL, which cannot, and
+    // then a required signature is refused rather than skipped
+    let can_verify = Command::new("sh")
+        .args(["-c", "command -v minisign || openssl version | grep -q '^OpenSSL 3'"])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .is_ok_and(|o| o.status.success());
     let (code, err) = run(&["--require-signature"]);
-    assert_eq!(code, Some(0), "{err}");
-    assert!(err.contains("signature OK"), "{err}");
-    assert_eq!(fs::read(&target).unwrap(), fs::read(&stub).unwrap());
-    fs::remove_file(&target).unwrap();
+    if can_verify {
+        assert_eq!(code, Some(0), "{err}");
+        assert!(err.contains("signature OK"), "{err}");
+        assert_eq!(fs::read(&target).unwrap(), fs::read(&stub).unwrap());
+        fs::remove_file(&target).unwrap();
+    } else {
+        assert_eq!(code, Some(1), "{err}");
+        assert!(err.contains("cannot check the release signature"), "{err}");
+        assert!(!target.exists(), "nothing is installed without a checked signature");
+        // The checks below need a verifier
+        return;
+    }
     // Tampered checksums: refused
     let original = fs::read(&sums).unwrap();
     let mut changed = original.clone();
