@@ -325,7 +325,7 @@ pub fn server_name() -> ServerName<'static> {
 }
 
 /// QUIC transport parameters shared by both ends (protocol.md 9.1).
-fn transport() -> quinn::TransportConfig {
+pub(crate) fn transport() -> quinn::TransportConfig {
     let mut transport = quinn::TransportConfig::default();
     // Keepalives hold NAT mappings open (carrier UDP mappings last 30 s or more), and are rare
     // enough to let a phone's cellular radio go idle. The session layer finds dead paths.
@@ -437,9 +437,113 @@ impl ServerCertVerifier for PinnedCert {
     }
 }
 
+impl Identity {
+    /// The key of the daemon's QUIC stateless resets (RFC 9000 10.3), derived from the
+    /// identity's private key with HKDF-SHA256, info `"qsh stateless reset"` (m2.md 10.6):
+    /// the same for every process of the daemon, so a client whose connection the daemon no
+    /// longer knows (after an upgrade in place or a crash) gets a reset it recognizes and
+    /// reconnects at once, instead of waiting for its idle timer. It is as secret as the
+    /// identity itself.
+    pub fn stateless_reset_key(&self) -> hmac::Key {
+        let salt = ring::hkdf::Salt::new(ring::hkdf::HKDF_SHA256, b"qsh/1");
+        let prk = salt.extract(self.key.secret_pkcs8_der());
+        let info: &[&[u8]] = &[b"qsh stateless reset"];
+        let okm = prk
+            .expand(info, hmac::HMAC_SHA256)
+            .expect("HKDF output of one hash length is always valid");
+        hmac::Key::from(okm)
+    }
+}
+
+/// Length of the key that seals the upgrade's handoff state (ChaCha20-Poly1305).
+pub const STATE_KEY_LEN: usize = 32;
+
+/// Additional data of the sealed handoff state: binds the ciphertext to its purpose.
+const STATE_AAD: &[u8] = b"qsh handoff state";
+
+/// A key of [`STATE_KEY_LEN`] bytes, wiped when dropped.
+pub type StateKey = zeroize::Zeroizing<[u8; STATE_KEY_LEN]>;
+
+/// Seal `plaintext` with ChaCha20-Poly1305 under a fresh random key (security.md 4.8): returns
+/// the sealed bytes (a random 12-byte nonce, the ciphertext and the tag) and the key, which
+/// travels separately and is wiped when dropped. The plaintext is encrypted in place.
+pub fn seal_state(mut plaintext: Vec<u8>) -> io::Result<(Vec<u8>, StateKey)> {
+    use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305, NONCE_LEN};
+    let key = StateKey::new(random::<STATE_KEY_LEN>());
+    let sealing =
+        LessSafeKey::new(UnboundKey::new(&CHACHA20_POLY1305, &key[..]).map_err(|_| io::Error::other("bad key"))?);
+    let nonce = random::<NONCE_LEN>();
+    sealing
+        .seal_in_place_append_tag(
+            Nonce::assume_unique_for_key(nonce),
+            Aad::from(STATE_AAD),
+            &mut plaintext,
+        )
+        .map_err(|_| io::Error::other("cannot seal the state"))?;
+    let mut sealed = Vec::with_capacity(NONCE_LEN + plaintext.len());
+    sealed.extend_from_slice(&nonce);
+    sealed.extend_from_slice(&plaintext);
+    Ok((sealed, key))
+}
+
+/// Open what [`seal_state`] sealed. Any change to the bytes, or another key, is an error.
+pub fn open_state(mut sealed: Vec<u8>, key: &[u8; STATE_KEY_LEN]) -> io::Result<Vec<u8>> {
+    use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305, NONCE_LEN};
+    let bad = || io::Error::new(io::ErrorKind::InvalidData, "the state is not authentic");
+    if sealed.len() < NONCE_LEN + CHACHA20_POLY1305.tag_len() {
+        return Err(bad());
+    }
+    let opening = LessSafeKey::new(UnboundKey::new(&CHACHA20_POLY1305, key).map_err(|_| bad())?);
+    let nonce: [u8; NONCE_LEN] = sealed[..NONCE_LEN].try_into().map_err(|_| bad())?;
+    let len = opening
+        .open_in_place(
+            Nonce::assume_unique_for_key(nonce),
+            Aad::from(STATE_AAD),
+            &mut sealed[NONCE_LEN..],
+        )
+        .map_err(|_| bad())?
+        .len();
+    sealed.copy_within(NONCE_LEN..NONCE_LEN + len, 0);
+    sealed.truncate(len);
+    Ok(sealed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The handoff state (m2.md 10.3 step 4): sealed under a fresh key; any change, or another
+    /// key, is refused.
+    #[test]
+    fn the_state_is_sealed_and_tampering_is_refused() {
+        let plain = b"QSH-HANDOFF\nsecret session keys".to_vec();
+        let (sealed, key) = seal_state(plain.clone()).unwrap();
+        assert!(!sealed.windows(6).any(|w| w == b"secret"), "not in clear");
+        assert_eq!(open_state(sealed.clone(), &key).unwrap(), plain);
+        for i in [0, 12, sealed.len() / 2, sealed.len() - 1] {
+            let mut bad = sealed.clone();
+            bad[i] ^= 1;
+            assert!(open_state(bad, &key).is_err(), "byte {i}");
+        }
+        let mut other = *key;
+        other[0] ^= 1;
+        assert!(open_state(sealed.clone(), &other).is_err());
+        assert!(open_state(sealed[..10].to_vec(), &key).is_err());
+        let (again, key2) = seal_state(plain).unwrap();
+        assert_ne!(again, sealed);
+        assert_ne!(*key2, *key);
+    }
+
+    /// The stateless reset key is derived from the identity: the same for the same identity
+    /// (across restarts), different for another one.
+    #[test]
+    fn the_stateless_reset_key_follows_the_identity() {
+        let a = Identity::generate().unwrap();
+        let b = Identity::generate().unwrap();
+        let sign = |k: &hmac::Key| hmac::sign(k, b"cid").as_ref().to_vec();
+        assert_eq!(sign(&a.stateless_reset_key()), sign(&a.stateless_reset_key()));
+        assert_ne!(sign(&a.stateless_reset_key()), sign(&b.stateless_reset_key()));
+    }
 
     #[test]
     fn hex_roundtrip_and_rejects_bad_input() {

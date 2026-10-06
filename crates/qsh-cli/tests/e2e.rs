@@ -569,3 +569,59 @@ fn a_host_named_ls_is_reached_with_double_dash() {
         world.ssh_log()
     );
 }
+
+/// Path memory from the command line (m2.md 3.5, S1): after a run on a network where UDP is
+/// blocked, the next run starts TLS at once (the transcript's `plan`), and what is remembered
+/// is in a private file that names no host.
+#[test]
+fn the_next_run_starts_with_what_worked_last_time() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut world = World::new("memory");
+    world.block_udp();
+    let transcript = world.dir.join("transcript.jsonl");
+    world.set("QSH_TRANSCRIPT", transcript.display().to_string());
+    for _ in 0..2 {
+        let out = world
+            .qsh(&["srv", "echo remembered"])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "remembered\n",
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let memory = world.dir.join("state/qsh/paths.json");
+    if !memory.exists() {
+        // A machine without a default route has no network to remember anything for
+        eprintln!("no path memory written (no default route?)");
+        return;
+    }
+    assert_eq!(std::fs::metadata(&memory).unwrap().permissions().mode() & 0o777, 0o600);
+    assert!(!std::fs::read_to_string(&memory).unwrap().contains("127.0.0.1"));
+    let plans: Vec<serde_json::Value> = std::fs::read_to_string(&transcript)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .filter(|v| v["ev"] == "plan")
+        .collect();
+    assert_eq!(plans.len(), 2, "{plans:?}");
+    let tls_start = |plan: &serde_json::Value| {
+        plan["attempts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["transport"] == "TLS")
+            .map(|a| a["delay_ms"].as_u64().unwrap())
+    };
+    assert_eq!(
+        (plans[0]["remembered"].as_bool(), tls_start(&plans[0])),
+        (Some(false), Some(400))
+    );
+    assert_eq!(
+        (plans[1]["remembered"].as_bool(), tls_start(&plans[1])),
+        (Some(true), Some(0))
+    );
+}

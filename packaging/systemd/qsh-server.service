@@ -7,8 +7,17 @@
 #   loginctl enable-linger "$USER"     # keep the user manager, and the daemon, running after logout
 #
 # Stopping the service ends every session it serves (they are processes of its cgroup).
+# Reloading it keeps them: `systemctl --user reload qsh-server` upgrades the daemon in place to
+# the installed qsh-server (same process, same ports, every session kept; clients reconnect
+# within a second). A newer qsh-server also does that by itself when it is used (qsh host) or,
+# with `upgrade = "auto"` (the default, qsh_config(5)), when the daemon is idle.
 # With qsh-server in ~/.local/bin (the release installer), point the unit at it once:
-#   systemctl --user edit qsh-server.service    # [Service] ExecStart= / ExecStart=%h/.local/bin/qsh-server daemon --foreground
+#   systemctl --user edit qsh-server.service
+#     [Service]
+#     ExecStart=
+#     ExecStart=%h/.local/bin/qsh-server daemon --foreground
+#     ExecReload=
+#     ExecReload=%h/.local/bin/qsh-server upgrade
 #
 # Hardening note. This daemon is a login service: every terminal session it serves is a child of
 # it and inherits its sandbox. Options that would be standard for a network daemon would break
@@ -30,6 +39,8 @@ Documentation=man:qsh-server(1) https://github.com/yzfly/qsh
 [Service]
 Type=exec
 ExecStart=/usr/bin/qsh-server daemon --foreground
+# Upgrade in place (m2.md section 10): the main PID stays the same, so systemd keeps tracking it
+ExecReload=/usr/bin/qsh-server upgrade
 # `qsh-server stop` asks the daemon to end its sessions cleanly; SIGTERM does the same: it
 # hangs up every session (SIGHUP, as sshd does), sends each attached client the program's exit
 # status, then GOAWAY, and exits (protocol.md 7.13).

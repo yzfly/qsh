@@ -135,10 +135,15 @@ the options of the command line, so those win (ssh uses the first value it gets)
 none.
 .TP
 .B keepalive
-How often to send something on an idle connection, so that NAT routers keep it open: a time
-(see
+How often a QUIC connection sends a keep\-alive while it is idle, so that NAT routers keep its
+mapping: a time (see
 .BR "TIME AND SIZE FORMATS" )
-of 1 second to 1 hour, or \fB"auto"\fR for qsh's own interval. Default: \fB"auto"\fR.
+of 1 second to 1 hour, or \fB"auto"\fR: qsh learns the interval per network, starting at 20
+seconds, halving it (down to 5 seconds) when the server reports that a NAT forgot the
+connection, and growing it again after quiet half hours (up to 25 seconds). A fixed interval
+turns learning off; one above 25 seconds also lets an idle connection live three times as long
+when the server allows it. TLS and ssh pipe connections send a PING every 15 seconds either
+way. Default: \fB"auto"\fR.
 .TP
 .B install
 What to do when the host has no
@@ -151,9 +156,14 @@ When a new client attaches to a running session, show the output the server kept
 \fBtrue\fR or \fBfalse\fR. Default: \fBtrue\fR.
 .TP
 .B path_memory
-Remember, per server and per network, which transport and port worked, so that the next
-connection on that network starts with it: \fBtrue\fR or \fBfalse\fR. Reserved: this version
-reads it but does not use it yet. Default: \fBtrue\fR.
+Remember, per server and per network, which transport and port worked and which were blocked,
+so that the next connection on that network starts with what worked, leaves out what is
+blocked there (and tries it again in the background, moving to it when it works again), and
+uses the learned keepalive interval: \fBtrue\fR or \fBfalse\fR (nothing is read or written;
+what is learned lasts only as long as the process). Servers and networks are stored as keyed
+hashes only, in
+.IR $XDG_STATE_HOME/qsh/paths.json ;
+deleting the file forgets everything. Default: \fBtrue\fR.
 .TP
 .B catchup
 When a session's output arrives faster than the network carries it, show the current screen
@@ -184,8 +194,9 @@ More ports to listen on, for networks that block the first, as an array of at mo
 numbers; more, and duplicates, are warnings. The daemon binds each on UDP and on TCP where it
 can (a port another program holds, or one below
 .B net.ipv4.ip_unprivileged_port_start
-on Linux, is skipped) and tells clients which it bound. Reserved: this version reads it but
-does not use it yet. Default: none.
+on Linux, is skipped) and tells clients which it bound; they try them when the first port
+does not answer and remember which worked on each network. A change applies at the daemon's
+next fresh start. Default: none.
 .TP
 .B max_sessions
 The most sessions one daemon keeps, from 1 to 100000. Default: 1000.
@@ -217,7 +228,8 @@ When the daemon replaces itself with a newer
 in place, keeping its sessions: \fB"auto"\fR (when a newer version connects to it, and by
 itself when no client is attached), or \fB"manual"\fR (only on
 .BR "qsh\-server upgrade" ).
-Reserved: this version reads it but does not use it yet. Default: \fB"auto"\fR.
+The daemon keeps its process id, ports and sessions; clients reconnect within about a second.
+Default: \fB"auto"\fR.
 .PP
 .B [server.preauth]
 limits the connections that have not authenticated yet:
@@ -313,8 +325,12 @@ The system's configuration file.
 .RI ( ~/.local/state/qsh/ )
 The daemon's certificate and key
 .RI ( daemon/ ),
-and the log of a daemon started on demand
-.RI ( daemon.log ).
+the log of a daemon started on demand
+.RI ( daemon.log ),
+and the client's path memory
+.RI ( paths.json ,
+see
+.BR path_memory ).
 .TP
 .I $XDG_RUNTIME_DIR/qsh/
 .RI ( /tmp/qsh\- UID

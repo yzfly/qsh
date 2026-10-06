@@ -69,3 +69,10 @@ path = "fuzz_targets/netwatch.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "handoff_state"
+path = "fuzz_targets/handoff_state.rs"
+test = false
+doc = false
+bench = false

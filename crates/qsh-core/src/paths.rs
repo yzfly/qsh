@@ -3,7 +3,7 @@
 //! | what | default |
 //! |---|---|
 //! | configuration | `$XDG_CONFIG_HOME/qsh`, else `~/.config/qsh` |
-//! | state (daemon identity, saved sessions in `sessions/`, logs of on-demand daemons) | `$XDG_STATE_HOME/qsh`, else `~/.local/state/qsh` |
+//! | state (daemon identity, saved sessions in `sessions/`, path memory `paths.json`, logs of on-demand daemons) | `$XDG_STATE_HOME/qsh`, else `~/.local/state/qsh` |
 //! | runtime (control socket, daemon lock) | `$XDG_RUNTIME_DIR/qsh`, else `/tmp/qsh-$UID` |
 //!
 //! Every field is public: an embedder (TokenSSH keeps everything under its own directory)
@@ -93,6 +93,12 @@ impl Paths {
     /// session, mode 0600, in a directory of mode 0700 ([`crate::client::store`]).
     pub fn sessions_dir(&self) -> PathBuf {
         self.state.join("sessions")
+    }
+
+    /// Path memory (m2.md section 3): which transports and ports worked from which network,
+    /// as keyed hashes, mode 0600 in the state directory ([`crate::client::paths`]).
+    pub fn path_memory(&self) -> PathBuf {
+        self.state.join("paths.json")
     }
 
     /// The hub's unix socket (feature `hub`).
@@ -295,6 +301,7 @@ mod tests {
         let p = Paths::under(Path::new("/x"));
         assert_eq!(p.control_socket(), Path::new("/x/run/control.sock"));
         assert_eq!(p.identity_dir(), Path::new("/x/state/daemon"));
+        assert_eq!(p.path_memory(), Path::new("/x/state/paths.json"));
     }
 
     #[test]

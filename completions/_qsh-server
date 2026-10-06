@@ -47,8 +47,13 @@ _arguments "${_arguments_options[@]}" : \
 (daemon)
 _arguments "${_arguments_options[@]}" : \
 '--ports=[Ports to try, FIRST-LAST; the first free on both UDP and TCP is used]:FIRST-LAST:_default' \
+'--state-fd=[The descriptor of the sealed state (with --resume)]:FD:_default' \
+'--key-fd=[The descriptor of the pipe with the state'\''s key (with --resume)]:FD:_default' \
+'--fallback-exe-fd=[The descriptor of the previous program, run again if resuming fails (with --resume)]:FD:_default' \
 '--foreground[Stay in the foreground (for service managers); otherwise start in the background]' \
 '--on-demand[Exit after an hour without sessions (set when started on demand)]' \
+'--resume[Resume from the state an older image of this daemon handed over (an upgrade in place)]' \
+'--fell-back[The new program could not resume; this is the previous one again (with --resume)]' \
 '*-v[Log more (repeat for more)]' \
 '-h[Print help]' \
 '--help[Print help]' \
@@ -62,6 +67,22 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (stop)
+_arguments "${_arguments_options[@]}" : \
+'*-v[Log more (repeat for more)]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(upgrade)
+_arguments "${_arguments_options[@]}" : \
+'--exe=[The qsh-server to run (default\: this program)]:PATH:_files' \
+'--force[Upgrade even to a version that is not newer]' \
+'*-v[Log more (repeat for more)]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(handoff-probe)
 _arguments "${_arguments_options[@]}" : \
 '*-v[Log more (repeat for more)]' \
 '-h[Print help]' \
@@ -100,6 +121,14 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(upgrade)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(handoff-probe)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (help)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
@@ -121,6 +150,8 @@ _qsh-server_commands() {
 'daemon:Run the per-user daemon (started on demand by bootstrap otherwise)' \
 'status:Show the running daemon and its sessions (JSON)' \
 'stop:Stop the running daemon; its sessions end' \
+'upgrade:Replace the running daemon with a newer qsh-server in place; sessions are kept' \
+'handoff-probe:Print the version and the handoff state formats this program reads (used by upgrades)' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'qsh-server commands' commands "$@"
@@ -135,6 +166,11 @@ _qsh-server__subcmd__daemon_commands() {
     local commands; commands=()
     _describe -t commands 'qsh-server daemon commands' commands "$@"
 }
+(( $+functions[_qsh-server__subcmd__handoff-probe_commands] )) ||
+_qsh-server__subcmd__handoff-probe_commands() {
+    local commands; commands=()
+    _describe -t commands 'qsh-server handoff-probe commands' commands "$@"
+}
 (( $+functions[_qsh-server__subcmd__help_commands] )) ||
 _qsh-server__subcmd__help_commands() {
     local commands; commands=(
@@ -143,6 +179,8 @@ _qsh-server__subcmd__help_commands() {
 'daemon:Run the per-user daemon (started on demand by bootstrap otherwise)' \
 'status:Show the running daemon and its sessions (JSON)' \
 'stop:Stop the running daemon; its sessions end' \
+'upgrade:Replace the running daemon with a newer qsh-server in place; sessions are kept' \
+'handoff-probe:Print the version and the handoff state formats this program reads (used by upgrades)' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'qsh-server help commands' commands "$@"
@@ -156,6 +194,11 @@ _qsh-server__subcmd__help__subcmd__bootstrap_commands() {
 _qsh-server__subcmd__help__subcmd__daemon_commands() {
     local commands; commands=()
     _describe -t commands 'qsh-server help daemon commands' commands "$@"
+}
+(( $+functions[_qsh-server__subcmd__help__subcmd__handoff-probe_commands] )) ||
+_qsh-server__subcmd__help__subcmd__handoff-probe_commands() {
+    local commands; commands=()
+    _describe -t commands 'qsh-server help handoff-probe commands' commands "$@"
 }
 (( $+functions[_qsh-server__subcmd__help__subcmd__help_commands] )) ||
 _qsh-server__subcmd__help__subcmd__help_commands() {
@@ -177,6 +220,11 @@ _qsh-server__subcmd__help__subcmd__stop_commands() {
     local commands; commands=()
     _describe -t commands 'qsh-server help stop commands' commands "$@"
 }
+(( $+functions[_qsh-server__subcmd__help__subcmd__upgrade_commands] )) ||
+_qsh-server__subcmd__help__subcmd__upgrade_commands() {
+    local commands; commands=()
+    _describe -t commands 'qsh-server help upgrade commands' commands "$@"
+}
 (( $+functions[_qsh-server__subcmd__pipe_commands] )) ||
 _qsh-server__subcmd__pipe_commands() {
     local commands; commands=()
@@ -191,6 +239,11 @@ _qsh-server__subcmd__status_commands() {
 _qsh-server__subcmd__stop_commands() {
     local commands; commands=()
     _describe -t commands 'qsh-server stop commands' commands "$@"
+}
+(( $+functions[_qsh-server__subcmd__upgrade_commands] )) ||
+_qsh-server__subcmd__upgrade_commands() {
+    local commands; commands=()
+    _describe -t commands 'qsh-server upgrade commands' commands "$@"
 }
 
 if [ "$funcstack[1]" = "_qsh-server" ]; then

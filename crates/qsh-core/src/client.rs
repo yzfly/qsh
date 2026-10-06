@@ -18,14 +18,17 @@
 //!   bootstrap over ssh;
 //! - `client/conn.rs`: one connection after the hello exchange, with its control stream
 //!   ([`Conn`]);
-//! - `client/pool.rs`: connections shared per daemon, the transport race and the network
+//! - `client/pool.rs`: connections shared per daemon, the transport race planned from path
+//!   memory, keepalive learning, background probes and transport upgrades, and the network
 //!   watcher ([`Pool`]);
+//! - [`paths`]: path memory and NAT keepalive learning (m2.md sections 3 and 4);
 //! - `client/session.rs`: one terminal session across connections: attach, the terminal
 //!   channel, resume ([`Session`]);
 //! - [`store`]: saved credentials (`qsh attach`);
 //! - [`transcript`]: the `QSH_TRANSCRIPT` test hook (unstable).
 
 mod conn;
+pub mod paths;
 mod pool;
 mod session;
 pub mod store;
@@ -73,7 +76,7 @@ pub struct ClientConfig {
     pub size: WindowSize,
     /// A session name for `qsh ls`.
     pub name: Option<String>,
-    /// Which transports to race, and when each starts.
+    /// Which transports to race, and when each starts without path memory.
     pub race: RaceConfig,
     /// Run the bootstrap's ssh interactively (password and second factor prompts on the
     /// terminal); false adds `BatchMode=yes`.
@@ -91,11 +94,13 @@ pub struct ClientConfig {
     /// true replays the output the server still buffers (FRESH from offset 0), false starts at
     /// the current end (LATEST), skipping the backlog. A new session always starts at 0.
     pub replay_on_attach: bool,
-    /// The NAT keepalive interval (qsh_config(5) `keepalive`; m2.md section 4). Not used yet:
-    /// the client pings every 15 s on every transport.
+    /// The QUIC keepalive interval (qsh_config(5) `keepalive`; m2.md section 4): `Auto` learns
+    /// it per network between 5 and 25 s; a fixed interval disables learning. TLS and the ssh
+    /// pipe send PING every 15 s either way.
     pub keepalive: Keepalive,
-    /// Remember per network which transport and port worked (`path_memory`; m2.md section 3).
-    /// Not used yet.
+    /// Remember per network which transport and port worked, in the pool's path memory file
+    /// (`path_memory`; m2.md section 3). False: neither read nor write it; what is learned
+    /// lives only as long as the process.
     pub path_memory: bool,
     /// Accept SNAPSHOT on tty sessions (`catchup`; m2.md section 6). Not used yet: the client
     /// offers no capability.

@@ -2051,7 +2051,7 @@ qsh-server daemons in place follow them:
 - Op `upgrade` (`{"v":2,"op":"upgrade","exe":"/usr/bin/qsh-server","force":false}`) asks for an
   upgrade explicitly; the answer is `{"restarting":true}` or `{"ok":false,"error":"…"}`.
 - Op `status` answers, from version 2, at least: `version`, `pid`, `udp`, `tcp`, `extra_ports`,
-  `cert_sha256`, `sessions` (a count), `upgrade` (`"auto"` or `"manual"`) and `handoff` (the
+  `cert_sha256`, `session_count` (the number of sessions; `sessions` is their list), `upgrade` (`"auto"` or `"manual"`) and `handoff` (the
   state formats it can write and read, below).
 - `qsh-server handoff-probe` prints one line, `{"qsh-server":"<version>","handoff":[1]}`, and
   exits 0. A daemon upgrades only to an executable whose probe succeeds within 5 s, reports a

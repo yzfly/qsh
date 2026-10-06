@@ -9,18 +9,26 @@
 //! None of them keeps the session alive: they hold a weak reference, and every wait on a
 //! descriptor can be cancelled ([`sys::Cancel`]), so hanging a session up (or dropping it)
 //! closes its terminal or pipes at once, whatever its programs do.
+//!
+//! For an upgrade in place (m2.md section 10) the reader and writer threads stop and park
+//! their descriptors and queues (`PtySession::request_pause`); the session's state is exported
+//! with its descriptors by number, and the new image adopts both (`PtySession::adopt`). The
+//! program is reaped by pid ([`sys::reap`]), so it is the same in either image.
 
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::os::fd::AsRawFd;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
 use tokio::sync::Notify;
 
+use super::handoff::{BufferState, ExitState, ModelState, SessionFds, SessionState, NO_FD};
 use crate::crypto::SessionKey;
 use crate::proto::ExitStatus;
 use crate::session::{Inbound, ReplayBuffer};
@@ -40,6 +48,14 @@ pub trait OutputSink: Send {
     /// `offset + bytes.len()`). Output that fell out of the buffer before the sink was set is
     /// never seen; see [`PtySession::set_output_sink`].
     fn output(&mut self, offset: u64, bytes: &[u8]);
+
+    /// The model's state for an upgrade in place (m2.md 6.8 and 10.5): (columns, rows, a
+    /// resync snapshot that reproduces it). Called with the session's threads stopped. The new
+    /// image hands it out through [`PtySession::take_resumed_model`]. None (the default): the
+    /// session continues without a model.
+    fn handoff(&mut self) -> Option<(u16, u16, Vec<u8>)> {
+        None
+    }
 }
 
 /// The installed [`OutputSink`], if any.
@@ -141,6 +157,38 @@ enum InputItem {
     Data(Vec<u8>),
     /// Close the program's stdin (pipe sessions).
     Eof,
+    /// Stop and park (an upgrade in place, m2.md 10.3 step 3).
+    Park,
+}
+
+/// A stopped output reader: its descriptor and the sender that tells the waiter it reached
+/// the end (it has not).
+#[derive(Debug)]
+struct ParkedReader {
+    fd: File,
+    done: Sender<()>,
+}
+
+/// The stopped input writer.
+#[derive(Debug)]
+struct ParkedInput {
+    /// The program's input; None once closed (end of input, or broken).
+    fd: Option<File>,
+    /// Bytes accepted and not yet written, in order, before what `rx` holds.
+    pending: Vec<u8>,
+    /// Close the input after `pending`.
+    eof: bool,
+    rx: Receiver<InputItem>,
+}
+
+/// The descriptors and queues of a session's threads while they do not run: before they
+/// start, and while an upgrade in place has them stopped (m2.md 10.3 step 3). The upgrade
+/// exports them; resuming (in this image or the next) starts the threads on them again.
+#[derive(Debug, Default)]
+struct Parked {
+    output: Option<ParkedReader>,
+    error: Option<ParkedReader>,
+    input: Option<ParkedInput>,
 }
 
 /// One session: a program on a pty or on pipes, and the state that outlives connections.
@@ -154,7 +202,7 @@ pub struct PtySession {
     pub pipe: bool,
     /// The pty master, for window sizes (tty sessions; None once hung up).
     master: Mutex<Option<File>>,
-    input: Mutex<Option<std::sync::mpsc::Sender<InputItem>>>,
+    input: Mutex<Option<Sender<InputItem>>>,
     /// Input bytes queued for the program and not yet written (section 7.4).
     input_queued: Arc<AtomicUsize>,
     /// Output produced by the program: a pipe session's stdout, kept until acknowledged; on a
@@ -179,13 +227,22 @@ pub struct PtySession {
     attached: AtomicUsize,
     /// Set when the session was removed (HANGUP, kill, TTL): attachments end.
     removed: AtomicBool,
-    /// Cancelled on hangup and drop: the threads let go of the terminal or pipes.
-    cancel: Arc<sys::Cancel>,
+    /// Cancelled on hangup, on drop, and to stop the threads for an upgrade: the threads let
+    /// go of the terminal or pipes. A new one for every start of the threads.
+    cancel: Mutex<Arc<sys::Cancel>>,
+    /// Set while the threads stop for an upgrade: they park their descriptors instead of
+    /// closing them.
+    pausing: Arc<AtomicBool>,
+    /// The threads' descriptors and queues while they do not run.
+    parked: Mutex<Parked>,
     /// Threads that hold one of the session's descriptors, still running.
     io_threads: Arc<AtomicUsize>,
-    /// Set (under its lock) when the program was reaped: its process group may no longer be
-    /// signalled after that, its id could be reused.
-    reaped: Arc<Mutex<bool>>,
+    /// The program's status once it was reaped (under this lock): its process group may no
+    /// longer be signalled after that, its id could be reused.
+    reaped: Arc<Mutex<Option<ExitStatus>>>,
+    /// The screen model handed over by the previous image of the daemon (m2.md 6.8), for the
+    /// model's owner to take ([`PtySession::take_resumed_model`]).
+    resumed_model: Mutex<Option<ModelState>>,
     /// The program's pid, also its process group.
     pub pid: u32,
     /// The command, None for a login shell.
@@ -196,7 +253,63 @@ pub struct PtySession {
     pub started: SystemTime,
 }
 
+/// How the parts of a new [`PtySession`] are put together.
+struct Parts {
+    id: SessionId,
+    keys: Keys,
+    pipe: bool,
+    master: Option<File>,
+    input: Sender<InputItem>,
+    input_queued: usize,
+    output: ReplayBuffer,
+    errors: ReplayBuffer,
+    input_received: InputState,
+    generation: u64,
+    last_seen: Instant,
+    exit: Option<(ExitStatus, Instant)>,
+    parked: Parked,
+    reaped: Option<ExitStatus>,
+    model: Option<ModelState>,
+    pid: u32,
+    command: Option<String>,
+    name: Option<String>,
+    started: SystemTime,
+}
+
 impl PtySession {
+    fn assemble(p: Parts) -> io::Result<Arc<PtySession>> {
+        Ok(Arc::new(PtySession {
+            id: p.id,
+            keys: Mutex::new(p.keys),
+            pipe: p.pipe,
+            master: Mutex::new(p.master),
+            input: Mutex::new(Some(p.input)),
+            input_queued: Arc::new(AtomicUsize::new(p.input_queued)),
+            output: Mutex::new(p.output),
+            errors: Mutex::new(p.errors),
+            sink: Mutex::new(SinkSlot(None)),
+            room: Condvar::new(),
+            input_received: Mutex::new(p.input_received),
+            changed: Notify::new(),
+            exit: Mutex::new(p.exit.as_ref().map(|e| e.0.clone())),
+            generation: AtomicU64::new(p.generation),
+            last_seen: Mutex::new(p.last_seen),
+            exited_at: Mutex::new(p.exit.map(|e| e.1)),
+            attached: AtomicUsize::new(0),
+            removed: AtomicBool::new(false),
+            cancel: Mutex::new(Arc::new(sys::Cancel::new()?)),
+            pausing: Arc::new(AtomicBool::new(false)),
+            parked: Mutex::new(p.parked),
+            io_threads: Arc::new(AtomicUsize::new(0)),
+            reaped: Arc::new(Mutex::new(p.reaped)),
+            resumed_model: Mutex::new(p.model),
+            pid: p.pid,
+            command: p.command,
+            name: p.name,
+            started: p.started,
+        }))
+    }
+
     /// Start `spawn` as `account`, on a new pty or on pipes, keeping `replay_capacity` bytes
     /// of output (and, for a pipe session, an eighth of that of stderr, at least 64 KiB).
     pub fn start(
@@ -242,7 +355,7 @@ impl PtySession {
         }
 
         // The descriptors: (reader of output, reader of stderr, writer of input, pty master)
-        let (mut child, output_fd, error_fd, input_fd, master) = if spawn.pipe {
+        let (child, output_fd, error_fd, input_fd, master) = if spawn.pipe {
             // As ssh without a pty: no TERM
             cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
             sys::spawn_with_pipes(&mut cmd);
@@ -280,105 +393,285 @@ impl PtySession {
             sys::set_nonblocking(fd)?;
         }
         let pid = child.id();
+        // Reaped by pid (sys::reap): after an upgrade in place no Child value exists, and the
+        // same waiter serves both cases
+        drop(child);
 
-        let (input_tx, input_rx) = std::sync::mpsc::channel::<InputItem>();
+        let (input_tx, input_rx) = channel::<InputItem>();
+        let (done_tx, done_rx) = channel::<()>();
+        let readers = if spawn.pipe { 2 } else { 1 };
+        let parked = Parked {
+            output: Some(ParkedReader {
+                fd: output_fd,
+                done: done_tx.clone(),
+            }),
+            error: error_fd.map(|fd| ParkedReader {
+                fd,
+                done: done_tx.clone(),
+            }),
+            input: Some(ParkedInput {
+                fd: Some(input_fd),
+                pending: Vec::new(),
+                eof: false,
+                rx: input_rx,
+            }),
+        };
+        drop(done_tx);
         let error_capacity = (replay_capacity / 8).max(64 << 10);
-        let session = Arc::new(PtySession {
+        let session = PtySession::assemble(Parts {
             id,
-            keys: Mutex::new(Keys {
+            keys: Keys {
                 current: key,
                 pending: None,
-            }),
+            },
             pipe: spawn.pipe,
-            master: Mutex::new(master),
-            input: Mutex::new(Some(input_tx)),
-            input_queued: Arc::new(AtomicUsize::new(0)),
-            output: Mutex::new(ReplayBuffer::new(replay_capacity)),
-            errors: Mutex::new(ReplayBuffer::new(if spawn.pipe { error_capacity } else { 0 })),
-            sink: Mutex::new(SinkSlot(None)),
-            room: Condvar::new(),
-            input_received: Mutex::new(InputState::default()),
-            changed: Notify::new(),
-            exit: Mutex::new(None),
-            generation: AtomicU64::new(0),
-            last_seen: Mutex::new(Instant::now()),
-            exited_at: Mutex::new(None),
-            attached: AtomicUsize::new(0),
-            removed: AtomicBool::new(false),
-            cancel: Arc::new(sys::Cancel::new()?),
-            io_threads: Arc::new(AtomicUsize::new(0)),
-            reaped: Arc::new(Mutex::new(false)),
+            master,
+            input: input_tx,
+            input_queued: 0,
+            output: ReplayBuffer::new(replay_capacity),
+            errors: ReplayBuffer::new(if spawn.pipe { error_capacity } else { 0 }),
+            input_received: InputState::default(),
+            generation: 0,
+            last_seen: Instant::now(),
+            exit: None,
+            parked,
+            reaped: None,
+            model: None,
             pid,
             command: spawn.command.clone(),
             name: spawn.name.clone(),
             started: SystemTime::now(),
-        });
-
-        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
-        let readers = if spawn.pipe { 2 } else { 1 };
-        let bounded = spawn.pipe;
-        spawn_reader(&session, output_fd, Stream::Output, bounded, done_tx.clone())?;
-        if let Some(fd) = error_fd {
-            spawn_reader(&session, fd, Stream::Error, bounded, done_tx)?;
-        } else {
-            drop(done_tx);
-        }
-        let queued = session.input_queued.clone();
-        let cancel = session.cancel.clone();
-        let running = IoThread::start(&session.io_threads);
-        std::thread::Builder::new()
-            .name("qsh-session-in".into())
-            .spawn(move || {
-                write_input(input_fd, input_rx, queued, cancel);
-                drop(running);
-            })?;
-
-        let weak = Arc::downgrade(&session);
-        let reaped = session.reaped.clone();
-        let pipe = spawn.pipe;
-        std::thread::Builder::new()
-            .name("qsh-session-wait".into())
-            .spawn(move || {
-                // Wait without reaping, then reap under the lock that signalling takes: the
-                // process group is never signalled after its id could have been reused
-                let _ = sys::wait_exit_no_reap(pid);
-                let status = {
-                    let mut reaped = reaped.lock().unwrap();
-                    let status = child.wait();
-                    *reaped = true;
-                    status
-                };
-                let status = match status {
-                    Ok(status) => match (status.code(), status.signal()) {
-                        (Some(code), _) => ExitStatus::Exited(code as u32 & 0xff),
-                        (None, Some(signal)) => ExitStatus::Signaled {
-                            signal: sys::signal_name(signal),
-                            core_dumped: status.core_dumped(),
-                        },
-                        (None, None) => ExitStatus::Exited(255),
-                    },
-                    Err(_) => ExitStatus::Exited(255),
-                };
-                if pipe {
-                    // As ssh: the end is when the program is gone and both pipes reached their end
-                    // (a background process holding one open delays it)
-                    for _ in 0..readers {
-                        if done_rx.recv().is_err() {
-                            break;
-                        }
-                    }
-                } else {
-                    // The output ends when the reader reaches the end of the pty; a background
-                    // process that keeps the terminal open must not hold the EXIT back for long
-                    let _ = done_rx.recv_timeout(Duration::from_millis(500));
-                }
-                if let Some(s) = weak.upgrade() {
-                    *s.exit.lock().unwrap() = Some(status);
-                    *s.exited_at.lock().unwrap() = Some(Instant::now());
-                    s.changed.notify_waiters();
-                }
-            })?;
+        })?;
+        session.resume_threads()?;
+        spawn_waiter(&session, None, done_rx, readers)?;
         Ok(session)
+    }
+
+    /// Start (again) the reader and writer threads on the parked descriptors: after
+    /// [`PtySession::start`] and [`PtySession::adopt`], and when an upgrade that stopped them
+    /// failed (m2.md 10.3 step 6). A removed session's parked descriptors are closed instead.
+    pub(crate) fn resume_threads(self: &Arc<Self>) -> io::Result<()> {
+        let cancel = Arc::new(sys::Cancel::new()?);
+        *self.cancel.lock().unwrap() = cancel.clone();
+        self.pausing.store(false, Ordering::SeqCst);
+        let parked = std::mem::take(&mut *self.parked.lock().unwrap());
+        if self.is_removed() {
+            return Ok(());
+        }
+        if let Some(reader) = parked.output {
+            spawn_reader(self, reader, Stream::Output, &cancel)?;
+        }
+        if let Some(reader) = parked.error {
+            spawn_reader(self, reader, Stream::Error, &cancel)?;
+        }
+        if let Some(input) = parked.input {
+            spawn_writer(self, input, &cancel)?;
+        }
+        Ok(())
+    }
+
+    /// Tell the reader and writer threads to stop and park their descriptors and queues (m2.md
+    /// 10.3 step 3); [`PtySession::threads_running`] says when they have. Output the program
+    /// writes meanwhile waits in the kernel's terminal or pipe buffer.
+    pub(crate) fn request_pause(&self) {
+        self.pausing.store(true, Ordering::SeqCst);
+        self.cancel.lock().unwrap().cancel();
+        if let Some(input) = self.input.lock().unwrap().as_ref() {
+            let _ = input.send(InputItem::Park);
+        }
+        self.room.notify_all();
+    }
+
+    /// Reader and writer threads still running.
+    pub(crate) fn threads_running(&self) -> usize {
+        self.io_threads.load(Ordering::SeqCst)
+    }
+
+    /// The session's state for the handoff (m2.md 10.5), with its descriptors by number; the
+    /// threads must be stopped ([`PtySession::request_pause`]). None for a removed session.
+    /// The descriptors stay owned by this session: they must stay open until the `execve`.
+    pub(crate) fn export(&self) -> Option<SessionState> {
+        if self.is_removed() {
+            return None;
+        }
+        // Under the input lock no attachment accepts input: what was accepted is in the
+        // writer's queue or still in its channel, and both go into the state
+        let input = self.input_received.lock().unwrap();
+        let mut parked = self.parked.lock().unwrap();
+        if let Some(p) = parked.input.as_mut() {
+            while let Ok(item) = p.rx.try_recv() {
+                match item {
+                    InputItem::Data(bytes) => p.pending.extend_from_slice(&bytes),
+                    InputItem::Eof => p.eof = true,
+                    InputItem::Park => {}
+                }
+            }
+        }
+        let raw = |f: &File| f.as_raw_fd() as u32;
+        let (fds, cols, rows) = if self.pipe {
+            let reader = |r: &Option<ParkedReader>| r.as_ref().map_or(NO_FD, |r| raw(&r.fd));
+            let fds = SessionFds::Pipe {
+                stdin: parked.input.as_ref().and_then(|p| p.fd.as_ref()).map_or(NO_FD, raw),
+                stdout: reader(&parked.output),
+                stderr: reader(&parked.error),
+            };
+            (fds, 0, 0)
+        } else {
+            let master = self.master.lock().unwrap();
+            let master = master.as_ref()?;
+            let (cols, rows) = sys::window_size(master).unwrap_or((80, 24));
+            (SessionFds::Tty { master: raw(master) }, cols, rows)
+        };
+        let buffer = |b: &Mutex<ReplayBuffer>| {
+            let b = b.lock().unwrap();
+            BufferState {
+                capacity: b.capacity() as u64,
+                base: b.base(),
+                bytes: b.read_from(b.base(), usize::MAX).1,
+            }
+        };
+        let output = buffer(&self.output);
+        let errors = buffer(&self.errors);
+        let model = self.sink.lock().unwrap().0.as_mut().and_then(|s| s.handoff());
+        let exit = match (self.exit_status(), *self.exited_at.lock().unwrap()) {
+            (Some(status), Some(at)) => Some(ExitState {
+                status,
+                published_ms_ago: Some(at.elapsed().as_millis() as u64),
+            }),
+            _ => self.reaped.lock().unwrap().clone().map(|status| ExitState {
+                status,
+                published_ms_ago: None,
+            }),
+        };
+        let keys = self.keys.lock().unwrap().clone();
+        let pending = parked.input.as_ref().map(|p| p.pending.clone()).unwrap_or_default();
+        Some(SessionState {
+            id: self.id.0,
+            current_key: keys.current,
+            pending_key: keys.pending,
+            pid: self.pid,
+            generation: self.current_generation(),
+            created_ms: self
+                .started
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis() as u64),
+            last_seen_ms_ago: self.last_seen.lock().unwrap().elapsed().as_millis() as u64,
+            exit,
+            name: self.name.clone(),
+            command: self.command.clone(),
+            cols,
+            rows,
+            fds,
+            output,
+            errors,
+            input_received: input.inbound.received(),
+            input_queue: pending,
+            input_eof: input.eof,
+            model: model.map(|(cols, rows, snapshot)| ModelState { cols, rows, snapshot }),
+        })
+    }
+
+    /// Rebuild a session from the previous image's state and the descriptors it handed over
+    /// (m2.md 10.3 step 8), without starting anything: [`Adopted::start`] does that, once the
+    /// new image is committed to the state.
+    pub(crate) fn adopt(state: SessionState, fds: AdoptedFds) -> io::Result<Adopted> {
+        let now = Instant::now();
+        let ago = |ms: u64| now.checked_sub(Duration::from_millis(ms)).unwrap_or(now);
+        let restore = |b: &BufferState| {
+            let mut buffer = ReplayBuffer::starting_at(b.capacity as usize, b.base);
+            buffer.push(&b.bytes);
+            buffer
+        };
+        let (input_tx, input_rx) = channel::<InputItem>();
+        let (done_tx, done_rx) = channel::<()>();
+        let pipe = state.pipe();
+        let mut readers = 0;
+        let mut reader = |fd: Option<File>| {
+            fd.map(|fd| {
+                readers += 1;
+                ParkedReader {
+                    fd,
+                    done: done_tx.clone(),
+                }
+            })
+        };
+        let (master, output, error, input_fd) = if pipe {
+            (None, reader(fds.stdout), reader(fds.stderr), fds.stdin)
+        } else {
+            let master = fds
+                .master
+                .ok_or_else(|| io::Error::other("a tty session without its terminal"))?;
+            (
+                Some(master.try_clone()?),
+                reader(Some(master.try_clone()?)),
+                None,
+                Some(master),
+            )
+        };
+        drop(done_tx);
+        for fd in [&output, &error].into_iter().flatten() {
+            sys::set_nonblocking(&fd.fd)?;
+        }
+        if let Some(fd) = &input_fd {
+            sys::set_nonblocking(fd)?;
+        }
+        // The end of input still to deliver: received, and the pipe still open
+        let eof = state.input_eof.is_some() && input_fd.is_some();
+        let published = state
+            .exit
+            .as_ref()
+            .and_then(|e| e.published_ms_ago.map(|ms| (e.status.clone(), ago(ms))));
+        let reaped = state.exit.as_ref().map(|e| e.status.clone());
+        let waiter = match (&published, &reaped) {
+            (Some(_), _) => None,
+            (None, known) => Some(Waiter {
+                known: known.clone(),
+                done: done_rx,
+                readers,
+            }),
+        };
+        let session = PtySession::assemble(Parts {
+            id: SessionId(state.id),
+            keys: Keys {
+                current: state.current_key.clone(),
+                pending: state.pending_key.clone(),
+            },
+            pipe,
+            master,
+            input: input_tx,
+            input_queued: state.input_queue.len(),
+            output: restore(&state.output),
+            errors: restore(&state.errors),
+            input_received: InputState {
+                inbound: Inbound::at(state.input_received),
+                eof: state.input_eof,
+            },
+            generation: state.generation,
+            last_seen: ago(state.last_seen_ms_ago),
+            exit: published,
+            parked: Parked {
+                output,
+                error,
+                input: Some(ParkedInput {
+                    fd: input_fd,
+                    pending: state.input_queue.clone(),
+                    eof,
+                    rx: input_rx,
+                }),
+            },
+            reaped,
+            model: state.model.clone(),
+            pid: state.pid,
+            command: state.command.clone(),
+            name: state.name.clone(),
+            started: std::time::UNIX_EPOCH + Duration::from_millis(state.created_ms),
+        })?;
+        Ok(Adopted { session, waiter })
+    }
+
+    /// The screen model the previous image of the daemon handed over (m2.md 6.8), once.
+    pub fn take_resumed_model(&self) -> Option<ModelState> {
+        self.resumed_model.lock().unwrap().take()
     }
 
     /// Install `sink` for the output stream (or remove it with None), and return the output
@@ -509,7 +802,7 @@ impl PtySession {
         }
         {
             let reaped = self.reaped.lock().unwrap();
-            if !*reaped {
+            if reaped.is_none() {
                 let _ = sys::kill_group(self.pid, sys::Signal::Hangup);
                 let (pid, reaped) = (self.pid, self.reaped.clone());
                 let _ = std::thread::Builder::new()
@@ -517,7 +810,7 @@ impl PtySession {
                     .spawn(move || {
                         std::thread::sleep(HANGUP_KILL_AFTER);
                         let reaped = reaped.lock().unwrap();
-                        if !*reaped {
+                        if reaped.is_none() {
                             let _ = sys::kill_group(pid, sys::Signal::Kill);
                         }
                     });
@@ -525,9 +818,10 @@ impl PtySession {
         }
         // The readers and the writer let go of the master or the pipes; with ours, the
         // terminal is hung up (or the pipes closed)
-        self.cancel.cancel();
+        self.cancel.lock().unwrap().cancel();
         self.master.lock().unwrap().take();
         self.input.lock().unwrap().take();
+        *self.parked.lock().unwrap() = Parked::default();
         self.room.notify_all();
         self.changed.notify_waiters();
     }
@@ -536,27 +830,146 @@ impl PtySession {
 impl Drop for PtySession {
     fn drop(&mut self) {
         // Whatever happened, the threads let go of the terminal or the pipes
-        self.cancel.cancel();
+        match self.cancel.get_mut() {
+            Ok(cancel) => cancel.cancel(),
+            Err(poisoned) => poisoned.into_inner().cancel(),
+        }
     }
 }
 
-/// Read one output of a session into its replay buffer until the end, an error or cancellation.
-/// A pipe session's reader (`bounded`) stops reading while the buffer is full of
-/// unacknowledged bytes, so the program blocks as under ssh (protocol.md 7.14.5).
-fn spawn_reader(
+/// The descriptors handed over for one session by the previous image ([`PtySession::adopt`]),
+/// checked and owned.
+#[derive(Debug, Default)]
+pub(crate) struct AdoptedFds {
+    /// A tty session's master.
+    pub master: Option<File>,
+    /// A pipe session's stdin (None: closed).
+    pub stdin: Option<File>,
+    /// A pipe session's stdout (None: it reached its end).
+    pub stdout: Option<File>,
+    /// A pipe session's stderr (None: it reached its end).
+    pub stderr: Option<File>,
+}
+
+/// What waits for an adopted session's program.
+#[derive(Debug)]
+struct Waiter {
+    /// The status, when the previous image had reaped the program already.
+    known: Option<ExitStatus>,
+    done: Receiver<()>,
+    readers: usize,
+}
+
+/// A session rebuilt from a handoff state, not started yet.
+#[derive(Debug)]
+pub(crate) struct Adopted {
+    /// The session.
+    pub session: Arc<PtySession>,
+    waiter: Option<Waiter>,
+}
+
+impl Adopted {
+    /// Start its threads: the readers, the writer and, unless the program's end was already
+    /// published, the waiter (the program is still this process's child: a zombie if it ended
+    /// during the upgrade, waiting for exactly this).
+    pub fn start(self) -> io::Result<Arc<PtySession>> {
+        self.session.resume_threads()?;
+        if let Some(w) = self.waiter {
+            spawn_waiter(&self.session, w.known, w.done, w.readers)?;
+        }
+        Ok(self.session)
+    }
+}
+
+/// Wait for the program to end, reap it (unless `known`), wait for its output to reach its
+/// end, then publish the status.
+fn spawn_waiter(
     session: &Arc<PtySession>,
-    fd: File,
-    stream: Stream,
-    bounded: bool,
-    done: std::sync::mpsc::Sender<()>,
+    known: Option<ExitStatus>,
+    done: Receiver<()>,
+    readers: usize,
 ) -> io::Result<()> {
     let weak = Arc::downgrade(session);
-    let cancel = session.cancel.clone();
+    let reaped = session.reaped.clone();
+    let (pid, pipe) = (session.pid, session.pipe);
+    std::thread::Builder::new()
+        .name("qsh-session-wait".into())
+        .spawn(move || {
+            let status = match known {
+                Some(status) => status,
+                None => {
+                    // Wait without reaping, then reap under the lock that signalling takes:
+                    // the process group is never signalled after its id could have been reused
+                    let _ = sys::wait_exit_no_reap(pid);
+                    let mut reaped = reaped.lock().unwrap();
+                    let status = match sys::reap(pid) {
+                        Ok(exit) => match (exit.code, exit.signal) {
+                            (Some(code), _) => ExitStatus::Exited(code as u32 & 0xff),
+                            (None, Some(signal)) => ExitStatus::Signaled {
+                                signal: sys::signal_name(signal),
+                                core_dumped: exit.core_dumped,
+                            },
+                            (None, None) => ExitStatus::Exited(255),
+                        },
+                        Err(_) => ExitStatus::Exited(255),
+                    };
+                    *reaped = Some(status.clone());
+                    status
+                }
+            };
+            if pipe {
+                // As ssh: the end is when the program is gone and both pipes reached their end
+                // (a background process holding one open delays it)
+                for _ in 0..readers {
+                    if done.recv().is_err() {
+                        break;
+                    }
+                }
+            } else {
+                // The output ends when the reader reaches the end of the pty; a background
+                // process that keeps the terminal open must not hold the EXIT back for long
+                let _ = done.recv_timeout(Duration::from_millis(500));
+            }
+            if let Some(s) = weak.upgrade() {
+                *s.exit.lock().unwrap() = Some(status);
+                *s.exited_at.lock().unwrap() = Some(Instant::now());
+                s.changed.notify_waiters();
+            }
+        })?;
+    Ok(())
+}
+
+/// Read one output of a session into its replay buffer until the end, an error, a hangup or
+/// a pause. A pipe session's reader stops reading while the buffer is full of unacknowledged
+/// bytes, so the program blocks as under ssh (protocol.md 7.14.5).
+fn spawn_reader(
+    session: &Arc<PtySession>,
+    reader: ParkedReader,
+    stream: Stream,
+    cancel: &Arc<sys::Cancel>,
+) -> io::Result<()> {
+    let weak = Arc::downgrade(session);
+    let cancel = cancel.clone();
+    let pausing = session.pausing.clone();
+    let bounded = session.pipe;
     let running = IoThread::start(&session.io_threads);
     std::thread::Builder::new()
         .name("qsh-session-out".into())
         .spawn(move || {
-            read_output(&fd, stream, bounded, &weak, &cancel);
+            let ParkedReader { fd, done } = reader;
+            if read_output(&fd, stream, bounded, &weak, &cancel, &pausing) {
+                if let Some(s) = weak.upgrade() {
+                    let mut parked = s.parked.lock().unwrap();
+                    let slot = match stream {
+                        Stream::Output => &mut parked.output,
+                        Stream::Error => &mut parked.error,
+                    };
+                    *slot = Some(ParkedReader { fd, done });
+                    drop(parked);
+                    drop(running);
+                    return;
+                }
+            }
             drop(fd);
             drop(running);
             let _ = done.send(());
@@ -580,19 +993,34 @@ impl Drop for IoThread {
     }
 }
 
-fn read_output(mut fd: &File, stream: Stream, bounded: bool, weak: &Weak<PtySession>, cancel: &sys::Cancel) {
+/// The reader's loop. True when it stopped for a pause (its descriptor is to be parked), false
+/// when the output ended (or failed, or the session was hung up).
+fn read_output(
+    mut fd: &File,
+    stream: Stream,
+    bounded: bool,
+    weak: &Weak<PtySession>,
+    cancel: &sys::Cancel,
+    pausing: &AtomicBool,
+) -> bool {
+    let stopped = || pausing.load(Ordering::SeqCst);
     let mut buf = vec![0u8; 16384];
     loop {
+        // Checked on every round, not only when waiting: a program that floods its output
+        // never lets the reader wait
+        if cancel.is_cancelled() {
+            return stopped();
+        }
         let mut limit = buf.len();
         if bounded {
-            let Some(s) = weak.upgrade() else { return };
+            let Some(s) = weak.upgrade() else { return false };
             let replay = s.buffer(stream).lock().unwrap();
             let room = replay.capacity() - replay.len();
             if room == 0 {
                 // Full of unacknowledged bytes: wait for acknowledgements (without keeping the
                 // session alive in between)
                 if cancel.is_cancelled() {
-                    return;
+                    return stopped();
                 }
                 let _ = s.room.wait_timeout(replay, Duration::from_millis(200)).unwrap();
                 continue;
@@ -602,9 +1030,9 @@ fn read_output(mut fd: &File, stream: Stream, bounded: bool, weak: &Weak<PtySess
         match fd.read(&mut buf[..limit]) {
             // EIO on a pty once the program and everything it started closed the terminal.
             // The server keeps reading whether or not anyone is attached (7.6).
-            Ok(0) => return,
+            Ok(0) => return false,
             Ok(n) => {
-                let Some(s) = weak.upgrade() else { return };
+                let Some(s) = weak.upgrade() else { return false };
                 {
                     let mut buffer = s.buffer(stream).lock().unwrap();
                     let offset = buffer.end();
@@ -619,47 +1047,105 @@ fn read_output(mut fd: &File, stream: Stream, bounded: bool, weak: &Weak<PtySess
                 s.changed.notify_waiters();
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => match sys::wait_fd(fd, false, cancel, None) {
-                Ok(sys::Ready::Cancelled) | Err(_) => return,
+                Ok(sys::Ready::Cancelled) => return stopped(),
+                Err(_) => return false,
                 Ok(_) => {}
             },
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(_) => return,
+            Err(_) => return false,
         }
     }
 }
 
 /// Write the session's input queue to the program, in order. Input after the terminal or pipe
-/// closed (or after cancellation) is accepted and discarded (7.4).
-fn write_input(fd: File, rx: std::sync::mpsc::Receiver<InputItem>, queued: Arc<AtomicUsize>, cancel: Arc<sys::Cancel>) {
-    let mut fd = Some(fd);
-    while let Ok(item) = rx.recv() {
-        match item {
-            InputItem::Data(bytes) => {
-                if let Some(f) = fd.as_ref() {
-                    if write_all(f, &bytes, &cancel).is_err() {
-                        fd = None;
-                    }
+/// closed (or after a hangup) is accepted and discarded (7.4). A pause parks the descriptor
+/// and whatever is not written yet.
+fn spawn_writer(session: &Arc<PtySession>, input: ParkedInput, cancel: &Arc<sys::Cancel>) -> io::Result<()> {
+    let weak = Arc::downgrade(session);
+    let cancel = cancel.clone();
+    let pausing = session.pausing.clone();
+    let queued = session.input_queued.clone();
+    let running = IoThread::start(&session.io_threads);
+    std::thread::Builder::new()
+        .name("qsh-session-in".into())
+        .spawn(move || {
+            if let Some(parked) = write_input(input, &queued, &cancel, &pausing) {
+                if let Some(s) = weak.upgrade() {
+                    s.parked.lock().unwrap().input = Some(parked);
                 }
-                queued.fetch_sub(bytes.len(), Ordering::SeqCst);
             }
+            drop(running);
+        })?;
+    Ok(())
+}
+
+/// The writer's loop: the parked input to park again after a pause, None when it ended.
+fn write_input(
+    input: ParkedInput,
+    queued: &AtomicUsize,
+    cancel: &sys::Cancel,
+    pausing: &AtomicBool,
+) -> Option<ParkedInput> {
+    let ParkedInput {
+        mut fd,
+        mut pending,
+        mut eof,
+        rx,
+    } = input;
+    loop {
+        let paused = pausing.load(Ordering::SeqCst);
+        if !paused && !pending.is_empty() {
+            let written = match fd.as_ref() {
+                Some(f) => match write_some(f, &pending, cancel) {
+                    Ok(()) => pending.len(),
+                    Err((n, cancelled)) => {
+                        if !(cancelled && pausing.load(Ordering::SeqCst)) {
+                            // Closed, broken, or hung up: the rest is discarded
+                            fd = None;
+                            pending.len()
+                        } else {
+                            n
+                        }
+                    }
+                },
+                None => pending.len(),
+            };
+            queued.fetch_sub(written, Ordering::SeqCst);
+            pending.drain(..written);
+        }
+        if !pausing.load(Ordering::SeqCst) && pending.is_empty() && eof {
             // The program reads end of file
-            InputItem::Eof => fd = None,
+            fd = None;
+            eof = false;
+        }
+        match rx.recv() {
+            Ok(InputItem::Data(bytes)) => pending.extend_from_slice(&bytes),
+            Ok(InputItem::Eof) => eof = true,
+            Ok(InputItem::Park) if pausing.load(Ordering::SeqCst) => {
+                return Some(ParkedInput { fd, pending, eof, rx });
+            }
+            // A pause that ended before this writer saw its request
+            Ok(InputItem::Park) => {}
+            // Hung up
+            Err(_) => return None,
         }
     }
 }
 
-fn write_all(mut fd: &File, mut bytes: &[u8], cancel: &sys::Cancel) -> io::Result<()> {
-    while !bytes.is_empty() {
-        match fd.write(bytes) {
-            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-            Ok(n) => bytes = &bytes[n..],
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                if sys::wait_fd(fd, true, cancel, None)? == sys::Ready::Cancelled {
-                    return Err(io::ErrorKind::BrokenPipe.into());
-                }
-            }
+/// Write all of `bytes`; on failure, how many were written and whether the wait was cancelled.
+fn write_some(mut fd: &File, bytes: &[u8], cancel: &sys::Cancel) -> Result<(), (usize, bool)> {
+    let mut written = 0;
+    while written < bytes.len() {
+        match fd.write(&bytes[written..]) {
+            Ok(0) => return Err((written, false)),
+            Ok(n) => written += n,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => match sys::wait_fd(fd, true, cancel, None) {
+                Ok(sys::Ready::Cancelled) => return Err((written, true)),
+                Err(_) => return Err((written, false)),
+                Ok(_) => {}
+            },
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
+            Err(_) => return Err((written, false)),
         }
     }
     Ok(())
@@ -943,6 +1429,160 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         }
+    }
+
+    /// What an `execve` does to a paused session: its descriptors stay open, by number, and
+    /// nothing in this image owns them any more.
+    fn release_descriptors(s: &PtySession) {
+        use std::os::fd::IntoRawFd;
+        if let Some(master) = s.master.lock().unwrap().take() {
+            let _ = master.into_raw_fd();
+        }
+        let parked = std::mem::take(&mut *s.parked.lock().unwrap());
+        for reader in [parked.output, parked.error].into_iter().flatten() {
+            let _ = reader.fd.into_raw_fd();
+        }
+        if let Some(fd) = parked.input.and_then(|i| i.fd) {
+            let _ = fd.into_raw_fd();
+        }
+    }
+
+    /// The descriptors of an exported session, adopted by number as the next image does.
+    fn adopt_descriptors(state: &SessionState) -> AdoptedFds {
+        let take = |fd: u32| (fd != NO_FD).then(|| File::from(sys::adopt_fd(fd as i32).expect("open")));
+        match state.fds {
+            SessionFds::Tty { master } => AdoptedFds {
+                master: take(master),
+                ..Default::default()
+            },
+            SessionFds::Pipe { stdin, stdout, stderr } => AdoptedFds {
+                master: None,
+                stdin: take(stdin),
+                stdout: take(stdout),
+                stderr: take(stderr),
+            },
+        }
+    }
+
+    async fn wait_paused(s: &PtySession) {
+        let deadline = Instant::now() + PATIENCE;
+        while s.threads_running() > 0 {
+            assert!(Instant::now() < deadline, "the threads did not stop");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// m2.md 10.3 steps 3, 4, 7 and 8 for a tty session: the threads stop and park, input
+    /// accepted meanwhile is kept, and the session continues in its next image at the same
+    /// offsets, with the same keys, the same program and terminal, nothing lost or repeated.
+    #[tokio::test]
+    async fn a_paused_tty_session_continues_from_its_exported_state() {
+        let s = start("while read line; do echo got-$line; done", false);
+        s.write_input(b"one\n".to_vec());
+        wait_output(&s, "got-one").await;
+        *s.input_received.lock().unwrap() = InputState {
+            inbound: Inbound::at(4),
+            eof: None,
+        };
+        s.request_pause();
+        wait_paused(&s).await;
+        // Accepted while the threads are stopped: kept, written by the next image
+        s.write_input(b"two\n".to_vec());
+        s.input_received.lock().unwrap().inbound = Inbound::at(8);
+        let state = s.export().expect("exported");
+        let output_end = s.output.lock().unwrap().end();
+        assert_eq!(state.input_queue, b"two\n");
+        assert_eq!(
+            (
+                state.input_received,
+                state.output.base + state.output.bytes.len() as u64
+            ),
+            (8, output_end)
+        );
+        assert!(matches!(state.fds, SessionFds::Tty { .. }) && state.cols == 80 && state.rows == 24);
+        // Through the format, as the next image reads it
+        let wire = super::super::handoff::State {
+            writer: "qsh-server/test".into(),
+            started_ms: 0,
+            restarts: 0,
+            failures: 0,
+            port: 1,
+            listeners: vec![
+                super::super::handoff::Listener {
+                    kind: super::super::handoff::ListenerKind::Control,
+                    fd: 1000,
+                    port: 0,
+                },
+                super::super::handoff::Listener {
+                    kind: super::super::handoff::ListenerKind::Lock,
+                    fd: 1001,
+                    port: 0,
+                },
+            ],
+            sessions: vec![state],
+        };
+        let mut wire = super::super::handoff::decode(&super::super::handoff::encode(&wire).unwrap()).unwrap();
+        let state = wire.sessions.remove(0);
+        release_descriptors(&s);
+        let (id, key, pid) = (s.id, s.keys.lock().unwrap().current.0, s.pid);
+        drop(s);
+        let fds = adopt_descriptors(&state);
+        let t = PtySession::adopt(state, fds).unwrap().start().unwrap();
+        assert_eq!((t.id, t.keys.lock().unwrap().current.0, t.pid), (id, key, pid));
+        assert_eq!(t.input_received.lock().unwrap().inbound.received(), 8);
+        let text = wait_output(&t, "got-two").await;
+        assert_eq!(text.matches("got-one").count(), 1, "{text:?}");
+        assert_eq!(t.output.lock().unwrap().base(), 0, "the same offsets");
+        t.write_input(b"three\n".to_vec());
+        wait_output(&t, "got-three").await;
+        t.hang_up();
+    }
+
+    /// The same for a pipe session, whose input end is delivered after the queued input, and
+    /// whose stdout is read on from where the previous image stopped.
+    #[tokio::test]
+    async fn a_paused_pipe_session_continues_from_its_exported_state() {
+        let s = start("cat; echo end >&2", true);
+        s.write_input(b"abc".to_vec());
+        wait_output(&s, "abc").await;
+        s.request_pause();
+        wait_paused(&s).await;
+        s.write_input(b"def".to_vec());
+        {
+            let mut input = s.input_received.lock().unwrap();
+            input.inbound = Inbound::at(6);
+            input.eof = Some(6);
+        }
+        s.close_input();
+        let state = s.export().expect("exported");
+        assert_eq!((state.input_queue.as_slice(), state.input_eof), (&b"def"[..], Some(6)));
+        let SessionFds::Pipe { stdin, stdout, stderr } = state.fds else {
+            panic!("a pipe session")
+        };
+        assert!(stdin != NO_FD && stdout != NO_FD && stderr != NO_FD);
+        release_descriptors(&s);
+        drop(s);
+        let fds = adopt_descriptors(&state);
+        let t = PtySession::adopt(state, fds).unwrap().start().unwrap();
+        // cat gets "def" and then the end of its input: it ends, and so does stdout
+        assert_eq!(wait_output(&t, "abcdef").await, "abcdef");
+        assert_eq!(wait_for(&t, Stream::Error, "end").await, "end\n");
+    }
+
+    /// A pause that is not followed by an exec (the upgrade failed, m2.md 10.3 step 6): the
+    /// threads start again on their parked descriptors, with nothing lost.
+    #[tokio::test]
+    async fn a_paused_session_resumes_in_place() {
+        let s = start("while read line; do echo got-$line; done", false);
+        s.request_pause();
+        wait_paused(&s).await;
+        s.write_input(b"x\n".to_vec());
+        assert!(s.export().is_some());
+        s.resume_threads().unwrap();
+        wait_output(&s, "got-x").await;
+        s.write_input(b"y\n".to_vec());
+        wait_output(&s, "got-y").await;
+        s.hang_up();
     }
 
     #[test]

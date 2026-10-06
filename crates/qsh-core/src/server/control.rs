@@ -9,9 +9,13 @@
 //! | `{"op":"pipe","client":"…"}` | `ok`, then the connection carries the mux layer (10.5) |
 //! | `{"op":"status"}` | one line of JSON |
 //! | `{"op":"stop"}` | `{"ok":true}`, then the daemon stops |
+//! | `{"op":"upgrade","exe":"…","force":false}` | `{"restarting":true}`, or `{"ok":false,"error":"…"}` |
 //!
 //! This protocol is internal to one installation (protocol.md 10.4): the commands and the daemon
 //! may be of different versions only across an upgrade, which `"v"` lets each side notice.
+//! From version 2 every request also carries the requester's `"version"` and `"exe"`; a daemon
+//! that is older upgrades itself to that executable (protocol.md 10.6, m2.md 10.2) and answers
+//! `{"restarting":true}`, after which the requester connects again and repeats its request.
 
 use std::ffi::OsString;
 use std::io;
@@ -25,7 +29,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWrite
 use tokio::net::{UnixListener, UnixStream};
 
 use super::pty::{PtySession, SessionId, Spawn};
-use super::{count, Shared};
+use super::{count, upgrade, version, Shared};
 use crate::crypto::SessionKey;
 use crate::log;
 use crate::paths::Paths;
@@ -35,8 +39,40 @@ use crate::proto::bootstrap::{
 use crate::proto::PIPE_PREFACE;
 use crate::sys;
 
-/// Version of the control socket requests.
-const CONTROL_VERSION: u64 = 1;
+/// Version of the control socket requests (protocol.md 10.6).
+const CONTROL_VERSION: u64 = 2;
+
+/// How long a requester repeats a request while the daemon restarts in place (10.6).
+const RESTART_WAIT: Duration = Duration::from_secs(10);
+
+/// The answer of a daemon that restarts in place.
+fn restarting() -> Value {
+    json!({ "restarting": true })
+}
+
+/// True for the answer `{"restarting":true}`.
+fn is_restarting(line: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(line).is_ok_and(|v| v["restarting"] == true)
+}
+
+/// A request to the daemon (version 2): the op, this program's version and executable, and
+/// `members`.
+fn request_value(op: &str, members: Value) -> Value {
+    let mut request = json!({
+        "v": CONTROL_VERSION,
+        "op": op,
+        "version": version(),
+    });
+    if let Ok(exe) = std::env::current_exe() {
+        request["exe"] = json!(exe.to_string_lossy());
+    }
+    if let Value::Object(members) = members {
+        for (k, v) in members {
+            request[k] = v;
+        }
+    }
+    request
+}
 
 /// Every exchange on the control socket has a deadline: a daemon that hangs (or something
 /// else answering on the socket) must not hang `qsh-server bootstrap`, and with it the client's
@@ -89,10 +125,26 @@ async fn handle(shared: Arc<Shared>, stream: UnixStream) -> io::Result<()> {
         return Ok(());
     }
     let request: Value = serde_json::from_slice(&line).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    match request["op"].as_str() {
+    let op = request["op"].as_str();
+    // A daemon restarting in place serves nothing until it is back; and a request from a newer
+    // qsh-server may start the upgrade (protocol.md 10.6)
+    if matches!(op, Some("bootstrap" | "pipe" | "doctor" | "stop"))
+        && (shared.upgrade.restarting() || (op != Some("stop") && upgrade::upgrade_for(&shared, &request).await))
+    {
+        return timed("the reply", write_json(&mut w, &restarting())).await;
+    }
+    match op {
         Some("bootstrap") => {
             let reply = match serde_json::from_value::<Request>(request["request"].clone()) {
-                Ok(r) => bootstrap_op(&shared, &r),
+                Ok(r) => {
+                    // Sessions do not change while an upgrade collects them
+                    let _gate = shared.upgrade.gate.read().unwrap_or_else(|e| e.into_inner());
+                    if shared.upgrade.restarting() {
+                        restarting()
+                    } else {
+                        bootstrap_op(&shared, &r)
+                    }
+                }
                 Err(e) => error_value(ErrorKind::BadRequest, format!("bad request: {e}")),
             };
             timed("the reply", write_json(&mut w, &reply)).await?;
@@ -109,9 +161,39 @@ async fn handle(shared: Arc<Shared>, stream: UnixStream) -> io::Result<()> {
             log::info(format_args!("stopping on request"));
             shared.shutdown.notify_one();
         }
+        Some("upgrade") => {
+            let reply = upgrade_op(&shared, &request).await;
+            timed("the reply", write_json(&mut w, &reply)).await?;
+        }
         _ => write_json(&mut w, &json!({ "ok": false, "error": "unknown request" })).await?,
     }
     Ok(())
+}
+
+/// `{"op":"upgrade","exe":"…","force":false}`: upgrade to `exe` now (`qsh-server upgrade`,
+/// m2.md 10.2), whatever the `upgrade` setting.
+async fn upgrade_op(shared: &Shared, request: &Value) -> Value {
+    let Some(exe) = request["exe"].as_str() else {
+        return json!({ "ok": false, "error": "no executable named" });
+    };
+    let force = request["force"] == true;
+    let why = if force {
+        "forced upgrade requested"
+    } else {
+        "upgrade requested"
+    };
+    match upgrade::prepare(shared, std::path::Path::new(exe), force, why).await {
+        Ok(plan) => {
+            shared.upgrade.start(plan);
+            restarting()
+        }
+        Err(refusal) => json!({
+            "ok": false,
+            "error": refusal.message,
+            "not_newer": refusal.not_newer,
+            "version": version(),
+        }),
+    }
 }
 
 /// The client address from `SSH_CONNECTION` ("client_ip client_port server_ip server_port").
@@ -209,11 +291,11 @@ fn credentials(shared: &Shared, id: &SessionId, key: &SessionKey, pipe: bool) ->
         udp: shared.port,
         tcp: shared.port,
         caps: Vec::new(),
-        server: format!("qsh-server/{}", env!("CARGO_PKG_VERSION")),
+        server: format!("qsh-server/{}", version()),
         ssh_addr: None,
         tty: pipe.then_some(false),
-        // Extra ports are announced once the daemon binds them (m2.md section 5, WP-4)
-        extra_ports: Vec::new(),
+        // The extra ports actually bound (m2.md 5.2)
+        extra_ports: shared.extra_ports.clone(),
     })
     .unwrap_or(Value::Null)
 }
@@ -238,13 +320,18 @@ fn status(shared: &Shared) -> Value {
         .collect();
     let stats = &shared.stats;
     let load = |c: &std::sync::atomic::AtomicU64| c.load(std::sync::atomic::Ordering::Relaxed);
-    json!({
+    let mut value = json!({
         "v": CONTROL_VERSION,
-        "version": env!("CARGO_PKG_VERSION"),
+        "version": version(),
         "pid": std::process::id(),
         "started": secs(shared.started),
         "port": shared.port,
+        "udp": shared.port,
+        "tcp": shared.port,
+        "extra_ports": shared.extra_ports,
         "fingerprint": shared.fingerprint.to_hex(),
+        "cert_sha256": shared.fingerprint.to_hex(),
+        "session_count": sessions.len(),
         "sessions": sessions,
         "stats": {
             "quic_connections": load(&stats.quic_connections),
@@ -254,7 +341,11 @@ fn status(shared: &Shared) -> Value {
             "attach_failures": load(&stats.attach_failures),
             "unauthenticated": shared.gate.pending(),
         },
-    })
+    });
+    if let (Value::Object(all), Value::Object(upgrade)) = (&mut value, shared.upgrade.status(&shared.config)) {
+        all.extend(upgrade);
+    }
+    value
 }
 
 async fn write_json<W: AsyncWrite + Unpin>(w: &mut W, value: &Value) -> io::Result<()> {
@@ -381,21 +472,14 @@ where
         if let Err(e) = request.validate() {
             return serde_json::to_value(e).unwrap_or(Value::Null);
         }
-        let exchange = async {
-            let stream = connect_or_start(paths, launcher).await?;
-            let (r, mut w) = stream.into_split();
-            let line = timed("the daemon", async {
-                write_json(
-                    &mut w,
-                    &json!({ "v": CONTROL_VERSION, "op": "bootstrap", "request": request }),
-                )
-                .await?;
-                read_line(&mut BufReader::new(r), 1 << 20).await
-            })
-            .await?;
+        let asked = async {
+            let message = request_value("bootstrap", json!({ "request": request }));
+            let line = exchange(paths, Some(launcher), &message)
+                .await?
+                .ok_or_else(|| io::Error::other("no daemon"))?;
             serde_json::from_slice::<Value>(&line).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
         };
-        match exchange.await {
+        match asked.await {
             Ok(mut reply) => {
                 if reply.get("key").is_some() {
                     if let Some(addr) = ssh_server_addr() {
@@ -430,18 +514,27 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let stream = connect_or_start(paths, launcher).await?;
-    let (r, mut w) = stream.into_split();
     let client = std::env::var("SSH_CONNECTION").unwrap_or_default();
-    let mut reader = BufReader::new(r);
-    let ok = timed("the daemon", async {
-        write_json(&mut w, &json!({ "v": CONTROL_VERSION, "op": "pipe", "client": client })).await?;
-        read_line(&mut reader, 64).await
-    })
-    .await?;
-    if ok != b"ok" {
-        return Err(io::Error::other("the daemon refused the pipe"));
-    }
+    let message = request_value("pipe", json!({ "client": client }));
+    let deadline = Instant::now() + RESTART_WAIT;
+    let (mut reader, mut w) = loop {
+        let stream = connect_or_start(paths, launcher).await?;
+        let (r, mut w) = stream.into_split();
+        let mut reader = BufReader::new(r);
+        let answer = timed("the daemon", async {
+            write_json(&mut w, &message).await?;
+            read_line(&mut reader, 64).await
+        })
+        .await?;
+        if answer == b"ok" {
+            break (reader, w);
+        }
+        // The daemon restarts in place: ask its next image (protocol.md 10.6)
+        if !is_restarting(&answer) || Instant::now() >= deadline {
+            return Err(io::Error::other("the daemon refused the pipe"));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
     output.write_all(PIPE_PREFACE).await?;
     output.flush().await?;
     let up = async {
@@ -467,16 +560,38 @@ where
     Ok(())
 }
 
-async fn request(paths: &Paths, op: &str) -> io::Result<Option<Value>> {
-    let Some(stream) = paths.connect_private(&paths.control_socket()).await? else {
+/// Send `message` to the daemon and read its one-line answer; while the daemon restarts in
+/// place, connect again and repeat it, for up to [`RESTART_WAIT`] (protocol.md 10.6: the
+/// control socket's listener survives the restart, connections wait in its backlog, and the
+/// security checks of the connection are made again each time). With a launcher the daemon
+/// is started when none runs; without one, None when none runs.
+async fn exchange(paths: &Paths, launcher: Option<&DaemonLauncher>, message: &Value) -> io::Result<Option<Vec<u8>>> {
+    let deadline = Instant::now() + RESTART_WAIT;
+    loop {
+        let stream = match launcher {
+            Some(launcher) => connect_or_start(paths, launcher).await?,
+            None => match paths.connect_private(&paths.control_socket()).await? {
+                Some(stream) => stream,
+                None => return Ok(None),
+            },
+        };
+        let (r, mut w) = stream.into_split();
+        let line = timed("the daemon", async {
+            write_json(&mut w, message).await?;
+            read_line(&mut BufReader::new(r), 1 << 20).await
+        })
+        .await?;
+        if !is_restarting(&line) || Instant::now() >= deadline {
+            return Ok(Some(line));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn request(paths: &Paths, op: &str, members: Value) -> io::Result<Option<Value>> {
+    let Some(line) = exchange(paths, None, &request_value(op, members)).await? else {
         return Ok(None);
     };
-    let (r, mut w) = stream.into_split();
-    let line = timed("the daemon", async {
-        write_json(&mut w, &json!({ "v": CONTROL_VERSION, "op": op })).await?;
-        read_line(&mut BufReader::new(r), 1 << 20).await
-    })
-    .await?;
     Ok(Some(
         serde_json::from_slice(&line).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
     ))
@@ -484,13 +599,36 @@ async fn request(paths: &Paths, op: &str) -> io::Result<Option<Value>> {
 
 /// `qsh-server status`: the running daemon's status as JSON, None when no daemon runs.
 pub async fn request_status(paths: &Paths) -> io::Result<Option<Value>> {
-    request(paths, "status").await
+    request(paths, "status", json!({})).await
+}
+
+/// `qsh-server upgrade`: ask the running daemon to upgrade in place to `exe` (m2.md 10.2).
+/// The answer, None when no daemon runs: `{"restarting":true}` when it started, or
+/// `{"ok":false,"error":…,"not_newer":…}`. The daemon goes on with its sessions either way;
+/// [`request_status`] tells when the upgrade is done (`restarts`) or failed
+/// (`upgrade_failures`, `upgrade_error`).
+pub async fn request_upgrade(paths: &Paths, exe: &std::path::Path, force: bool) -> io::Result<Option<Value>> {
+    let Some(stream) = paths.connect_private(&paths.control_socket()).await? else {
+        return Ok(None);
+    };
+    let (r, mut w) = stream.into_split();
+    let message = request_value("upgrade", json!({ "exe": exe.to_string_lossy(), "force": force }));
+    // The daemon probes the program first (up to 5 s)
+    let line = tokio::time::timeout(Duration::from_secs(30), async {
+        write_json(&mut w, &message).await?;
+        read_line(&mut BufReader::new(r), 1 << 20).await
+    })
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "the daemon did not answer"))??;
+    Ok(Some(
+        serde_json::from_slice(&line).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+    ))
 }
 
 /// `qsh-server stop`: stop the running daemon and wait until it is gone. False when none ran.
 pub async fn request_stop(paths: &Paths) -> io::Result<bool> {
     let pid = request_status(paths).await?.and_then(|s| s["pid"].as_u64());
-    if request(paths, "stop").await?.is_none() {
+    if request(paths, "stop", json!({})).await?.is_none() {
         return Ok(false);
     }
     let deadline = Instant::now() + Duration::from_secs(5);

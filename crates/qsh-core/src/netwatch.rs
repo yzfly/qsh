@@ -3,8 +3,8 @@
 //! [`NetWatch`] tells a client when the network it is on changed: the default route moved to
 //! another interface or gateway, or the addresses of that interface changed (Wi-Fi to
 //! cellular, a new Wi-Fi network, a VPN coming up, waking from sleep somewhere else). Each
-//! state of the network has a [`NetFingerprint`], stable across runs, which is also the key
-//! for remembering what worked on a network (path memory, M2).
+//! state of the network has a [`NetFingerprint`], stable across runs; path memory (m2.md 3.2)
+//! keys networks by the coarser [`NetSnapshot::path_key`].
 //!
 //! Where the news comes from:
 //!
@@ -36,8 +36,8 @@
 //!     pool.quic().rebind()?;
 //!     // Then probe each connection at once (PING) instead of waiting for the dead path
 //!     // timers: no answer within about 2 s means the path is gone, so race the transports
-//!     // again (TLS and ssh pipe connections usually die with the old address). A pool
-//!     // could key its memory of working transports by `change.fingerprint`.
+//!     // again (TLS and ssh pipe connections usually die with the old address). Path
+//!     // memory keys what worked by `change.snapshot.path_key()`, a coarser view.
 //! }
 //! # }
 //! ```
@@ -146,6 +146,41 @@ impl NetSnapshot {
         let mut out = [0; 16];
         out.copy_from_slice(&digest.as_ref()[..16]);
         NetFingerprint(out)
+    }
+
+    /// The network as path memory keys it (m2.md 3.2, `NetKey`): a coarser view than
+    /// [`NetSnapshot::fingerprint`], so that a new DHCP lease on the same Wi-Fi is still the
+    /// same network. For each address family with a default route, IPv4 then IPv6: the family
+    /// tag (4 or 6), the interface name, the gateway (a zero byte when there is none) and the
+    /// route's source address cut to its /24 (IPv4) or /64 (IPv6), encoded as in the
+    /// fingerprint. The interfaces' address list is not part of it. Empty when offline.
+    ///
+    /// These bytes are never stored: path memory keeps only a keyed hash of them.
+    pub fn path_key(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for (tag, route) in [(4u8, &self.ipv4), (6u8, &self.ipv6)] {
+            let Some(route) = route else { continue };
+            bytes.push(tag);
+            push_field(&mut bytes, route.interface.as_bytes());
+            match &route.gateway {
+                Some(gateway) => push_address(&mut bytes, gateway),
+                None => bytes.push(0),
+            }
+            push_address(&mut bytes, &network_prefix(route.source));
+        }
+        bytes
+    }
+}
+
+/// The source address as path memory keys a network: IPv4 cut to its /24, IPv6 to its /64.
+fn network_prefix(address: IpAddr) -> IpAddr {
+    match address {
+        IpAddr::V4(a) => {
+            let mut octets = a.octets();
+            octets[3] = 0;
+            IpAddr::V4(Ipv4Addr::from(octets))
+        }
+        IpAddr::V6(_) => stable_address(address),
     }
 }
 

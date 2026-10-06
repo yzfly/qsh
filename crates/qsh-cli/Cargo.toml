@@ -26,6 +26,8 @@ default = []
 # downloads the release archive (with curl or wget, checked against SHA256SUMS). Release builds
 # turn it on; distributions build without it, so that qsh never downloads anything
 self-install = []
+# Unstable test hooks (QSH_TEST_*), for the upgrade and chaos tests only
+test-hooks = ["qsh-core/test-hooks"]
 
 [dependencies]
 qsh-core.workspace = true
@@ -40,3 +42,7 @@ qsh-core = { workspace = true, features = ["hub"] }
 
 [lints]
 workspace = true
+
+[[test]]
+name = "upgrade"
+required-features = ["test-hooks"]

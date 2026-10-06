@@ -156,7 +156,11 @@ pub async fn run(paths: &Paths, config: HubConfig) -> io::Result<()> {
     std::fs::set_permissions(&socket, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
     log::info(format_args!("hub started, pid {}", std::process::id()));
     let hub = Arc::new(Hub {
-        pool: Pool::new(),
+        // Path memory in the hub's own state directory
+        pool: Pool::with_memory(
+            Arc::new(crate::transport::quic::QuicClient::new()),
+            Some(client::paths::PathMemory::standard(paths)),
+        ),
         sessions: Mutex::new(HashMap::new()),
         next_id: AtomicU64::new(1),
         idle_since: Mutex::new(Instant::now()),

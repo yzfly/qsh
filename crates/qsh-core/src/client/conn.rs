@@ -1,9 +1,13 @@
 //! One connection after the hello exchange (protocol.md section 5), with its control stream
 //! served in the background: PING / PONG and the round-trip time, PATH_INFO, GOAWAY.
 //!
-//! Path intelligence (m2.md sections 3 and 4, work package WP-1) builds on this: the observed
-//! address ([`Conn::observed`]), the round-trip time ([`Conn::rtt`]) and how the race went
-//! ([`Conn::attempts`]).
+//! Path intelligence (m2.md sections 3 and 4) builds on this: the observed address
+//! ([`Conn::observed`]) and its changes, which the pool uses to detect NAT timeouts; the
+//! round-trip time ([`Conn::rtt`]) and loss; how the race went ([`Conn::attempts`]); and the
+//! liveness rules, which differ on QUIC (m2.md 4.4): no PING on an idle QUIC connection (its
+//! keep-alive holds the NAT mapping), unless the network's learned interval fell below the
+//! one the connection was created with, and "dead" means no UDP datagram for
+//! max(45 s, 3 × the keepalive interval).
 
 use std::fmt;
 use std::io;
@@ -20,17 +24,75 @@ use crate::proto::{read_message, write_message, ErrorCode, FramingError, Message
 use crate::transport::{Connection, RecvStream, Transport};
 use crate::{log, proto};
 
-/// Send PING this often on an attached connection (section 12.3).
+/// Send PING this often on an attached connection over TLS or the pipe (section 12.3).
 const PING_INTERVAL: Duration = Duration::from_secs(15);
 /// Nothing received for this long: the path is dead.
 const DEAD_AFTER: Duration = Duration::from_secs(45);
+/// Sends this far apart belong to different bursts of client activity.
+const BURST_GAP: Duration = Duration::from_secs(1);
+/// A change of address reaches the client up to this long after the packet that caused it
+/// (the server looks every 500 ms, then one trip back).
+const REBIND_SLACK: Duration = Duration::from_secs(2);
+
+/// When the client sent something other than a keepalive (m2.md 4.2, condition 3), on
+/// tokio's clock.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Activity {
+    /// The last send.
+    last: tokio::time::Instant,
+    /// The last silence of at least [`BURST_GAP`]: from its last send to the next one.
+    gap: Option<(tokio::time::Instant, tokio::time::Instant)>,
+}
+
+impl Activity {
+    pub(crate) fn new(now: tokio::time::Instant) -> Activity {
+        Activity { last: now, gap: None }
+    }
+
+    pub(crate) fn sent(&mut self, now: tokio::time::Instant) {
+        if now.saturating_duration_since(self.last) >= BURST_GAP {
+            self.gap = Some((self.last, now));
+        }
+        self.last = now;
+    }
+
+    /// How long the client had been silent when a change of address that was reported at
+    /// `arrival` happened (within [`REBIND_SLACK`] before it): the current silence, or the one
+    /// a burst that started since then ended; zero while traffic flowed.
+    pub(crate) fn idle_before(&self, arrival: tokio::time::Instant) -> Duration {
+        let window = arrival.checked_sub(REBIND_SLACK).unwrap_or(arrival);
+        if self.last <= window {
+            return arrival.saturating_duration_since(self.last);
+        }
+        match self.gap {
+            Some((start, end)) if end >= window => end.saturating_duration_since(start),
+            _ => Duration::ZERO,
+        }
+    }
+}
+
+/// The server reported a new address for the client (PATH_INFO, protocol.md 5.6).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PathChange {
+    /// When it arrived.
+    pub(crate) at: tokio::time::Instant,
+    /// How long the client had been sending nothing but keepalives ([`Activity::idle_before`]).
+    pub(crate) idle: Duration,
+    /// The address before.
+    pub(crate) from: SocketAddr,
+    /// The address now.
+    pub(crate) to: SocketAddr,
+}
 
 /// A connection after the hello exchange, with its control stream served in the background.
 pub struct Conn {
     pub(crate) connection: Connection,
     pub(crate) nonce: [u8; 32],
     control: mpsc::UnboundedSender<Message>,
-    last_rx: Mutex<Instant>,
+    /// When anything last arrived, on tokio's clock.
+    last_rx: Mutex<tokio::time::Instant>,
+    /// Messages received so far.
+    rx_count: std::sync::atomic::AtomicU64,
     rtt: Mutex<Option<Duration>>,
     observed: Mutex<Option<SocketAddr>>,
     goaway: AtomicBool,
@@ -41,9 +103,18 @@ pub struct Conn {
     restart: AtomicBool,
     /// The client is moving its sessions to another connection ([`Conn::retire`]).
     retiring: AtomicBool,
-    /// When the client last sent something other than a keepalive: ATTACH, INPUT, INPUT_EOF,
-    /// ACK, RESIZE, KEY_CONFIRM or HANGUP (m2.md 4.2, condition 3).
-    last_tx: Mutex<Instant>,
+    /// When the client sent something other than a keepalive: ATTACH, INPUT, INPUT_EOF, ACK,
+    /// RESIZE, KEY_CONFIRM or HANGUP (m2.md 4.2, condition 3).
+    activity: Mutex<Activity>,
+    /// The QUIC keep-alive interval the connection was created with; None: not QUIC (or not
+    /// made by the pool), PING every 15 s.
+    quic_keepalive: Mutex<Option<Duration>>,
+    /// The keepalive interval of the network the connection is on now (m2.md 4.4).
+    network_keepalive: Mutex<Option<Duration>>,
+    /// UDP datagrams received, and when that count last grew (QUIC liveness).
+    udp_rx: Mutex<(u64, tokio::time::Instant)>,
+    /// Where changes of the observed address go.
+    path_changes: Mutex<Option<mpsc::UnboundedSender<PathChange>>>,
     started: Instant,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     /// How each transport fared in the race that produced this connection.
@@ -114,14 +185,19 @@ impl Conn {
             connection,
             nonce,
             control,
-            last_rx: Mutex::new(Instant::now()),
+            last_rx: Mutex::new(tokio::time::Instant::now()),
+            rx_count: std::sync::atomic::AtomicU64::new(0),
             rtt: Mutex::new(None),
             observed: Mutex::new(None),
             goaway: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
             restart: AtomicBool::new(false),
             retiring: AtomicBool::new(false),
-            last_tx: Mutex::new(Instant::now()),
+            activity: Mutex::new(Activity::new(tokio::time::Instant::now())),
+            quic_keepalive: Mutex::new(None),
+            network_keepalive: Mutex::new(None),
+            udp_rx: Mutex::new((0, tokio::time::Instant::now())),
+            path_changes: Mutex::new(None),
             started,
             tasks: Mutex::new(Vec::new()),
             attempts: Mutex::new(Vec::new()),
@@ -167,25 +243,96 @@ impl Conn {
     /// INPUT_EOF, ACK, RESIZE, KEY_CONFIRM, HANGUP. For NAT timeout detection (m2.md
     /// 4.2, condition 3).
     pub(crate) fn sent(&self) {
-        *self.last_tx.lock().unwrap() = Instant::now();
+        self.activity.lock().unwrap().sent(tokio::time::Instant::now());
     }
 
     /// When the client last sent something other than a keepalive: ATTACH, INPUT, INPUT_EOF,
     /// ACK, RESIZE, KEY_CONFIRM or HANGUP (m2.md 4.2, condition 3).
     pub fn last_sent(&self) -> Instant {
-        *self.last_tx.lock().unwrap()
+        self.activity.lock().unwrap().last.into_std()
     }
 
-    /// Whether an attachment that last sent PING at `last_ping` should send one now (12.3):
-    /// every 15 s. (Work package WP-1 changes this for QUIC, m2.md 4.4.)
+    /// The connection is QUIC and was created with keep-alive interval `k`; `network` is the
+    /// interval of the network it is on (m2.md 4.4).
+    pub(crate) fn set_keepalive(&self, quic: Option<Duration>, network: Duration) {
+        *self.quic_keepalive.lock().unwrap() = quic;
+        *self.network_keepalive.lock().unwrap() = Some(network);
+    }
+
+    /// The network's interval changed (learning, or another network).
+    pub(crate) fn set_network_keepalive(&self, k: Duration) {
+        *self.network_keepalive.lock().unwrap() = Some(k);
+    }
+
+    /// The keepalive interval in effect on a QUIC connection: the one it was created with,
+    /// or the network's when that is smaller (the client then sends PING at that interval
+    /// while idle). None on TLS and the pipe (PING every 15 s).
+    pub fn keepalive(&self) -> Option<Duration> {
+        let quic = (*self.quic_keepalive.lock().unwrap())?;
+        Some(match *self.network_keepalive.lock().unwrap() {
+            Some(k) => k.min(quic),
+            None => quic,
+        })
+    }
+
+    /// Changes of the observed address go to `tx` from now on.
+    pub(crate) fn watch_path(&self, tx: mpsc::UnboundedSender<PathChange>) {
+        *self.path_changes.lock().unwrap() = Some(tx);
+    }
+
+    /// Whether an attachment that last sent PING at `last_ping` should send one now
+    /// (protocol.md 12.3, m2.md 4.4): every 15 s over TLS and the pipe; over QUIC only while
+    /// the network's keepalive interval is below the one the connection was created with,
+    /// every that interval while the client sends nothing else.
     pub(crate) fn ping_due(&self, last_ping: Instant) -> bool {
-        last_ping.elapsed() >= PING_INTERVAL
+        let Some(quic) = *self.quic_keepalive.lock().unwrap() else {
+            return last_ping.elapsed() >= PING_INTERVAL;
+        };
+        let Some(k) = self.keepalive().filter(|&k| k < quic) else {
+            return false;
+        };
+        last_ping.elapsed() >= k && self.activity.lock().unwrap().last.elapsed() >= k
     }
 
-    /// Why the path is dead, if it is: nothing received for 45 s (12.3). (Work package WP-1
-    /// changes this for QUIC, m2.md 4.4.)
+    /// Why the path is dead, if it is (protocol.md 12.3): nothing received for 45 s; over
+    /// QUIC, no UDP datagram (the server's acknowledgements of the keep-alives count) for
+    /// max(45 s, 3 × the keepalive interval) (m2.md 4.4).
     pub(crate) fn dead(&self) -> Option<String> {
-        (self.last_received().elapsed() > DEAD_AFTER).then(|| "nothing received for 45 s".to_string())
+        let last_rx = *self.last_rx.lock().unwrap();
+        let Some(k) = self.keepalive() else {
+            return (last_rx.elapsed() > DEAD_AFTER).then(|| "nothing received for 45 s".to_string());
+        };
+        let limit = DEAD_AFTER.max(k * 3);
+        let last = last_rx.max(self.udp_received());
+        (last.elapsed() > limit).then(|| format!("nothing received for {} s", limit.as_secs()))
+    }
+
+    /// When the QUIC connection last received a UDP datagram, as far as it can tell: when
+    /// its count last grew, seen at the latest call.
+    fn udp_received(&self) -> tokio::time::Instant {
+        let mut udp = self.udp_rx.lock().unwrap();
+        if let Some(c) = self.connection.quic_connection() {
+            let n = c.stats().udp_rx.datagrams;
+            if n != udp.0 {
+                *udp = (n, tokio::time::Instant::now());
+            }
+        }
+        udp.1
+    }
+
+    /// The QUIC loss ratio of the connection so far: lost packets per packet sent. None on TLS
+    /// and the pipe, and before anything was sent.
+    pub fn loss(&self) -> Option<f64> {
+        let path = self.connection.quic_connection()?.stats().path;
+        (path.sent_packets > 0).then(|| path.lost_packets as f64 / path.sent_packets as f64)
+    }
+
+    /// Send GOAWAY with `code` (the client closes the connection on purpose, protocol.md 5.7).
+    pub(crate) fn goaway(&self, code: ErrorCode) {
+        let _ = self.control.send(Message::GoAway {
+            code,
+            message: String::new(),
+        });
     }
 
     /// True once the server said it is stopping (GOAWAY with SHUTDOWN).
@@ -216,11 +363,12 @@ impl Conn {
     }
 
     pub(crate) fn received(&self) {
-        *self.last_rx.lock().unwrap() = Instant::now();
+        *self.last_rx.lock().unwrap() = tokio::time::Instant::now();
+        self.rx_count.fetch_add(1, Ordering::SeqCst);
     }
 
     pub(crate) fn last_received(&self) -> Instant {
-        *self.last_rx.lock().unwrap()
+        self.last_rx.lock().unwrap().into_std()
     }
 
     pub(crate) fn ping(&self) {
@@ -233,13 +381,13 @@ impl Conn {
     /// at all arrives within `within`. The sessions on it then race the transports again
     /// instead of waiting for the dead path timers (protocol.md 12.3, 12.4).
     pub(crate) fn probe(self: &Arc<Self>, within: Duration) {
-        let sent = Instant::now();
+        let before = self.rx_count.load(Ordering::SeqCst);
         self.ping();
         let conn = Arc::downgrade(self);
         tokio::spawn(async move {
             tokio::time::sleep(within).await;
             if let Some(conn) = conn.upgrade() {
-                if conn.last_received() < sent && !conn.connection.is_closed() {
+                if conn.rx_count.load(Ordering::SeqCst) == before && !conn.connection.is_closed() {
                     log::info(format_args!(
                         "no answer over {} after the network changed; reconnecting",
                         conn.transport()
@@ -248,6 +396,16 @@ impl Conn {
                 }
             }
         });
+    }
+
+    /// The server reported a new address: tell the pool (keepalive learning, m2.md 4.2).
+    fn path_changed(&self, from: SocketAddr, to: SocketAddr) {
+        log::debug(format_args!("the server sees this client at {to} now (was {from})"));
+        let at = tokio::time::Instant::now();
+        let idle = self.activity.lock().unwrap().idle_before(at);
+        if let Some(tx) = self.path_changes.lock().unwrap().as_ref() {
+            let _ = tx.send(PathChange { at, idle, from, to });
+        }
     }
 
     /// The round-trip time: QUIC's own estimate, or the last PING.
@@ -278,7 +436,13 @@ async fn control_reader(conn: std::sync::Weak<Conn>, mut recv: BufReader<RecvStr
                 let _ = conn.control.send(Message::Pong { data });
             }
             Message::PathInfo { address, port, .. } => {
-                *conn.observed.lock().unwrap() = address.map(|a| SocketAddr::new(a, port));
+                let now = address.map(|a| SocketAddr::new(a, port));
+                let before = std::mem::replace(&mut *conn.observed.lock().unwrap(), now);
+                if let (Some(from), Some(to)) = (before, now) {
+                    if from != to {
+                        conn.path_changed(from, to);
+                    }
+                }
             }
             Message::GoAway { code, .. } => {
                 log::debug(format_args!("GOAWAY {code}"));

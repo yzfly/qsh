@@ -6,7 +6,7 @@
 
 use std::io;
 use std::net::SocketAddr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::crypto::{self, Fingerprint, Identity};
@@ -15,10 +15,54 @@ use crate::sys;
 /// A QUIC handshake gives up after this long.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
 
+/// The client's QUIC keep-alive interval when nothing was learned about the network
+/// (`KEEPALIVE_START`, m2.md 4.3; protocol.md 9.1).
+pub const KEEPALIVE_DEFAULT: Duration = Duration::from_secs(20);
+
+/// The QUIC idle timeout both ends advertise (protocol.md 9.1).
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Settings of one client connection that QUIC fixes when the connection is created (quinn
+/// cannot change them later, m2.md 4.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Options {
+    /// Send a QUIC PING after this long without sending anything: holds NAT mappings open.
+    pub keep_alive: Duration,
+    /// The client's `max_idle_timeout`; QUIC uses the smaller of both ends' values.
+    pub idle_timeout: Duration,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Options {
+            keep_alive: KEEPALIVE_DEFAULT,
+            idle_timeout: IDLE_TIMEOUT,
+        }
+    }
+}
+
+impl Options {
+    /// The options for a keep-alive interval `k`: an interval above 25 s raises the idle
+    /// timeout to three times `k`, so that two lost keep-alives do not end the connection
+    /// (m2.md 4.3; the server's 60 s still bound it unless it allows more).
+    pub fn with_keepalive(k: Duration) -> Options {
+        Options {
+            keep_alive: k,
+            idle_timeout: if k > Duration::from_secs(25) {
+                k * 3
+            } else {
+                IDLE_TIMEOUT
+            },
+        }
+    }
+}
+
 /// The client side: one endpoint, created on first use.
 #[derive(Debug, Default)]
 pub struct QuicClient {
     endpoint: Mutex<Option<(quinn::Endpoint, bool)>>,
+    /// When the endpoint last moved to a new socket ([`QuicClient::rebind`]).
+    rebound: Mutex<Option<tokio::time::Instant>>,
 }
 
 impl QuicClient {
@@ -41,10 +85,29 @@ impl QuicClient {
         Ok((e, ipv6))
     }
 
-    /// Connect to the daemon at `host`:`port` whose certificate has `fingerprint`.
+    /// Connect to the daemon at `host`:`port` whose certificate has `fingerprint`, with the
+    /// default [`Options`].
     pub async fn connect(&self, host: &str, port: u16, fingerprint: Fingerprint) -> io::Result<quinn::Connection> {
+        self.connect_with(host, port, fingerprint, &Options::default()).await
+    }
+
+    /// [`QuicClient::connect`] with `options` for this connection.
+    pub async fn connect_with(
+        &self,
+        host: &str,
+        port: u16,
+        fingerprint: Fingerprint,
+        options: &Options,
+    ) -> io::Result<quinn::Connection> {
         let (endpoint, ipv6) = self.endpoint()?;
-        let (config, pin) = crypto::pinned_quic_client(fingerprint)?;
+        let (mut config, pin) = crypto::pinned_quic_client(fingerprint)?;
+        let mut transport = crypto::transport();
+        // qsh/1 has no server-initiated channels
+        transport.max_concurrent_bidi_streams(0u32.into());
+        transport.keep_alive_interval(Some(options.keep_alive));
+        let idle = quinn::IdleTimeout::try_from(options.idle_timeout).unwrap_or(quinn::VarInt::MAX.into());
+        transport.max_idle_timeout(Some(idle));
+        config.transport_config(Arc::new(transport));
         let connection = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
             let addresses: Vec<SocketAddr> = tokio::net::lookup_host((host, port)).await?.collect();
             // A dual stack socket reaches both families; an IPv4 one only IPv4
@@ -78,7 +141,14 @@ impl QuicClient {
         let socket = sys::udp_any(0)?;
         *ipv6 = socket.local_addr()?.is_ipv6();
         e.rebind(socket)?;
+        *self.rebound.lock().unwrap() = Some(tokio::time::Instant::now());
         Ok(true)
+    }
+
+    /// When the endpoint last moved to a new socket, if it did: a change of address the
+    /// server reports after that is the client's own doing, not a NAT's (m2.md 4.2).
+    pub fn rebound_at(&self) -> Option<tokio::time::Instant> {
+        *self.rebound.lock().unwrap()
     }
 
     /// The local address of the endpoint, if there is one.

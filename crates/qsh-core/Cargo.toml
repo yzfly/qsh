@@ -15,6 +15,9 @@ categories = ["network-programming", "command-line-utilities"]
 default = ["hub"]
 # The resident client that keeps one connection per server for many terminals (embedders)
 hub = []
+# Unstable environment hooks for the upgrade and chaos tests (QSH_TEST_VERSION,
+# QSH_TEST_HANDOFF_FAULT): never in release or distribution builds
+test-hooks = []
 
 [dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "time", "sync", "signal", "process", "fs"] }

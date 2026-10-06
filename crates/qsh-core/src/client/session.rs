@@ -414,7 +414,7 @@ impl Session {
                     return Ok(outcome);
                 }
             }
-            let conn = match self.pool.get(&state.target, &self.config.race).await {
+            let conn = match self.pool.get(&state.target, &self.config).await {
                 Ok(c) => c,
                 Err(e) => {
                     log::debug(format_args!("no connection: {e}"));

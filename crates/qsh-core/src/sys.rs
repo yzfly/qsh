@@ -203,6 +203,20 @@ pub fn raise_nofile_limit() -> io::Result<u64> {
     Ok(limit.rlim_cur as u64)
 }
 
+/// Put the soft limit of open descriptors back to what it was before
+/// [`raise_nofile_limit`], if that raised it: right before an upgrade in place executes the
+/// next image (m2.md 10.3 step 5), which raises it again and so learns the limit its session
+/// programs must get. Calling [`raise_nofile_limit`] again undoes it.
+pub fn restore_nofile_limit() -> io::Result<()> {
+    if let Some(original) = ORIGINAL_NOFILE.get() {
+        // SAFETY: setrlimit reads one rlimit from the pointer, valid across the call.
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, original) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
 /// Make `fd` non-blocking (for [`wait_fd`] loops).
 pub fn set_nonblocking(fd: &impl AsRawFd) -> io::Result<()> {
     let fd = fd.as_raw_fd();
@@ -387,6 +401,306 @@ pub fn wait_exit_no_reap(pid: u32) -> io::Result<()> {
             return Err(e);
         }
     }
+}
+
+/// How a reaped child ended (see [`reap`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChildExit {
+    /// The exit code, when it exited.
+    pub code: Option<i32>,
+    /// The signal that ended it, when one did.
+    pub signal: Option<i32>,
+    /// A core dump was written.
+    pub core_dumped: bool,
+}
+
+/// Wait for child process `pid` to end and reap it. The daemon uses this rather than
+/// `std::process::Child::wait`, because after an upgrade in place (m2.md section 10) the
+/// session programs are still its children, but no `Child` value exists for them any more.
+pub fn reap(pid: u32) -> io::Result<ChildExit> {
+    let pid = libc::pid_t::try_from(pid).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    if pid <= 0 {
+        return Err(io::ErrorKind::InvalidInput.into());
+    }
+    loop {
+        let mut status: libc::c_int = 0;
+        // SAFETY: waitpid writes one c_int into the pointer, valid across the call; pid > 0
+        // names a single child.
+        let r = unsafe { libc::waitpid(pid, &mut status, 0) };
+        if r == pid {
+            let exited = libc::WIFEXITED(status);
+            let signaled = libc::WIFSIGNALED(status);
+            return Ok(ChildExit {
+                code: exited.then(|| libc::WEXITSTATUS(status)),
+                signal: signaled.then(|| libc::WTERMSIG(status)),
+                core_dumped: signaled && libc::WCOREDUMP(status),
+            });
+        }
+        let e = io::Error::last_os_error();
+        if r < 0 && e.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(e);
+    }
+}
+
+/// Mark `fd` inherited by programs this process executes (`inherit`), or close-on-exec. The
+/// upgrade in place clears close-on-exec on exactly the descriptors the new image adopts, and
+/// on nothing else (security.md 4.8).
+pub fn set_inheritable(fd: &impl AsRawFd, inherit: bool) -> io::Result<()> {
+    let flags = if inherit { 0 } else { libc::FD_CLOEXEC };
+    // SAFETY: fcntl F_SETFD on a descriptor has no memory effects.
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, flags) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Take ownership of descriptor number `fd`, inherited from the previous image of this process
+/// across an upgrade in place. None when no descriptor with that number is open. The caller
+/// must have been told the number by that image (the handoff state, m2.md 10.5), must take each
+/// number at most once, and must not hold another owner of it.
+pub fn adopt_fd(fd: RawFd) -> Option<OwnedFd> {
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: fcntl F_GETFD only checks that the number is an open descriptor.
+    if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+        return None;
+    }
+    // SAFETY: the descriptor is open (checked above) and, by the caller's contract, owned by
+    // nothing else in this process: it was inherited across execve for exactly this owner.
+    Some(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// The kind of file a descriptor refers to ([`fd_info`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FdKind {
+    /// A socket.
+    Socket,
+    /// A character device (a pseudo-terminal master).
+    CharDevice,
+    /// A pipe.
+    Fifo,
+    /// A regular file (including an anonymous memory file).
+    Regular,
+    /// Anything else.
+    Other,
+}
+
+/// What `fstat` says about a descriptor: its kind and the user that owns it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FdInfo {
+    /// The kind of file.
+    pub kind: FdKind,
+    /// The owner's user id.
+    pub uid: u32,
+}
+
+/// The kind and owner of the file `fd` refers to.
+pub fn fd_info(fd: &impl AsRawFd) -> io::Result<FdInfo> {
+    // SAFETY: stat is plain old data; all zeroes is a valid value.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: fstat writes one stat into the pointer, valid across the call.
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let kind = match st.st_mode & libc::S_IFMT {
+        libc::S_IFSOCK => FdKind::Socket,
+        libc::S_IFCHR => FdKind::CharDevice,
+        libc::S_IFIFO => FdKind::Fifo,
+        libc::S_IFREG => FdKind::Regular,
+        _ => FdKind::Other,
+    };
+    Ok(FdInfo { kind, uid: st.st_uid })
+}
+
+/// True when `fd` is the master side of a pseudo terminal. (A master belongs to root, the
+/// owner of the multiplexer device: its owner says nothing about who opened it.)
+pub fn is_pty_master(fd: &impl AsRawFd) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let mut number: libc::c_uint = 0;
+        // SAFETY: TIOCGPTN writes the slave's number into the c_uint, valid across the call;
+        // it succeeds only on a master.
+        unsafe { libc::ioctl(fd.as_raw_fd(), libc::TIOCGPTN as _, &mut number) == 0 }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // SAFETY: isatty only inspects the descriptor.
+        unsafe { libc::isatty(fd.as_raw_fd()) == 1 }
+    }
+}
+
+/// The socket type (`SOCK_STREAM`, `SOCK_DGRAM`, ...) of socket `fd`.
+pub fn socket_type(fd: &impl AsRawFd) -> io::Result<i32> {
+    let mut value: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: getsockopt writes at most `len` bytes into the c_int and updates `len`, both
+    // valid across the call.
+    let r = unsafe {
+        libc::getsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            &mut value as *mut libc::c_int as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if r != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(value)
+}
+
+/// A pipe, both ends close-on-exec: (read end, write end).
+pub fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+    let mut fds = [-1 as libc::c_int; 2];
+    // SAFETY: pipe writes two descriptors into the array, which lives across the call.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: pipe succeeded: both are open descriptors this process now owns.
+    let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    set_cloexec(read.as_raw_fd())?;
+    set_cloexec(write.as_raw_fd())?;
+    Ok((read, write))
+}
+
+/// An anonymous file for secrets that must cross an `execve` (the upgrade's state, m2.md 10.3
+/// step 4): a memory file (`memfd_create`) on Linux; elsewhere, or where that fails, a file
+/// created with mode 0600 in `dir` (a private directory) and unlinked at once. Close-on-exec.
+pub fn anonymous_file(dir: &std::path::Path) -> io::Result<File> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let name = c"qsh-handoff";
+        // SAFETY: memfd_create reads the NUL-terminated name, valid across the call.
+        let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+        if fd >= 0 {
+            // SAFETY: memfd_create succeeded: a new descriptor this process now owns.
+            return Ok(File::from(unsafe { OwnedFd::from_raw_fd(fd) }));
+        }
+    }
+    use std::os::unix::fs::OpenOptionsExt;
+    for _ in 0..16 {
+        let path = dir.join(format!(
+            ".handoff-{}",
+            crate::crypto::hex(&crate::crypto::random::<8>())
+        ));
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            Ok(file) => {
+                std::fs::remove_file(&path)?;
+                return Ok(file);
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::other("cannot create a private temporary file"))
+}
+
+/// Pointers to the strings, NUL-terminated, for execve's argv and envp.
+fn exec_pointers(strings: &[std::ffi::CString]) -> Vec<*const libc::c_char> {
+    strings
+        .iter()
+        .map(|s| s.as_ptr())
+        .chain(std::iter::once(std::ptr::null()))
+        .collect()
+}
+
+/// Replace this process's program with `path` (`execve`), keeping its process id, its
+/// children and every descriptor not marked close-on-exec. Returns only when that fails.
+pub fn execve(path: &std::ffi::CStr, argv: &[std::ffi::CString], envp: &[std::ffi::CString]) -> io::Error {
+    let args = exec_pointers(argv);
+    let env = exec_pointers(envp);
+    // SAFETY: the path and every string are NUL-terminated and alive across the call; both
+    // arrays end with a null pointer. On success the call does not return.
+    unsafe { libc::execve(path.as_ptr(), args.as_ptr(), env.as_ptr()) };
+    io::Error::last_os_error()
+}
+
+/// Replace this process's program with the executable open on `fd` (`fexecve`; the old
+/// image of an upgrade, m2.md 10.4). Returns only when that fails.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn fexecve(fd: &impl AsRawFd, argv: &[std::ffi::CString], envp: &[std::ffi::CString]) -> io::Error {
+    let args = exec_pointers(argv);
+    let env = exec_pointers(envp);
+    // SAFETY: every string is NUL-terminated and alive across the call; both arrays end with a
+    // null pointer; fd is an open descriptor. On success the call does not return.
+    unsafe { libc::fexecve(fd.as_raw_fd(), args.as_ptr(), env.as_ptr()) };
+    io::Error::last_os_error()
+}
+
+/// Ask for `bytes` of receive and send buffer on a UDP socket (the kernel caps the request
+/// at `net.core.rmem_max` / `wmem_max`, m2.md 8.2 `udp-buffers`). Returns the sizes the kernel
+/// granted (Linux reports twice the usable size).
+pub fn set_socket_buffers(fd: &impl AsRawFd, bytes: usize) -> io::Result<(usize, usize)> {
+    let value = libc::c_int::try_from(bytes).unwrap_or(libc::c_int::MAX);
+    let mut granted = [0usize; 2];
+    for (i, option) in [libc::SO_RCVBUF, libc::SO_SNDBUF].into_iter().enumerate() {
+        // SAFETY: the option value points to a c_int that lives across the call, with its size.
+        let r = unsafe {
+            libc::setsockopt(
+                fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                option,
+                &value as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if r != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut now: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: getsockopt writes at most `len` bytes into the c_int and updates `len`.
+        let r = unsafe {
+            libc::getsockopt(
+                fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                option,
+                &mut now as *mut libc::c_int as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        if r == 0 {
+            granted[i] = usize::try_from(now).unwrap_or(0);
+        }
+    }
+    Ok((granted[0], granted[1]))
+}
+
+/// Use congestion control `name` (`bbr`) on TCP socket `fd`; on a listening socket the
+/// connections it accepts inherit it. Linux only, and only when the administrator allows the
+/// algorithm for unprivileged users (`net.ipv4.tcp_allowed_congestion_control`, m2.md 8.4).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn set_tcp_congestion(fd: &impl AsRawFd, name: &str) -> io::Result<()> {
+    // SAFETY: the option value points to `name`'s bytes, valid across the call, with its length.
+    let r = unsafe {
+        libc::setsockopt(
+            fd.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_CONGESTION,
+            name.as_ptr() as *const libc::c_void,
+            name.len() as libc::socklen_t,
+        )
+    };
+    if r != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Congestion control cannot be chosen per socket on this system.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub fn set_tcp_congestion(_fd: &impl AsRawFd, _name: &str) -> io::Result<()> {
+    Err(io::ErrorKind::Unsupported.into())
 }
 
 /// Make `command` a daemon: a grandchild in a session of its own (so the ssh session that
@@ -927,6 +1241,69 @@ mod tests {
             addresses.iter().any(|a| a.loopback && a.address.is_loopback()),
             "{addresses:?}"
         );
+    }
+
+    #[test]
+    // Reaped by pid with `reap`, which is what is tested, not with Child::wait
+    #[allow(clippy::zombie_processes)]
+    fn a_child_is_reaped_with_its_status() {
+        let child = Command::new("/bin/sh").args(["-c", "exit 7"]).spawn().unwrap();
+        let exit = reap(child.id()).unwrap();
+        assert_eq!((exit.code, exit.signal), (Some(7), None));
+        let child = Command::new("/bin/sh").args(["-c", "kill -TERM $$"]).spawn().unwrap();
+        let exit = reap(child.id()).unwrap();
+        assert_eq!((exit.code, exit.signal), (None, Some(libc::SIGTERM)));
+        assert!(reap(0).is_err());
+    }
+
+    #[test]
+    fn descriptors_are_classified_and_inheritance_is_switched() {
+        let (master, slave) = openpty(80, 24).unwrap();
+        assert_eq!(fd_info(&master).unwrap().kind, FdKind::CharDevice);
+        assert!(is_pty_master(&master));
+        #[cfg(target_os = "linux")]
+        assert!(!is_pty_master(&slave));
+        let (r, _w) = pipe().unwrap();
+        assert_eq!(
+            fd_info(&r).unwrap(),
+            FdInfo {
+                kind: FdKind::Fifo,
+                uid: euid()
+            }
+        );
+        let udp = udp_any(0).unwrap();
+        assert_eq!(fd_info(&udp).unwrap().kind, FdKind::Socket);
+        assert_eq!(socket_type(&udp).unwrap(), libc::SOCK_DGRAM);
+        let file = anonymous_file(&std::env::temp_dir()).unwrap();
+        assert_eq!(
+            fd_info(&file).unwrap(),
+            FdInfo {
+                kind: FdKind::Regular,
+                uid: euid()
+            }
+        );
+        // SAFETY: F_GETFD only reads the descriptor's flags.
+        let cloexec = |fd: &OwnedFd| unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC != 0;
+        assert!(cloexec(&r));
+        set_inheritable(&r, true).unwrap();
+        assert!(!cloexec(&r));
+        set_inheritable(&r, false).unwrap();
+        assert!(cloexec(&r));
+        // A number that is not open is not adopted
+        let number = r.as_raw_fd();
+        drop(r);
+        assert!(adopt_fd(number).is_none());
+        drop(slave);
+    }
+
+    #[test]
+    fn udp_buffers_are_raised_as_far_as_the_kernel_allows() {
+        let udp = udp_any(0).unwrap();
+        let (rcv, snd) = set_socket_buffers(&udp, 4 << 20).unwrap();
+        assert!(rcv > 0 && snd > 0);
+        // BBR may not be allowed here: either way the call is harmless
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let _ = set_tcp_congestion(&tcp, "bbr");
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

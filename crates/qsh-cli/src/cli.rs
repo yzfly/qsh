@@ -314,6 +314,25 @@ pub enum ServerCommand {
     Status,
     /// Stop the running daemon; its sessions end
     Stop,
+    /// Replace the running daemon with a newer qsh-server in place; sessions are kept
+    #[command(long_about = "Replace the running daemon with a newer qsh-server in place: the \
+                      daemon executes the new program in its own process, keeping its process \
+                      id, its ports and every session with its output; clients reconnect \
+                      within a second. The program must belong to root or to you, must not be \
+                      writable by others, and must report a newer version, unless --force. If \
+                      anything goes wrong, the daemon goes on as before. The systemd user unit \
+                      runs this on systemctl --user reload qsh-server.")]
+    Upgrade {
+        /// The qsh-server to run (default: this program)
+        #[arg(long, value_name = "PATH")]
+        exe: Option<PathBuf>,
+        /// Upgrade even to a version that is not newer
+        #[arg(long)]
+        force: bool,
+    },
+    /// Print the version and the handoff state formats this program reads (used by upgrades)
+    #[command(name = "handoff-probe", hide = true)]
+    HandoffProbe,
 }
 
 /// Options of `qsh-server daemon`.
@@ -328,6 +347,21 @@ pub struct DaemonArgs {
     /// Exit after an hour without sessions (set when started on demand)
     #[arg(long, hide = true)]
     pub on_demand: bool,
+    /// Resume from the state an older image of this daemon handed over (an upgrade in place)
+    #[arg(long, hide = true, requires_all = ["state_fd", "key_fd"])]
+    pub resume: bool,
+    /// The descriptor of the sealed state (with --resume)
+    #[arg(long, hide = true, value_name = "FD", requires = "resume")]
+    pub state_fd: Option<i32>,
+    /// The descriptor of the pipe with the state's key (with --resume)
+    #[arg(long, hide = true, value_name = "FD", requires = "resume")]
+    pub key_fd: Option<i32>,
+    /// The descriptor of the previous program, run again if resuming fails (with --resume)
+    #[arg(long, hide = true, value_name = "FD", requires = "resume")]
+    pub fallback_exe_fd: Option<i32>,
+    /// The new program could not resume; this is the previous one again (with --resume)
+    #[arg(long, hide = true, requires = "resume")]
+    pub fell_back: bool,
 }
 
 /// Parse `FIRST-LAST` (or a single port).
@@ -470,6 +504,40 @@ mod tests {
         assert!(help.contains("[user@]host, or a host alias"), "{help}");
         let help = parse_qsh(["qsh", "attach", "--help"]).unwrap_err().to_string();
         assert!(help.contains("[user@]host the session runs on"), "{help}");
+    }
+
+    #[test]
+    fn upgrade_and_resume_arguments() {
+        let args =
+            ServerArgs::try_parse_from(["qsh-server", "upgrade", "--exe", "/usr/bin/qsh-server", "--force"]).unwrap();
+        assert!(matches!(
+            args.command,
+            ServerCommand::Upgrade {
+                exe: Some(_),
+                force: true
+            }
+        ));
+        let args = ServerArgs::try_parse_from(["qsh-server", "handoff-probe"]).unwrap();
+        assert!(matches!(args.command, ServerCommand::HandoffProbe));
+        let args = ServerArgs::try_parse_from([
+            "qsh-server",
+            "daemon",
+            "--resume",
+            "--state-fd=5",
+            "--key-fd=6",
+            "--fallback-exe-fd=7",
+            "--foreground",
+            "--on-demand",
+        ])
+        .unwrap();
+        let ServerCommand::Daemon(d) = args.command else {
+            panic!()
+        };
+        assert!(d.resume && d.foreground && d.on_demand && !d.fell_back);
+        assert_eq!((d.state_fd, d.key_fd, d.fallback_exe_fd), (Some(5), Some(6), Some(7)));
+        // The descriptors only with --resume, and --resume only with them
+        assert!(ServerArgs::try_parse_from(["qsh-server", "daemon", "--state-fd=5"]).is_err());
+        assert!(ServerArgs::try_parse_from(["qsh-server", "daemon", "--resume", "--state-fd=5"]).is_err());
     }
 
     #[test]

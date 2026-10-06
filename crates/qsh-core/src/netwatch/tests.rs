@@ -70,6 +70,42 @@ fn fingerprint_tells_networks_apart() {
     );
 }
 
+/// Path memory's network key (m2.md 3.2): a new lease on the same network keeps it, another
+/// network changes it; pinned, since its keyed hash is on disk.
+#[test]
+fn path_key_is_coarse_and_stable() {
+    let a = home_wifi();
+    let mut lease = a.clone();
+    lease.ipv4.as_mut().unwrap().source = "192.168.1.42".parse().unwrap();
+    lease.addresses = vec!["192.168.1.42".parse().unwrap(), "2001:db8:1:2::".parse().unwrap()];
+    assert_ne!(a.fingerprint(), lease.fingerprint());
+    assert_eq!(a.path_key(), lease.path_key());
+    let mut gateway = a.clone();
+    gateway.ipv4.as_mut().unwrap().gateway = Some("192.168.1.254".parse().unwrap());
+    let mut subnet = a.clone();
+    subnet.ipv4.as_mut().unwrap().source = "192.168.2.42".parse().unwrap();
+    let mut prefix = a.clone();
+    prefix.ipv6.as_mut().unwrap().source = "2001:db8:1:3::1".parse().unwrap();
+    let mut no_v6 = a.clone();
+    no_v6.ipv6 = None;
+    let all = [&a, &gateway, &subnet, &prefix, &no_v6];
+    for (i, x) in all.iter().enumerate() {
+        for y in &all[i + 1..] {
+            assert_ne!(x.path_key(), y.path_key(), "{x:?} vs {y:?}");
+        }
+    }
+    assert!(NetSnapshot::default().path_key().is_empty());
+    let mut v4 = hex("04");
+    v4.extend_from_slice(&hex("00000005"));
+    v4.extend_from_slice(b"wlan0");
+    v4.extend_from_slice(&hex("04c0a80101"));
+    v4.extend_from_slice(&hex("04c0a80100"));
+    assert_eq!(no_v6.path_key(), v4);
+    let mut point_to_point = no_v6.clone();
+    point_to_point.ipv4.as_mut().unwrap().gateway = None;
+    assert_eq!(point_to_point.path_key()[10], 0);
+}
+
 #[test]
 fn route_addresses_are_sorted_cut_and_filtered() {
     let entry = |interface: &str, address: &str| sys::InterfaceAddress {

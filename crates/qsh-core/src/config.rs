@@ -255,8 +255,7 @@ pub struct HostSettings {
     /// On attaching to a session from a new client, replay the output it kept
     /// (`replay_on_attach`).
     pub replay_on_attach: bool,
-    /// Remember per network which transport and port worked (`path_memory`, m2.md section 3;
-    /// reserved, not used by this version).
+    /// Remember per network which transport and port worked (`path_memory`, m2.md section 3).
     pub path_memory: bool,
     /// Smart catch-up (`catchup`, m2.md section 6; reserved, not used by this version).
     pub catchup: Catchup,
@@ -357,7 +356,7 @@ pub struct ServerSettings {
     /// The daemon's port range: the first port free on both UDP and TCP (`ports`).
     pub ports: Option<RangeInclusive<u16>>,
     /// More ports to listen on, for networks that block the first (`extra_ports`, at most
-    /// [`MAX_EXTRA_PORTS`], without duplicates; m2.md section 5, not used by this version).
+    /// [`MAX_EXTRA_PORTS`], without duplicates; m2.md section 5).
     pub extra_ports: Option<Vec<u16>>,
     /// The most sessions one daemon keeps (`max_sessions`).
     pub max_sessions: Option<usize>,
@@ -374,8 +373,7 @@ pub struct ServerSettings {
     pub snapshot: Option<bool>,
     /// Accept the `zstd` capability (`compression`, m2.md section 7; not used by this version).
     pub compression: Option<bool>,
-    /// When the daemon upgrades itself in place (`upgrade`, m2.md section 10; not used by this
-    /// version).
+    /// When the daemon upgrades itself in place (`upgrade`, m2.md section 10).
     pub upgrade: Option<Upgrade>,
 }
 

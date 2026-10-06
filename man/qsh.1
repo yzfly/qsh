@@ -184,6 +184,15 @@ Each holds the destination and ssh options, the server's ports and certificate f
 and the session key: as sensitive as an ssh private key while the session lives. qsh removes a
 file when its session ends, and refuses files and directories other users may read.
 .TP
+.I $XDG_STATE_HOME/qsh/paths.json
+Path memory (mode 0600): per server and network, which transports and ports worked, which
+were blocked, and the learned keepalive interval, with servers and networks stored only as
+keyed hashes. Advisory: deleting it forgets everything and costs nothing but a slower first
+connection; see
+.B path_memory
+in
+.BR qsh_config (5).
+.TP
 .IR $XDG_CONFIG_HOME/qsh/config ", " /etc/qsh/qsh_config
 Configuration, see
 .BR qsh_config (5).
