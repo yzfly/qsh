@@ -575,3 +575,60 @@ async fn peers_without_the_capabilities_see_no_change() {
     let mut ch = attach(&client, &c, 0, ATTACH_FRESH | ATTACH_ACCEPT_SNAPSHOT).await;
     ch.send(Message::Hangup).await;
 }
+
+/// Output that falls out of the replay buffer while the window is full is skipped with one
+/// OUTPUT_GAP right before the output after it, not with a gap each time the buffer's base
+/// moves: a flood once sent a gap per chunk the program wrote while the client was behind,
+/// thousands of tiny packets a second that filled the queues of a slow path ahead of an
+/// interrupt (m2.md 6.4).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_full_window_sends_no_gaps() {
+    let _flood = FLOODS.lock().await;
+    let d = TestDaemon::start("gaps", |c| c.output_replay = 1 << 20).await;
+    let c = d.tty("yes gap-test-line").await;
+    let client = hello(&c, &[]).await;
+    let mut ch = attach(&client, &c, 0, ATTACH_FRESH).await;
+    let mut s = Stream::default();
+    // No ACK for 3 s: the window fills (at the test link's pace, with a gap before each chunk
+    // when the buffer's base passed it meanwhile) and then stays full while the program
+    // overflows the buffer many times over: from then on, nothing at all
+    let start = Instant::now();
+    let quiet = start + Duration::from_secs(3);
+    let mut last_output = start;
+    let mut gaps_after = 0;
+    while let Ok(m) = tokio::time::timeout_at(quiet.into(), read_message(&mut ch.recv, MAX_TERMINAL)).await {
+        let m = m.unwrap().expect("the channel ended");
+        match m {
+            Message::Output { .. } | Message::OutputZstd { .. } => {
+                last_output = Instant::now();
+                gaps_after = 0;
+            }
+            Message::OutputGap { .. } => gaps_after += 1,
+            _ => {}
+        }
+        let _ = s.take(m);
+    }
+    assert!(s.received > 0, "nothing was sent");
+    assert!(
+        last_output < start + Duration::from_millis(2500),
+        "the window was not full for half a second: {:?}",
+        last_output - start
+    );
+    assert_eq!(gaps_after, 0, "gaps while the window was full");
+    // Acknowledged: the output goes on from the buffer's base after a gap (and after another
+    // whenever the base passes what is being sent at the test link's pace), until the window is
+    // full again
+    let gaps = s.gaps;
+    ch.send(Message::Ack {
+        received: s.received,
+        error_received: None,
+    })
+    .await;
+    let quiet = Instant::now() + Duration::from_millis(1500);
+    while let Ok(m) = tokio::time::timeout_at(quiet.into(), read_message(&mut ch.recv, MAX_TERMINAL)).await {
+        let _ = s.take(m.unwrap().expect("the channel ended"));
+    }
+    let more = s.gaps - gaps;
+    assert!((1..=40).contains(&more), "{more} gaps for the window the ACK opened");
+    ch.send(Message::Hangup).await;
+}

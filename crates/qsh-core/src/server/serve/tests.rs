@@ -57,7 +57,7 @@ fn in_flight_is_what_is_on_the_wire_after_a_gap() {
     out.sent = 5500;
     assert_eq!((out.in_flight(), out.unacked(6000)), (1500, 2000));
     out.skip(7000);
-    out.snapshot = Some((7000, 300));
+    out.snapshots.push_back((7000, 300));
     assert!(out.snapshot_in_flight());
     assert_eq!((out.in_flight(), out.unacked(7000)), (1800, 1500));
     // ACKs below, inside and after the skipped ranges

@@ -20,8 +20,8 @@ milestones and were not released; their changes are listed here.
 
 - Smart catch-up: when output floods a slow link, the server stops streaming the backlog and
   sends the current screen instead (a SNAPSHOT, built from a model of the terminal), marking
-  the skipped output in scrollback. Ctrl-C during `cat bigfile` on a 270 ms link takes effect
-  in about half a second instead of tens of seconds. A new client process attaching to a
+  the skipped output in scrollback. Ctrl-C during `cat bigfile` on a 270 ms link with 6 % loss
+  takes effect in about 0.4 s (median) instead of 16 s; at 20 % loss, 1.3 s instead of minutes. A new client process attaching to a
   session gets the recent scrollback and then the current screen.
 - Compression: on a slow path the server compresses output with zstd (decoded by a bounded
   decoder of our own); a 1.5 MB build log over 300 kB/s takes 0.4 s instead of 5 s.
@@ -72,6 +72,9 @@ milestones and were not released; their changes are listed here.
   4 MiB); output keeps flowing during a large paste into a terminal session too.
 - After UDP was blocked during a session, a new `qsh attach` still tried QUIC first: the
   failure is now recorded when TLS wins the race, and the last winner breaks ties.
+- On a lossy link a lost QUIC handshake packet could let TLS win the race, and QUIC's late
+  answer was thrown away: sessions stayed on TLS and lost QUIC's roaming and keepalive learning.
+  A better transport that answers late now takes the sessions over.
 - `qsh install` no longer falls back to plain http, and it checks the release signature.
 
 ### Security

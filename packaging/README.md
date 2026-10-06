@@ -28,8 +28,10 @@ builds make no network access at runtime.
 
 ## How CI builds them
 
-`.github/workflows/packaging.yml` runs on changes to `packaging/` or `Cargo.lock`, weekly, and by
-hand:
+`.github/workflows/packaging.yml` runs by hand while the repository is private (Actions minutes),
+before every release: `gh workflow run packaging.yml`, or with `-f jobs='debian-archive fedora'`
+to run only some jobs (any of `debian debian-archive fedora-archive fedora alpine arch homebrew`;
+the source tarballs are always made):
 
 1. `ci/source.sh` makes the source tarballs from the checkout: `qsh-VERSION.tar.gz` (`git archive`,
    the same layout as GitHub's tag archive the recipes download) and `qsh-VERSION-vendor.tar.xz`
@@ -135,14 +137,25 @@ source package too), Debian 12 (rustup 1.85) and Ubuntu 24.04 (`rustc-1.91`); te
 installs and works.
 
 Against the archive, without `vendor/` (the `debian:testing (archive crates)` job, October 2026):
-every crate is there at a version in the ranges of `debian/control` (15 of 15, e.g. clap 4.6.7,
-quinn 0.11.11, rcgen 0.14.7, rustls 0.23.45, tokio 1.53.1, toml 1.1.6), and qsh 0.2.1 builds with
-the plain dh-cargo route (rustc 1.95), its tests pass, lintian reports only the ITP placeholder and
-the `vendor/*` paragraphs of `debian/copyright` that a build without `vendor/` does not use
-(`superfluous-file-pattern`), and the installed packages pass the smoke test. No new crate
-packages are needed.
+every crate is there at a version in the ranges of `debian/control` (18 of 18, e.g. clap 4.6.7,
+quinn 0.11.11, rcgen 0.14.7, rustls 0.23.45, tokio 1.53.1, toml 1.1.6, and for 0.5.0's catch-up
+and compression vt100 0.16.2, ruzstd 0.8.3, twox-hash 2.1.2), and qsh 0.5.0 builds with the plain
+dh-cargo route (rustc 1.95) with its default features, `zstd` included; its tests pass, lintian
+reports only the ITP placeholder and the `vendor/*` paragraphs of `debian/copyright` that a build
+without `vendor/` does not use (`superfluous-file-pattern`), and the installed packages pass the
+smoke test. No new crate packages are needed for forky. Trixie has older crates (vt100 0.15.2,
+which lacks what the screen model needs, ruzstd 0.7.3 without an encoder, twox-hash 1.6.3): a
+trixie backport builds with `pkg.qsh.vendored`, as the `debian:13` job does.
 
-In unstable the same Build-Depends are all there, but since 2026-10-04 they cannot be installed:
+When a dependency is added to a `Cargo.toml`, its `librust-*-dev` goes into `debian/control`
+(Build-Depends, the semver range as a `>=` / `<<` pair, `<!pkg.qsh.vendored>`) and
+`packaging/ci/debian-copyright.py` regenerates the `vendor/*` paragraphs of `debian/copyright`
+from `Cargo.lock`. The archive-crates jobs fail with an error naming any crates.io dependency of
+the manifests that has no Build-Depends (otherwise cargo stops with "no matching package"), and
+the source tarballs job warns when `debian/copyright` is out of date.
+
+In unstable the same Build-Depends are all there (18 of 18), but since 2026-10-04 they cannot be
+installed together:
 `rust-synstructure` 0.14.0 was uploaded that day without a 0.13 compat package, while
 `librust-asn1-rs-dev` (0.7.2+ds-2) still depends on `librust-synstructure-0.13-dev`; the
 archive's `librust-rcgen-dev` depends on `x509-parser` and through it on `asn1-rs` whatever

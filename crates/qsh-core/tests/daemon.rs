@@ -257,8 +257,16 @@ async fn an_ack_in_flight_across_a_gap_is_accepted() {
                     .await;
                 }
                 if outputs == 1 {
-                    // A slow reader: the program overflows the replay buffer meanwhile
+                    // A slow reader: the program overflows the replay buffer meanwhile. Then
+                    // it acknowledges what it has (a client must within a second, 7.5): the
+                    // window that opens is where the server announces the gap, right before
+                    // the output after it (it sends none while its window is full)
                     wait_for_file(&marker).await;
+                    ch.send(Message::Ack {
+                        received,
+                        error_received: None,
+                    })
+                    .await;
                 }
             }
             Message::OutputGap { from, to } if outputs > 0 && !gap_acked => {

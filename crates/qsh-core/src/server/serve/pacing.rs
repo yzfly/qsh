@@ -40,6 +40,8 @@ const SETTLE: Duration = Duration::from_millis(20);
 const SETTLE_MAX: Duration = Duration::from_millis(100);
 /// No new backlog snapshot before the last one is acknowledged and this long has passed.
 const HYSTERESIS: Duration = Duration::from_secs(1);
+/// Snapshots in flight at most: one, and one for input sent while it is in flight.
+const MAX_IN_FLIGHT: usize = 2;
 
 /// Compression only below this delivery rate (`COMPRESS_BELOW`, 4 MiB/s).
 pub(super) const COMPRESS_BELOW: f64 = 4.0 * 1024.0 * 1024.0;
@@ -175,8 +177,9 @@ pub(super) struct Stream {
     /// `T`, and how much sampled time it rests on.
     pub rate: f64,
     pub sampled: Duration,
-    /// A snapshot is in flight (sent, not acknowledged): no other is sent before it is.
-    pub busy: bool,
+    /// Snapshots in flight (sent, not acknowledged): the backlog trigger and resyncs wait for
+    /// none, the input trigger for at most one.
+    pub snapshots: usize,
 }
 
 /// The triggers of smart catch-up for one attachment (m2.md 6.4).
@@ -229,16 +232,19 @@ impl Catchup {
         self.interrupt.is_some()
     }
 
-    /// What to do with the output stream `s`. At most one snapshot is in flight: a trigger
-    /// that fires meanwhile waits for its acknowledgement (the input trigger holding the
-    /// output), so that one fresh snapshot follows instead of a stack of them.
+    /// What to do with the output stream `s`. At most one snapshot is in flight, and one more
+    /// for input: the backlog trigger waits for the acknowledgement of the one in flight, so
+    /// that one fresh snapshot follows instead of a stack of them; the input trigger does not
+    /// (its snapshot would wait a round trip and the queue ahead of the first, protocol.md
+    /// 7.8.5), unless two are in flight already, and then holds the output until one is
+    /// acknowledged.
     pub(super) fn step(&self, now: Instant, s: &Stream) -> Step {
         if let Some(since) = self.interrupt {
             let settled = self.output.0 + SETTLE;
             let latest = since + SETTLE_MAX;
             return if now < settled && now < latest {
                 Step::Hold(Some(settled.min(latest)))
-            } else if s.busy {
+            } else if s.snapshots >= MAX_IN_FLIGHT {
                 Step::Hold(None)
             } else {
                 Step::Snapshot
@@ -251,7 +257,7 @@ impl Catchup {
             .is_none_or(|(at, offset)| s.last_ack >= offset && now.saturating_duration_since(at) >= HYSTERESIS);
         // Something to skip, and something new since a snapshot could not be made
         let new = s.unsent > 0 && self.failed.is_none_or(|f| s.end > f);
-        if backlog && s.sampled >= enough && rested && new && !s.busy {
+        if backlog && s.sampled >= enough && rested && new && s.snapshots == 0 {
             Step::Snapshot
         } else {
             Step::Send

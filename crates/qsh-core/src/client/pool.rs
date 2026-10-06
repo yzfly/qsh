@@ -47,7 +47,8 @@ use crate::proto::limits::ATTACH_TIMEOUT;
 use crate::proto::ErrorCode;
 use crate::transport::quic::{self, QuicClient};
 use crate::transport::{
-    Attempt, Connector, Direct, FailureKind, Plan, Race, RaceConfig, RaceError, RaceEvent, Target, Transport,
+    Attempt, Connection, Connector, Direct, FailureKind, Plan, Race, RaceConfig, RaceError, RaceEvent, Target,
+    Transport,
 };
 
 /// After a network change, a connection that answers nothing for this long is dead.
@@ -73,6 +74,18 @@ struct ServerKey {
     udp: u16,
     tcp: u16,
     fingerprint: [u8; 32],
+}
+
+impl ServerKey {
+    fn of(target: &Target) -> ServerKey {
+        ServerKey {
+            destination: target.ssh.destination.clone(),
+            host: target.host.clone(),
+            udp: target.udp,
+            tcp: target.tcp,
+            fingerprint: target.fingerprint.0,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -326,14 +339,13 @@ impl Pool {
     /// A usable connection to `target`: the current one, or a new one from a race planned
     /// with `config` (its `race`, `keepalive` and `path_memory`).
     pub async fn get(&self, target: &Target, config: &ClientConfig) -> Result<Arc<Conn>, RaceError> {
-        let key = ServerKey {
-            destination: target.ssh.destination.clone(),
-            host: target.host.clone(),
-            udp: target.udp,
-            tcp: target.tcp,
-            fingerprint: target.fingerprint.0,
-        };
-        let slot_ref = self.slots.lock().unwrap().entry(key).or_default().clone();
+        let slot_ref = self
+            .slots
+            .lock()
+            .unwrap()
+            .entry(ServerKey::of(target))
+            .or_default()
+            .clone();
         let asked = std::time::Instant::now();
         let mut slot = slot_ref.lock().await;
         if let Some(c) = slot.current.as_ref().filter(|c| c.usable()) {
@@ -515,7 +527,7 @@ impl Pool {
                     let quic_keepalive = (conn.transport() == Transport::Quic).then_some(plan.quic.keep_alive);
                     conn.set_keepalive(quic_keepalive, ctx.keepalive);
                     *conn.attempts.lock().unwrap() = attempts(ctx, planned, attempt.transport, race.errors());
-                    self.conclude(race, ctx, attempt.transport, unanswered);
+                    self.conclude(race, ctx, &conn, unanswered);
                     return Ok(conn);
                 }
                 Ok(Err(e)) => {
@@ -591,13 +603,18 @@ impl Pool {
 
     /// The race is decided: let the attempts still running finish, and record what they
     /// show (a late success, or a failure, now that another transport worked). `marked`:
-    /// transports already recorded as failed by this race.
-    fn conclude(&self, race: Race, ctx: &Ctx, winner: Transport, marked: Vec<Transport>) {
+    /// transports already recorded as failed by this race. A late success of a better
+    /// transport than the winner's (QUIC after TLS won while a QUIC packet was lost) is not
+    /// thrown away: the sessions move to it, as after a background probe (m2.md 3.6), and it
+    /// is the one to start with next time.
+    fn conclude(&self, race: Race, ctx: &Ctx, won: &Arc<Conn>, marked: Vec<Transport>) {
         let pool = self.me.clone();
         let ctx = ctx.clone();
+        let winner = won.transport();
+        let old = Arc::downgrade(won);
         let mut worked = vec![winner];
         let mut failed: Vec<Transport> = marked;
-        race.conclude(move |attempt, outcome| {
+        race.conclude_keeping(move |attempt, outcome| {
             record_attempt(
                 attempt,
                 match &outcome {
@@ -605,24 +622,87 @@ impl Pool {
                     Err(kind) => kind.as_str(),
                 },
             );
-            let Some(pool) = pool.upgrade() else { return };
-            if pool.generation() != ctx.generation {
-                return;
-            }
             let t = attempt.transport;
-            let unix = paths::now();
-            match outcome {
-                Ok(handshake) if !worked.contains(&t) => {
+            let pool = pool.upgrade().filter(|p| p.generation() == ctx.generation);
+            match (pool, outcome) {
+                (Some(pool), Ok((connection, handshake))) if !worked.contains(&t) => {
                     worked.push(t);
+                    let unix = paths::now();
                     ctx.update(|e| e.succeeded(t, attempt.port, handshake, unix));
+                    if rank(t) > rank(winner) {
+                        tokio::spawn(pool.late(connection, attempt, handshake, ctx.clone(), old.clone()));
+                    } else {
+                        connection.close(ErrorCode::NO_ERROR, "");
+                    }
                 }
-                Err(kind) if kind.recorded() && !worked.contains(&t) && !failed.contains(&t) => {
+                (_, Ok((connection, _))) => connection.close(ErrorCode::NO_ERROR, ""),
+                (Some(_), Err(kind)) if kind.recorded() && !worked.contains(&t) && !failed.contains(&t) => {
                     failed.push(t);
+                    let unix = paths::now();
                     ctx.update(|e| e.failed(t, kind, unix));
                 }
                 _ => {}
             }
         });
+    }
+
+    /// `connection` of `attempt`, a better transport than that of `old`, came out of a race
+    /// after `old` won it: say hello on it and move the sessions over ([`Pool::adopt`]).
+    async fn late(
+        self: Arc<Pool>,
+        connection: Connection,
+        attempt: Attempt,
+        handshake: Duration,
+        ctx: Ctx,
+        old: Weak<Conn>,
+    ) {
+        let conn = match tokio::time::timeout(ATTACH_TIMEOUT, Conn::hello_offering(connection, ctx.offer)).await {
+            Ok(Ok(conn)) => conn,
+            Ok(Err(e)) => {
+                log::debug(format_args!("{} port {}, late: {e}", attempt.transport, attempt.port));
+                return;
+            }
+            Err(_) => return,
+        };
+        if self.generation() != ctx.generation {
+            goodbye(&conn, "").await;
+            return;
+        }
+        let slot = self
+            .slots
+            .lock()
+            .unwrap()
+            .get(&ServerKey::of(&ctx.target))
+            .map(Arc::downgrade)
+            .unwrap_or_default();
+        self.adopt(&slot, &old, conn, attempt, handshake, &ctx, "late").await;
+    }
+
+    /// `conn`, made by `attempt`, works: move the sessions of `old` to it when it is the
+    /// better transport ([`Pool::upgrade`]), and make it the one to start with next time on
+    /// this network; else record that it works and close it (`why`).
+    #[allow(clippy::too_many_arguments)]
+    async fn adopt(
+        &self,
+        slot: &Weak<tokio::sync::Mutex<Slot>>,
+        old: &Weak<Conn>,
+        conn: Arc<Conn>,
+        attempt: Attempt,
+        handshake: Duration,
+        ctx: &Ctx,
+        why: &str,
+    ) {
+        let quic_keepalive = (conn.transport() == Transport::Quic).then_some(ctx.keepalive);
+        conn.set_keepalive(quic_keepalive, ctx.keepalive);
+        let (t, unix) = (attempt.transport, paths::now());
+        match self.upgrade(slot, old, conn, ctx) {
+            // The sessions use it now: the one to start with next time
+            Ok(()) => ctx.update(|e| e.won(t, attempt.port, handshake, unix)),
+            Err(conn) => {
+                ctx.update(|e| e.succeeded(t, attempt.port, handshake, unix));
+                goodbye(&conn, why).await;
+            }
+        }
     }
 
     /// Start the monitor of `conn`, the current connection of `slot`.
@@ -657,10 +737,10 @@ impl Pool {
             .insert((ctx.host.clone(), ctx.network.clone()), at);
     }
 
-    /// A background probe found `new`, a better transport than `old`: make it the slot's
-    /// connection and move the sessions over (m2.md 3.6). Gives `new` back when it is not
-    /// used: `old` is no longer current or carries no session, or an upgrade happened within
-    /// the last minute.
+    /// A background probe, or a race's late answer, found `new`, a better transport than
+    /// `old`: make it the slot's connection and move the sessions over (m2.md 3.6). Gives
+    /// `new` back when it is not used: `old` is no longer current or carries no session, or
+    /// an upgrade happened within the last minute.
     fn upgrade(
         &self,
         slot: &Weak<tokio::sync::Mutex<Slot>>,
@@ -1068,17 +1148,8 @@ impl Probe {
             Ok((conn, attempt, handshake)) => {
                 record_event("probe", json!({"transport": transport.to_string(), "outcome": "ok"}));
                 log::debug(format_args!("{transport} works here again"));
-                let quic_keepalive = (conn.transport() == Transport::Quic).then_some(self.ctx.keepalive);
-                conn.set_keepalive(quic_keepalive, self.ctx.keepalive);
-                match pool.upgrade(&self.slot, &self.old, conn, &self.ctx) {
-                    // The sessions use it now: the one to start with next time
-                    Ok(()) => self.ctx.update(|e| e.won(transport, attempt.port, handshake, unix)),
-                    Err(conn) => {
-                        self.ctx
-                            .update(|e| e.succeeded(transport, attempt.port, handshake, unix));
-                        goodbye(&conn, "probe").await;
-                    }
-                }
+                pool.adopt(&self.slot, &self.old, conn, attempt, handshake, &self.ctx, "probe")
+                    .await;
             }
             Err(kind) => {
                 record_event(

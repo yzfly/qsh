@@ -8,6 +8,13 @@ name: Packaging
 on:
   # Manual only while the repository is private (Actions minutes); run before every release
   workflow_dispatch:
+    inputs:
+      jobs:
+        description: >-
+          Jobs to run after the source tarballs: all, or some of debian debian-archive
+          fedora-archive fedora alpine arch homebrew (space-separated), to retry a few
+        type: string
+        default: all
 
 permissions:
   contents: read
@@ -44,6 +51,7 @@ jobs:
   debian:
     name: ${{ matrix.image }}
     needs: source
+    if: ${{ !inputs.jobs || inputs.jobs == 'all' || contains(format(' {0} ', inputs.jobs), ' debian ') }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:
@@ -80,6 +88,7 @@ jobs:
   debian-archive:
     name: ${{ matrix.image }} (archive crates)
     needs: source
+    if: ${{ !inputs.jobs || inputs.jobs == 'all' || contains(format(' {0} ', inputs.jobs), ' debian-archive ') }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     continue-on-error: ${{ matrix.image == 'debian:unstable' }}
@@ -112,6 +121,7 @@ jobs:
   fedora-archive:
     name: fedora:rawhide (Fedora crates)
     needs: source
+    if: ${{ !inputs.jobs || inputs.jobs == 'all' || contains(format(' {0} ', inputs.jobs), ' fedora-archive ') }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -136,6 +146,7 @@ jobs:
   fedora:
     name: fedora:latest
     needs: source
+    if: ${{ !inputs.jobs || inputs.jobs == 'all' || contains(format(' {0} ', inputs.jobs), ' fedora ') }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -160,6 +171,7 @@ jobs:
   alpine:
     name: alpine:latest
     needs: source
+    if: ${{ !inputs.jobs || inputs.jobs == 'all' || contains(format(' {0} ', inputs.jobs), ' alpine ') }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -184,6 +196,7 @@ jobs:
   arch:
     name: archlinux:latest
     needs: source
+    if: ${{ !inputs.jobs || inputs.jobs == 'all' || contains(format(' {0} ', inputs.jobs), ' arch ') }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -208,6 +221,7 @@ jobs:
   homebrew:
     name: homebrew (macos-latest)
     needs: source
+    if: ${{ !inputs.jobs || inputs.jobs == 'all' || contains(format(' {0} ', inputs.jobs), ' homebrew ') }}
     runs-on: macos-latest
     timeout-minutes: 60
     steps:

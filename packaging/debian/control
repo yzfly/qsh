@@ -39,6 +39,12 @@ Build-Depends:
  librust-tokio-rustls-dev (<< 0.27) <!pkg.qsh.vendored>,
  librust-zeroize-dev (>= 1.7) <!pkg.qsh.vendored>,
  librust-zeroize-dev (<< 2) <!pkg.qsh.vendored>,
+ librust-vt100-dev (>= 0.16) <!pkg.qsh.vendored>,
+ librust-vt100-dev (<< 0.17) <!pkg.qsh.vendored>,
+ librust-ruzstd-dev (>= 0.8.1) <!pkg.qsh.vendored>,
+ librust-ruzstd-dev (<< 0.9) <!pkg.qsh.vendored>,
+ librust-twox-hash-dev (>= 2) <!pkg.qsh.vendored>,
+ librust-twox-hash-dev (<< 3) <!pkg.qsh.vendored>,
 Standards-Version: 4.7.2
 Rules-Requires-Root: no
 Homepage: https://github.com/yzfly/qsh

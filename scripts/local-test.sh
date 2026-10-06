@@ -12,8 +12,8 @@
 #   4. --fuzz N: every fuzz target for N seconds, when nightly and cargo-fuzz are installed
 #
 # Builds are queued on /tmp/heavy.lock at low priority with -j 2 and CARGO_INCREMENTAL=0, after a
-# check for 3 GiB of free disk space. Nothing outside the repository's target/ and one temporary
-# directory is written; no process this script did not start is killed.
+# check for 3 GiB of free disk space. Nothing outside the repository's target/ (and the --tmp
+# directory, if given) is written; no process this script did not start is killed.
 #
 # Usage: scripts/local-test.sh [OPTIONS]
 #   --chaos                 run step 3 (needs passwordless sudo; off by default)
@@ -30,8 +30,12 @@
 #   --pipe-runs N           its runs over the default transport (default 20)
 #   --pipe-runs-other N     its runs over tls and over ssh each (default 2; 0 to skip)
 #   --e2e-only LIST         step 2 scenarios whose names contain one of LIST (comma-separated)
-#   --tmp DIR               parent of the temporary directory (default /tmp; keep it short: unix
-#                           socket paths are limited to about 100 bytes)
+#   --tmp DIR               parent of the run's directory (default target/qshl, mode 0700, or /tmp
+#                           when that path is longer than 60 bytes: the daemon's unix socket
+#                           below it must fit in 107). Below a directory others can write, such
+#                           as /tmp, the daemon upgrade refuses the test HOMEs' qsh-server
+#                           (security.md 4.8) and the run passes the test hook
+#                           QSH_TEST_TRUSTED_DIR to the daemons
 #   --keep                  keep the temporary directory
 #   -v, --verbose           stream every command's output, not only failures
 #   -h, --help
@@ -52,7 +56,7 @@ FUZZ=0
 SKIP_STATIC=0
 SKIP_E2E=0
 KEEP=0
-TMPBASE=/tmp
+TMPBASE=
 PIPE_MIB=50
 PIPE_RUNS=20
 PIPE_RUNS_OTHER=2
@@ -98,9 +102,28 @@ export QSHL_CHAOS_TESTS QSHL_CHAOS_PROFILES QSHL_CHAOS_STRICT
 # shellcheck source=scripts/lib/chaos-local.sh
 . "$QSHL_REPO/scripts/lib/chaos-local.sh"
 
+# The run's directory: by default in target/, where every directory above the test HOMEs
+# belongs to the user (or root) and nobody else can write, like a real home directory
+if [ -z "$TMPBASE" ]; then
+    TMPBASE="$QSHL_REPO/target/qshl"
+    if [ ${#TMPBASE} -gt 60 ]; then
+        qshl_say "$TMPBASE is too long for the daemon's unix socket below it: using /tmp"
+        TMPBASE=/tmp
+    else
+        mkdir -p "$TMPBASE" && chmod 700 "$TMPBASE" || exit 2
+    fi
+fi
 ROOT=$(mktemp -d "$TMPBASE/qshl-rig-XXXXXX") || exit 2
 chmod 700 "$ROOT"
 FINISHED=0
+# Under a directory the daemon upgrade does not accept above its program (m2.md 10.3 step 1):
+# the test hook that makes it look no higher than the run's directory
+QSHL_TRUSTED_DIR=
+if qshl_untrusted_above "$ROOT"; then
+    QSHL_TRUSTED_DIR=$ROOT
+    qshl_say "$TMPBASE can be written by others: the daemons get QSH_TEST_TRUSTED_DIR=$ROOT"
+fi
+export QSHL_TRUSTED_DIR
 
 finish() {
     local rc=$?
@@ -246,6 +269,7 @@ step_e2e() {
         --results "$QSHL_RESULTS" --tmp "$TMPBASE" --self-install --test-hooks
         --pipe-mib "$PIPE_MIB" --pipe-runs "$PIPE_RUNS" --pipe-runs-other "$PIPE_RUNS_OTHER")
     [ -n "$E2E_ONLY" ] && args+=(--only "$E2E_ONLY")
+    [ -n "$QSHL_TRUSTED_DIR" ] && args+=(--trust-root)
     [ "$KEEP" = 1 ] && args+=(--keep)
     local before
     before=$(wc -l <"$QSHL_RESULTS")

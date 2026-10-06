@@ -61,6 +61,25 @@ const ACK_DELAY: Duration = Duration::from_millis(200);
 /// unacknowledged output, and prompt ACKs keep what is queued ahead of an interrupt small.
 const ACK_BYTES_SNAPSHOT: u64 = 16384;
 const ACK_DELAY_SNAPSHOT: Duration = Duration::from_millis(50);
+/// … but at most one ACK per this long for the bytes: output that arrives in a burst (several
+/// messages, often from one packet; compressed frames of 64 KiB of output each) would
+/// otherwise get an ACK per message, each in a packet of its own. They tell the server no more
+/// than one (its rate samples span a quarter of the round trip at least), and every extra
+/// packet on a lossy path is one more that input typed behind it may wait for.
+const ACK_SPACING: Duration = Duration::from_millis(10);
+/// Tail probes behind input, on QUIC: while typed input is not acknowledged, a PING on the
+/// control stream every quarter round trip (at least [`TAIL_PROBE_MIN`] apart, at most
+/// [`TAIL_PROBES`]), from a quarter round trip after it when the server skips output (a skip
+/// snapshot or a gap arrived this recently: the input interrupts a flood), else from once its
+/// acknowledgement is overdue (a round trip and a quarter). The connection is often idle in
+/// both directions then (the server holds its output for the program's reaction), so a lost
+/// packet of the input, or one before it on the same stream, would wait for QUIC's probe
+/// timeout and its exponential backoff (3.8 s for a Ctrl-C on the terrible profile, measured);
+/// the packets behind it let QUIC find it lost by its time threshold instead, and their
+/// acknowledgements stop the backoff (m2.md 6.4, "Tail probes").
+const SKIPPING_RECENTLY: Duration = Duration::from_secs(5);
+const TAIL_PROBE_MIN: Duration = Duration::from_millis(20);
+const TAIL_PROBES: u32 = 12;
 /// Local input is taken while less than this waits in the outbox: an ACK queued behind input
 /// waits for little more than this.
 const OUTBOX_INPUT: usize = 64 * 1024;
@@ -859,6 +878,14 @@ impl Session {
         // What the last ACK said, for both output streams
         let mut acked = (state.output.received(), state.errors.received());
         let mut ack_due: Option<Instant> = None;
+        // When the last ACK of output was queued
+        let mut last_ack = Instant::now().checked_sub(ACK_SPACING).unwrap_or_else(Instant::now);
+        // When the server last skipped output (a skip snapshot or a gap), and the tail probes
+        // behind input typed meanwhile: when the next is due, how many may follow
+        let mut skipped_at: Option<Instant> = None;
+        let mut probe: Option<(Instant, u32)> = None;
+        let quic = conn.connection.quic_connection().is_some();
+        let probe_every = |conn: &Conn| (conn.rtt().unwrap_or(Duration::from_millis(100)) / 4).max(TAIL_PROBE_MIN);
         let (ack_bytes, ack_delay) = if accept {
             (ACK_BYTES_SNAPSHOT, ACK_DELAY_SNAPSHOT)
         } else {
@@ -969,8 +996,14 @@ impl Session {
                             self.status.lock().unwrap().bytes_in += n;
                             let unacked = (state.output.received() - acked.0) + (state.errors.received() - acked.1);
                             if unacked >= ack_bytes {
-                                ack(&mut outbox, state, &mut acked);
-                                ack_due = None;
+                                let spaced = last_ack + ACK_SPACING;
+                                if Instant::now() >= spaced {
+                                    ack(&mut outbox, state, &mut acked);
+                                    ack_due = None;
+                                    last_ack = Instant::now();
+                                } else {
+                                    ack_due = Some(ack_due.map_or(spaced, |due| due.min(spaced)));
+                                }
                             } else {
                                 ack_due.get_or_insert_with(|| Instant::now() + ack_delay);
                             }
@@ -1065,6 +1098,7 @@ impl Session {
                                 }
                                 state.output = Inbound::at(offset);
                                 if skipped > 0 {
+                                    skipped_at = Some(Instant::now());
                                     {
                                         let mut status = self.status.lock().unwrap();
                                         status.skipped = status.skipped.saturating_add(skipped);
@@ -1075,6 +1109,7 @@ impl Session {
                                 // Acknowledged at once: the server sends no other snapshot before
                                 ack(&mut outbox, state, &mut acked);
                                 ack_due = None;
+                                last_ack = Instant::now();
                             }
                         }
                         Message::OutputGap { from, to } => {
@@ -1086,6 +1121,7 @@ impl Session {
                                 return Ok(sequence_error(&mut send, &mut outbox).await);
                             }
                             state.output = Inbound::at(to);
+                            skipped_at = Some(Instant::now());
                             transcript::record(Record::Gap {
                                 session: &state.session,
                                 from,
@@ -1143,6 +1179,15 @@ impl Session {
                             }
                             outbox.push(m);
                         }
+                        if quic && probe.is_none() {
+                            let every = probe_every(conn);
+                            let first = if skipped_at.is_some_and(|t| t.elapsed() < SKIPPING_RECENTLY) {
+                                every
+                            } else {
+                                every * 5
+                            };
+                            probe = Some((Instant::now() + first, TAIL_PROBES));
+                        }
                     }
                     Some(Input::Resize(size)) => {
                         state.size = size;
@@ -1158,16 +1203,28 @@ impl Session {
                     }
                     None => state.input_closed = true,
                 },
+                // Behind input typed during a flood, until it is acknowledged
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(probe.map_or_else(Instant::now, |p| p.0))), if probe.is_some() => {
+                    probe = match probe {
+                        Some((_, left)) if left > 0 && !state.input.is_empty() => {
+                            conn.ping();
+                            Some((Instant::now() + probe_every(conn), left - 1))
+                        }
+                        _ => None,
+                    };
+                }
                 // ACKs on time (7.5): 50 ms matter on an attachment that accepts snapshots
                 _ = tokio::time::sleep_until(tokio::time::Instant::from_std(ack_due.unwrap_or_else(Instant::now))), if ack_due.is_some() => {
                     ack(&mut outbox, state, &mut acked);
                     ack_due = None;
+                    last_ack = Instant::now();
                 }
                 _ = tick.tick() => {
                     let now = Instant::now();
                     if ack_due.is_some_and(|t| now >= t) {
                         ack(&mut outbox, state, &mut acked);
                         ack_due = None;
+                        last_ack = now;
                     }
                     if conn.connection.is_closed() {
                         return Ok(End::Lost("connection closed".into()));

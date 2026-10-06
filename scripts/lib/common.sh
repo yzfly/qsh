@@ -52,6 +52,25 @@ qshl_disk_ok() {
     return 1
 }
 
+# True when a directory above DIR could hold someone else's program in place of one below it,
+# as the daemon upgrade judges it (m2.md 10.3 step 1): owned by neither root nor the user,
+# writable by every user (like /tmp, sticky or not), or by a group other than the user's own
+qshl_untrusted_above() {
+    local d me private owner group mode
+    me=$(id -u)
+    private=
+    [ "$(id -gn)" = "$(id -un)" ] && private=$(id -gn)
+    d=$(cd "$1" && pwd -P) || return 0
+    while [ "$d" != / ]; do
+        d=$(dirname "$d")
+        read -r owner group mode < <(stat -c '%u %G %a' "$d") || return 0
+        case $owner in 0 | "$me") ;; *) return 0 ;; esac
+        case $mode in *[2367]) return 0 ;; esac
+        case $mode in *[2367]?) [ -n "$private" ] && [ "$group" = "$private" ] || return 0 ;; esac
+    done
+    return 1
+}
+
 # The build queue of this machine: one heavy job at a time, at low priority (AGENTS.md)
 qshl_heavy() {
     flock /tmp/heavy.lock nice -n 10 "$@"

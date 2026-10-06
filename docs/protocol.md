@@ -442,7 +442,13 @@ carrying the same `Data`, without waiting for anything else. `Data` is opaque to
 a sender SHOULD put a monotonic timestamp in microseconds there, so that the round-trip time is
 the current time minus `Data` of the PONG. A PONG that matches no outstanding PING is ignored.
 An endpoint SHOULD NOT send more than one PING per second on average, and MAY ignore PINGs that
-arrive faster than ten per second.
+arrive faster than ten per second. The exception is a short run of PINGs that puts packets
+behind latency-critical data on QUIC, so that QUIC detects a loss of that data by its time
+threshold rather than by its probe timeout: the reference implementation sends at most 12, a
+quarter round trip (and at least 20 ms) apart, behind the snapshot that answers input and
+behind input typed while the server skips output, until that data is acknowledged (m2.md
+6.4). Such PINGs serve their purpose through the transport's acknowledgement of their
+packets, whether or not they are answered.
 
 ### 5.6 PATH_INFO (0x05)
 
@@ -937,7 +943,10 @@ the oldest unacknowledged byte arrived, whichever comes first, and MUST send it 
 receiving data. The server SHOULD acknowledge input within 200 ms. ACKs are not acknowledged.
 A client that set ACCEPT_SNAPSHOT SHOULD acknowledge output every 16 384 bytes or 50 ms while
 output arrives continuously: the server's pacing (section 7.6) counts unacknowledged bytes, so
-prompt ACKs keep the amount queued ahead of an interrupt's effect small.
+prompt ACKs keep the amount queued ahead of an interrupt's effect small. It need not send more
+than one ACK per 10 ms for this: output that arrives in a burst (several messages, often from
+one packet) is acknowledged once, not once per message, since every extra packet on a lossy
+path is one more that input typed behind it on the same stream may have to wait for.
 
 ### 7.6 Replay buffers and output pacing
 
@@ -1235,11 +1244,15 @@ RECOMMENDED (the reference implementation's rules; `U` = output neither acknowle
 skipped, `(end − last_ack) − Σ(skipped ∩ (last_ack, end])` as in section 7.6; `B` = output not
 yet sent, `end − sent_end`; `T` and the window as in section 7.6):
 
-- **One at a time**: at most one snapshot is in flight on an attachment (sent, and no ACK with
-  `Received` ≥ its `Offset` yet). A trigger that fires meanwhile is not lost: once the snapshot
-  in flight is acknowledged, one fresh snapshot follows (the input trigger holds the output
-  until then; a resync snapshot waits; the backlog trigger has its hysteresis anyway). Several
-  snapshots in a row would only queue screens behind each other.
+- **One at a time, and one for input**: at most one snapshot is in flight on an attachment
+  (sent, and no ACK with `Received` ≥ its `Offset` yet), plus at most one sent by the input
+  trigger while another is in flight. A backlog or resync trigger that fires meanwhile is not
+  lost: once the snapshot in flight is acknowledged, one fresh snapshot follows (a resync
+  snapshot waits; the backlog trigger has its hysteresis anyway). Several backlog snapshots in a
+  row would only queue screens behind each other. The input trigger does not wait: its
+  snapshot goes right behind the one in flight, instead of a round trip and the queue ahead of
+  the first one later (on a 270 ms path that wait was most of an interrupt's latency); with
+  two in flight it holds the output until one of them is acknowledged.
 - **Backlog**: `U > max(2 s × T, 256 KiB)` and `B > 0` (there is output to skip), once the
   attachment has at least 1 s of delivery rate samples (500 ms on QUIC), and subject to the
   hysteresis.
@@ -1247,11 +1260,11 @@ yet sent, `end − sent_end`; `T` and the window as in section 7.6):
   the backlog at once and takes the snapshot when the program's output pauses for 20 ms
   (measured from the input), or after 100 ms, whichever comes first, so that the snapshot shows
   the program's reaction (an interrupt, a key typed into a pager). The input trigger is **not**
-  subject to the hysteresis nor to the sampling requirement: an interrupt typed right after a
-  backlog snapshot would otherwise wait for that snapshot's acknowledgement and up to a second,
-  far beyond the interrupt latency this mechanism exists for. One input episode gives at most
-  one snapshot; INPUT that arrives while the server already waits for the program's reaction
-  does not restart the wait.
+  subject to the hysteresis, nor to the sampling requirement, nor to a snapshot in flight (see
+  "One at a time" above): an interrupt typed right after a backlog snapshot would otherwise
+  wait for that snapshot's acknowledgement and up to a second, far beyond the interrupt latency
+  this mechanism exists for. One input episode gives at most one snapshot; INPUT that arrives
+  while the server already waits for the program's reaction does not restart the wait.
 - **Hysteresis** (backlog trigger only): no new backlog snapshot before the previous snapshot
   has been acknowledged (`Received` ≥ its `Offset`) and 1 s has passed since it was sent.
 
@@ -1266,10 +1279,14 @@ resync snapshot that cannot be made is replaced by the redraw alone, and the bac
 does not fire again before more output arrives (making the same impossible snapshot again
 would only cost the same again).
 
-Output that falls out of the replay buffer before it was sent is skipped with OUTPUT_GAP at
-once, whatever is in flight (section 7.6); on an attachment that takes snapshots the server
-follows such a gap with a resync snapshot once it has sent the output after it (instead of
-making the program redraw, section 7.7). Resync snapshots (here and in section 7.8.6) are not
+Output that falls out of the replay buffer before it was sent is skipped with OUTPUT_GAP
+right before the output that follows it, whatever is in flight (skipped bytes are not in
+flight, section 7.6). A server SHOULD NOT send such a gap each time the buffer's base moves
+while its window is full: during a flood that is a gap for every chunk the program writes,
+thousands of tiny packets a second that fill the queues of a slow path ahead of the
+interrupt. On an attachment that takes snapshots the server follows such a gap with a resync
+snapshot once it has sent the output after it (instead of making the program redraw, section
+7.7). Resync snapshots (here and in section 7.8.6) are not
 subject to the hysteresis.
 
 #### 7.8.6 Attach

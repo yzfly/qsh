@@ -12,7 +12,8 @@
 # - Processes are killed by namespace (`ip netns pids`) or by pid, never by name or user.
 # - The cleanup (also on Ctrl-C and errors) stops the test, deletes the namespaces, and compares
 #   the host's links, addresses, routes, rules, qdiscs, nftables ruleset and forwarding sysctls
-#   with a snapshot taken before; a difference is a loud failure.
+#   with a snapshot taken before; a difference is a loud failure. The elements of sets that
+#   change by themselves (fail2ban bans, timeouts: qshl_nft_stable) are not compared.
 # - Nothing is installed: missing tools skip the step (or the scenarios that need them).
 
 QSHL_CHAOS_PREFIX=${QSHL_CHAOS_PREFIX:-qshl-$$}
@@ -21,6 +22,27 @@ QSHL_CHAOS_DIR=
 QSHL_CHAOS_PID=
 QSHL_CHAOS_BASELINE=
 QSHL_SYS_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# `nft -s list ruleset` on stdin without the elements of sets that change by themselves: those
+# of fail2ban's tables (f2b-*), sshguard's and CrowdSec's, which ban addresses from the internet
+# at any time, and of any set with the dynamic or timeout flag or a default timeout (filled by
+# rules, emptied by timers). Their tables, chains, rules and set definitions are still compared.
+qshl_nft_stable() {
+    awk '
+        /^table / { tbl = $3; dyn_tbl = (tbl ~ /^(f2b-|sshguard|crowdsec)/) }
+        skipping { if (index($0, "}")) skipping = 0; next }
+        /^\t(set|map) / { inset = 1; dyn = dyn_tbl }
+        inset && /^\t\tflags .*(dynamic|timeout)/ { dyn = 1 }
+        inset && /^\t\ttimeout / { dyn = 1 }
+        # Left out, not replaced: an empty set has no elements line at all
+        inset && dyn && /^\t\telements = / {
+            if (!index($0, "}")) skipping = 1
+            next
+        }
+        /^\t}/ { inset = 0 }
+        { print }
+    '
+}
 
 # The host's network state, for the before/after comparison (counters and timers left out)
 qshl_host_snapshot() {
@@ -38,11 +60,12 @@ qshl_host_snapshot() {
     echo "## qdiscs"
     tc qdisc show
     echo "## nftables"
-    if command -v nft >/dev/null; then sudo -n nft -s list ruleset; fi
+    if command -v nft >/dev/null; then sudo -n nft -s list ruleset | qshl_nft_stable; fi
     echo "## sysctls"
     sysctl net.ipv4.ip_forward net.ipv6.conf.all.forwarding net.ipv4.conf.all.promote_secondaries
     echo "## namespaces"
-    ip netns list
+    # Not those of the local rigs (ours is checked by name; other runs come and go meanwhile)
+    ip netns list | grep -Ev '^qshl-[0-9]+-[crs]( |$)' || true
 }
 
 # Why the chaos step cannot run here (printed), or nothing
@@ -66,6 +89,10 @@ qshl_chaos_env() {
     QSHL_CHAOS_ENV=(env -i "PATH=$QSHL_SYS_PATH" LANG=C.UTF-8 QSH_CHAOS=1 QSH_CHAOS_LOCAL=1
         "QSH_CHAOS_NS_PREFIX=$QSHL_CHAOS_PREFIX" "QSH_CHAOS_USER=$(id -un)"
         "QSH_CHAOS_DIR=$QSHL_CHAOS_DIR" "QSH_CHAOS_NETNS=$QSHL_REPO/tests/chaos/netns.sh")
+    # Below a directory others can write (local-test.sh): the daemons' upgrade test hook
+    if [ -n "${QSHL_TRUSTED_DIR:-}" ]; then
+        QSHL_CHAOS_ENV+=("QSH_CHAOS_TRUSTED_DIR=$QSHL_CHAOS_DIR")
+    fi
 }
 
 # Our namespaces that exist

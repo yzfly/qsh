@@ -9,7 +9,10 @@
 #   DEB_BUILD_PROFILES=pkg.qsh.vendored dpkg-buildpackage -us -uc
 #
 # The cargo feature self-install (downloads release binaries at runtime) is off by default and
-# stays off here: Debian's qsh never fetches code from the network.
+# stays off here: Debian's qsh never fetches code from the network. The default features stay
+# on: zstd (output compression) needs ruzstd >= 0.8 (the first with an encoder) and twox-hash 2,
+# and the screen model for catch-up vt100 0.16, all in the archive since forky; a backport to
+# trixie (ruzstd 0.7.3, twox-hash 1.6.3, vt100 0.15) builds with pkg.qsh.vendored.
 
 include /usr/share/dpkg/pkg-info.mk
 include /usr/share/dpkg/architecture.mk

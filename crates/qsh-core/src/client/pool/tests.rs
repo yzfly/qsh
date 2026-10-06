@@ -566,7 +566,8 @@ async fn liveness_rules_per_transport() {
 }
 
 /// A QUIC attempt marked as failing because a slower transport won the race is cleared at
-/// once when its answer comes after all.
+/// once when its answer comes after all; with no session on the winner yet, nothing moves,
+/// and the winner stays the one to start with.
 #[tokio::test(start_paused = true)]
 async fn a_late_answer_clears_the_mark_of_a_lost_race() {
     let fake = Fake::new();
@@ -576,12 +577,109 @@ async fn a_late_answer_clears_the_mark_of_a_lost_race() {
     let conn = pool.get(&target(&[]), &ClientConfig::new("box")).await.unwrap();
     assert_eq!(conn.transport(), Transport::Tls);
     assert!(entry(&pool, NET).blocked(Transport::Quic, paths::now()));
+    // Nobody attached on it: only the slot holds it
+    let tls = Arc::downgrade(&conn);
+    drop(conn);
     tokio::time::sleep(S(2)).await;
     let e = entry(&pool, NET);
     assert!(!e.blocked(Transport::Quic, paths::now()), "{e:?}");
     assert!(e.transport(Transport::Quic).unwrap().ok.is_some());
     // TLS won the last race: on the same day it goes first next time
     assert_eq!(e.last(), Some(Transport::Tls));
+    assert!(!tls.upgrade().unwrap().retiring());
+    assert_eq!(pool.connections()[0].1, Transport::Tls);
+}
+
+/// m2.md 3.6: when a better transport answers after a slower one won the race (a lost QUIC
+/// packet costs QUIC a second, and TLS wins), the sessions move to it at once, and it is the
+/// one to start with next time.
+#[tokio::test(start_paused = true)]
+async fn a_late_better_transport_takes_the_sessions_over() {
+    let fake = Fake::new();
+    fake.set(Transport::Quic, 60443, Behaviour::Connect(MS(1300)));
+    fake.set(Transport::Tls, 60443, Behaviour::Connect(MS(540)));
+    let pool = pool(&fake, &network(NET));
+    let config = ClientConfig::new("box");
+    let conn = pool.get(&target(&[]), &config).await.unwrap();
+    assert_eq!(conn.transport(), Transport::Tls);
+    // A session attached on it
+    let session = conn.clone();
+    tokio::time::sleep(S(2)).await;
+    assert!(session.retiring(), "the sessions leave TLS");
+    let e = entry(&pool, NET);
+    assert!(!e.blocked(Transport::Quic, paths::now()), "{e:?}");
+    assert_eq!(e.last(), Some(Transport::Quic));
+    let moved = pool.get(&target(&[]), &config).await.unwrap();
+    assert_eq!(moved.transport(), Transport::Quic);
+    // Once its sessions are gone, the old connection is closed
+    let old = Arc::downgrade(&conn);
+    drop((conn, session));
+    tokio::time::sleep(S(1)).await;
+    assert!(old.upgrade().is_none());
+    // The next race starts with QUIC
+    close(&moved).await;
+    fake.restart_log();
+    fake.set(Transport::Quic, 60443, Behaviour::Connect(MS(270)));
+    let conn = pool.get(&target(&[]), &config).await.unwrap();
+    assert_eq!(conn.transport(), Transport::Quic);
+    assert_eq!(fake.log()[0], (Transport::Quic, 60443, 0));
+}
+
+/// The chaos scenario `port-fallback` on a lossy 270 ms path (m2.md 5.3): UDP to the primary
+/// port is dropped, the extra port 61443 is open. The first race finds QUIC on 61443 and
+/// remembers it; the next one starts there at once, but a lost QUIC packet lets TLS on the
+/// primary port win; QUIC answers a second later and takes the sessions over, so that
+/// QUIC on 61443 stays the remembered winner.
+#[tokio::test(start_paused = true)]
+async fn quic_on_an_extra_port_stays_remembered_when_a_lost_packet_lets_tls_win() {
+    let fake = Fake::new();
+    fake.set(Transport::Quic, 61443, Behaviour::Connect(MS(270)));
+    fake.set(Transport::Tls, 60443, Behaviour::Connect(MS(540)));
+    fake.set(Transport::Tls, 61443, Behaviour::Connect(MS(540)));
+    let pool = pool(&fake, &network(NET));
+    let config = ClientConfig::new("box");
+    let t = target(&[(61443, true, true)]);
+    let conn = pool.get(&t, &config).await.unwrap();
+    assert_eq!(conn.transport(), Transport::Quic);
+    assert_eq!(
+        fake.log(),
+        [
+            (Transport::Quic, 60443, 0),
+            (Transport::Quic, 61443, 300),
+            (Transport::Tls, 60443, 400)
+        ]
+    );
+    tokio::time::sleep(S(9)).await;
+    let e = entry(&pool, NET);
+    assert_eq!(e.transport(Transport::Quic).unwrap().port, Some(61443));
+    assert_eq!(e.last(), Some(Transport::Quic));
+    assert!(e.transport(Transport::Quic).unwrap().fail.is_none(), "{e:?}");
+    close(&conn).await;
+
+    // `qsh attach`: QUIC on 61443 first, at once; its first packet is lost
+    fake.restart_log();
+    fake.set(Transport::Quic, 61443, Behaviour::Connect(MS(1300)));
+    let conn = pool.get(&t, &config).await.unwrap();
+    assert_eq!(conn.transport(), Transport::Tls, "TLS on the primary port wins");
+    assert_eq!(fake.log()[0], (Transport::Quic, 61443, 0));
+    let session = conn.clone();
+    tokio::time::sleep(S(2)).await;
+    assert!(session.retiring());
+    let e = entry(&pool, NET);
+    assert_eq!(e.last(), Some(Transport::Quic));
+    assert_eq!(e.transport(Transport::Quic).unwrap().port, Some(61443));
+    assert!(!e.blocked(Transport::Quic, paths::now()), "{e:?}");
+    let moved = pool.get(&t, &config).await.unwrap();
+    assert_eq!(moved.transport(), Transport::Quic);
+    drop((conn, session));
+    tokio::time::sleep(S(9)).await;
+    // And the next attach starts with it again
+    close(&moved).await;
+    fake.restart_log();
+    fake.set(Transport::Quic, 61443, Behaviour::Connect(MS(270)));
+    let conn = pool.get(&t, &config).await.unwrap();
+    assert_eq!(conn.transport(), Transport::Quic);
+    assert_eq!(fake.log()[0], (Transport::Quic, 61443, 0));
 }
 
 /// The chaos scenario `udp-blocked-memory` (S1), exactly: a session over QUIC; UDP is blocked

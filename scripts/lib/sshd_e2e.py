@@ -221,9 +221,10 @@ def contiguous(seq):
 
 
 class World:
-    def __init__(self, root, qsh, server, keep, copy=True):
+    def __init__(self, root, qsh, server, keep, copy=True, trust_root=False):
         self.root = root
         self.keep = keep
+        self.trust_root = trust_root
         self.sshd = None
         self.started = time.time()
         for d in (
@@ -278,6 +279,8 @@ class World:
             "XDG_STATE_HOME": self.p("srv/state"),
             "XDG_CONFIG_HOME": self.p("srv/config"),
             "QSH_SERVER_PORTS": f"{self.daemon_port}-{self.daemon_port}",
+            # Test hook: the daemon upgrade checks no directory above the run's (--trust-root)
+            **({"QSH_TEST_TRUSTED_DIR": self.root} if self.trust_root else {}),
         }
 
     def server_env(self, extra=None):
@@ -943,6 +946,12 @@ def main():
     ap.add_argument("--pipe-stop-early", action="store_true", help="stop the pipe runs after 3 failures")
     ap.add_argument("--self-install", action="store_true", help="the build has the self-install feature")
     ap.add_argument("--test-hooks", action="store_true", help="the build has the test-hooks feature")
+    ap.add_argument(
+        "--trust-root",
+        action="store_true",
+        help="the run's directory is below one others can write (/tmp): tell the daemons not to check "
+        "the directories above it for an upgrade (test hook QSH_TEST_TRUSTED_DIR, needs --test-hooks)",
+    )
     ap.add_argument("--only", default="", help="comma-separated scenario names")
     a = ap.parse_args()
 
@@ -950,7 +959,7 @@ def main():
     root = tempfile.mkdtemp(prefix="qshl-", dir=a.tmp)
     os.chmod(root, 0o700)
     log(f"directory {root}")
-    world = World(root, a.qsh, a.server, a.keep, copy=not a.no_copy)
+    world = World(root, a.qsh, a.server, a.keep, copy=not a.no_copy, trust_root=a.trust_root)
 
     def on_signal(signum, _frame):
         raise KeyboardInterrupt(f"signal {signum}")

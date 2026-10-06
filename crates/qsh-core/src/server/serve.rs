@@ -64,6 +64,15 @@ const MESSAGES_PER_TURN: usize = 256;
 const PENDING_PONGS: usize = 16;
 /// How long the final ACK after DETACH may take to write.
 const DETACH_ACK: Duration = Duration::from_secs(2);
+/// After the snapshot that answers input (m2.md 6.4), while it is not acknowledged, a PING on
+/// the control stream every quarter of the round trip (at least this far apart), at most
+/// [`TAIL_PROBES`] of them: on QUIC the packets after it make a lost packet of the snapshot (or
+/// of the output before it) be detected by QUIC's time threshold, about 9/8 of a round trip
+/// after it was sent, instead of by the probe timeout, which backs off exponentially and whose
+/// probes need not carry the lost data. Without traffic behind it, the interrupt's last packet
+/// is the tail of the connection.
+const TAIL_PROBE_MIN: Duration = Duration::from_millis(20);
+const TAIL_PROBES: u32 = 12;
 
 /// Open connections, for GOAWAY and the close on shutdown.
 #[derive(Debug, Default)]
@@ -244,6 +253,12 @@ impl Conn {
             }
             None => pacing::INITIAL_RATE_MUX,
         }
+    }
+
+    /// A PING behind the snapshot that answers input, on QUIC ([`TAIL_PROBES`]).
+    fn tail_probe(&self) {
+        let data = self.established.elapsed().as_micros() as u64;
+        let _ = self.control.send(Control::Send(Message::Ping { data }));
     }
 
     /// A PING for the round trip time, over the mux transports (QUIC has its own estimate).
@@ -749,9 +764,9 @@ struct Out {
     /// Skipped ranges (OUTPUT_GAP, SNAPSHOT) not yet passed by `last_ack`: neither in flight
     /// nor delivery (7.6).
     skipped: VecDeque<(u64, u64)>,
-    /// The snapshot in flight until an ACK reaches its offset: (offset, bytes). There is at
-    /// most one (m2.md 6.4).
-    snapshot: Option<(u64, u64)>,
+    /// The snapshots in flight until an ACK reaches their offsets: (offset, bytes), oldest
+    /// first. At most one, and a second for input sent while that one is in flight (m2.md 6.4).
+    snapshots: VecDeque<(u64, u64)>,
     /// The delivery rate `T`.
     rate: Rate,
     /// The compression policy, when `zstd` was negotiated (never for ERROR_OUTPUT).
@@ -768,7 +783,7 @@ impl Out {
             sent: start,
             last_ack: start,
             skipped: VecDeque::new(),
-            snapshot: None,
+            snapshots: VecDeque::new(),
             rate: Rate::new(initial_rate),
             squeeze: (zstd && stream == Stream::Output).then(Squeeze::new),
             encoder_faults: 0,
@@ -819,17 +834,22 @@ impl Out {
             .sum()
     }
 
-    /// The snapshot in flight: sent, and no ACK has reached its offset yet.
+    /// Snapshots in flight: sent, and no ACK has reached their offsets yet.
+    fn snapshots_in_flight(&self) -> usize {
+        self.snapshots.iter().filter(|s| self.last_ack < s.0).count()
+    }
+
+    /// A snapshot is in flight.
     fn snapshot_in_flight(&self) -> bool {
-        self.snapshot.is_some_and(|s| self.last_ack < s.0)
+        self.snapshots_in_flight() > 0
     }
 
     /// Output in flight (7.6): sent and neither acknowledged nor skipped,
     /// `(sent_end − last_ack) − Σ(skipped ∩ (last_ack, sent_end])`, and the data of the
-    /// snapshot not acknowledged yet.
+    /// snapshots not acknowledged yet.
     fn in_flight(&self) -> u64 {
-        let snapshot = self.snapshot.filter(|_| self.snapshot_in_flight()).map_or(0, |s| s.1);
-        self.sent - self.last_ack - self.skipped_unacked() + snapshot
+        let snapshots: u64 = self.snapshots.iter().filter(|s| self.last_ack < s.0).map(|s| s.1).sum();
+        self.sent - self.last_ack - self.skipped_unacked() + snapshots
     }
 
     /// `U` (protocol.md 7.8.5): output up to `end` neither acknowledged nor skipped.
@@ -864,9 +884,7 @@ impl Out {
             let waiting = self.end(session) > self.sent;
             self.rate.ack(Instant::now(), delivered, waiting, rtt);
             self.last_ack = received;
-            if self.snapshot.is_some_and(|s| received >= s.0) {
-                self.snapshot = None;
-            }
+            self.snapshots.retain(|s| s.0 > received);
             session.ack(self.stream, received);
         }
         Ok(())
@@ -1155,7 +1173,7 @@ async fn send_snapshot(
         });
     }
     out.skip(snapshot.offset);
-    out.snapshot = Some((snapshot.offset, snapshot.data.len() as u64));
+    out.snapshots.push_back((snapshot.offset, snapshot.data.len() as u64));
     catchup.taken(now, snapshot.offset);
     snapshot.redraw
 }
@@ -1338,6 +1356,10 @@ async fn terminal(
     // The last snapshot or compressed output sent: what an ERROR from the client may be about
     // (protocol.md 7.8.4)
     let mut encoded: Option<(&str, u64)> = None;
+    // Tail probes after the snapshot that answers input (QUIC): when the next one is due, and how
+    // many may still follow; armed once that snapshot is written
+    let mut probe: Option<(Instant, u32)> = None;
+    let mut probe_armed = false;
 
     // Messages are read by a task so that a partly read message is never lost to select!
     let (tx, mut rx) = mpsc::channel::<Result<Message, FramingError>>(64);
@@ -1400,7 +1422,8 @@ async fn terminal(
                 let out = &mut outs[0];
                 let end = out.end(session);
                 catchup.output(now, end);
-                let busy = out.snapshot_in_flight();
+                let in_flight = out.snapshots_in_flight();
+                let busy = in_flight > 0;
                 let stream = pacing::Stream {
                     unacked: out.unacked(end),
                     unsent: end - out.sent,
@@ -1408,7 +1431,7 @@ async fn terminal(
                     end,
                     rate: out.rate.rate(now),
                     sampled: out.rate.sampled(now),
-                    busy,
+                    snapshots: in_flight,
                 };
                 let step = catchup.step(now, &stream);
                 // A snapshot waits for the test link like output
@@ -1421,7 +1444,10 @@ async fn terminal(
                     }
                     Step::Snapshot | Step::Send if link.is_some() => wait = link,
                     Step::Snapshot => {
-                        redraw |= send_snapshot(session, model, out, catchup, conn.zstd, true, &mut batch).await
+                        let input = catchup.interrupted();
+                        redraw |= send_snapshot(session, model, out, catchup, conn.zstd, true, &mut batch).await;
+                        probe_armed |=
+                            input && quic && batch[before..].iter().any(|m| matches!(m, Message::Snapshot { .. }));
                     }
                     // Caught up after an attach or a gap: the resync snapshot, once no other
                     // is in flight
@@ -1441,19 +1467,12 @@ async fn terminal(
                 if i == 0 && held_output {
                     continue;
                 }
-                if !pipe {
-                    // Output that fell out of the replay buffer is skipped whatever is in
-                    // flight: skipped bytes are not in flight (7.6, 7.7)
-                    let base = session.buffer(out.stream).lock().unwrap().base();
-                    if base > out.sent {
-                        batch.push(Message::OutputGap {
-                            from: out.sent,
-                            to: base,
-                        });
-                        out.skip(base);
-                        gap = true;
-                    }
-                }
+                // Output that fell out of the replay buffer is skipped (OUTPUT_GAP, 7.7) right
+                // before the output that follows it, once the window has room for that: the
+                // skipped bytes were never in flight, so nothing waits for them (7.6). Skipping
+                // them whenever the buffer's base moves sent a gap for every chunk the program
+                // wrote while the window was full: thousands of tiny packets a second during a
+                // flood, which overflowed the queues of slow paths and stalled the interrupt
                 let rate = out.rate.rate(now);
                 let window = pacing::window(rate, rtt, pipe);
                 loop {
@@ -1515,6 +1534,9 @@ async fn terminal(
                 return Outcome::Finished;
             }
             batch.clear();
+            if std::mem::take(&mut probe_armed) {
+                probe = Some((Instant::now() + tail_probe_every(conn.rtt()), TAIL_PROBES));
+            }
             if redraw {
                 session.redraw();
             }
@@ -1533,6 +1555,17 @@ async fn terminal(
             _ = &mut drained, if !held.bytes.is_empty() => continue,
             // Output waited for the program's reaction to input, or for the test link
             _ = tokio::time::sleep_until(until.unwrap_or(now).into()), if until.is_some() => continue,
+            // Behind the snapshot that answers input, until it is acknowledged
+            _ = tokio::time::sleep_until(probe.map_or(now, |p| p.0).into()), if probe.is_some() => {
+                probe = match probe {
+                    Some((_, left)) if left > 0 && outs[0].snapshot_in_flight() => {
+                        conn.tail_probe();
+                        Some((Instant::now() + tail_probe_every(conn.rtt()), left - 1))
+                    }
+                    _ => None,
+                };
+                continue;
+            }
         };
         // What is already there (a bounded number, so that output is not held back), then
         // one ACK for the input at the top of the loop (7.5)
@@ -1692,6 +1725,11 @@ async fn terminal(
             resize_session(session, size.cols, size.rows).await;
         }
     }
+}
+
+/// How far apart the tail probes after an interrupt's snapshot are: a quarter of the round trip.
+fn tail_probe_every(rtt: Duration) -> Duration {
+    (rtt / 4).max(TAIL_PROBE_MIN)
 }
 
 /// The end of an attachment of a hung up session (7.11, steps 2 and 3): wait up to 2 s for the

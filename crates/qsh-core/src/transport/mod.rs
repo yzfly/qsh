@@ -988,7 +988,23 @@ impl Race {
     /// 30 s), so that their outcome is known (path memory records it, m2.md 3.5). `outcome`
     /// is called for each with the handshake time or the failure; a connection that comes
     /// out late is closed at once. Needs a tokio runtime.
-    pub fn conclude(mut self, mut outcome: impl FnMut(Attempt, Result<Duration, FailureKind>) + Send + 'static) {
+    pub fn conclude(self, mut outcome: impl FnMut(Attempt, Result<Duration, FailureKind>) + Send + 'static) {
+        self.conclude_keeping(move |attempt, result| match result {
+            Ok((connection, took)) => {
+                connection.close(ErrorCode::NO_ERROR, "");
+                outcome(attempt, Ok(took));
+            }
+            Err(kind) => outcome(attempt, Err(kind)),
+        });
+    }
+
+    /// [`Race::conclude`], handing a connection that comes out late to `outcome` with its
+    /// handshake time: it keeps it (a better transport than the winner's answered after all,
+    /// m2.md 3.6) or closes it. Needs a tokio runtime.
+    pub fn conclude_keeping(
+        mut self,
+        mut outcome: impl FnMut(Attempt, Result<(Connection, Duration), FailureKind>) + Send + 'static,
+    ) {
         self.over.store(true, std::sync::atomic::Ordering::SeqCst);
         let tasks = std::mem::take(&mut self.tasks);
         for (transport, task) in &tasks {
@@ -1002,10 +1018,7 @@ impl Race {
             let drain = async {
                 while let Some(finished) = rx.recv().await {
                     match finished.result {
-                        Ok(connection) => {
-                            connection.close(ErrorCode::NO_ERROR, "");
-                            outcome(finished.attempt, Ok(finished.took));
-                        }
+                        Ok(connection) => outcome(finished.attempt, Ok((connection, finished.took))),
                         Err(e) => outcome(finished.attempt, Err(FailureKind::of(&e))),
                     }
                 }

@@ -17,7 +17,8 @@
 # (port $QSH_CHAOS_SSH_PORT, default 2222) with its keys in $QSH_CHAOS_DIR, and sets HOME and
 # the XDG directories of every login to $QSH_CHAOS_DIR/home and $QSH_CHAOS_DIR/run, so nothing
 # of the user's real home is read or written. Processes are found and killed by namespace,
-# never by user.
+# never by user. QSH_CHAOS_TRUSTED_DIR=DIR (local mode, a test directory below one others can
+# write, such as /tmp) passes the test hook QSH_TEST_TRUSTED_DIR=DIR to every login.
 #
 # Usage: netns.sh COMMAND [ARGS]
 #   up                    build the topology, the test user and sshd (tears down any old one)
@@ -71,7 +72,11 @@ ns_exists() { ip netns list | awk '{print $1}' | grep -qxF "$1"; }
 # directory instead of the user's real ones (sshd's SetEnv says the same)
 local_env() {
     h=$(home)
-    echo "HOME=$h XDG_RUNTIME_DIR=$DIR/run XDG_STATE_HOME=$h/.local/state XDG_CONFIG_HOME=$h/.config"
+    # Test hook (builds with test-hooks): the test directory is below one others can write
+    # (/tmp), which the daemon upgrade refuses above its program; it looks no higher than this
+    trusted=
+    [ -n "${QSH_CHAOS_TRUSTED_DIR:-}" ] && trusted=" QSH_TEST_TRUSTED_DIR=$QSH_CHAOS_TRUSTED_DIR"
+    echo "HOME=$h XDG_RUNTIME_DIR=$DIR/run XDG_STATE_HOME=$h/.local/state XDG_CONFIG_HOME=$h/.config$trusted"
 }
 
 # Packet offloads off: netem would otherwise delay, drop and rate-limit 64 KiB GSO

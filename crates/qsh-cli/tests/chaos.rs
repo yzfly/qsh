@@ -1087,14 +1087,11 @@ fn bytes_exact() {
 #[test]
 fn flood_interrupt() {
     let Some(mut lab) = lab() else { return };
-    let runs = env_u64("QSH_CHAOS_RUNS", 5).max(1);
+    // At least 9 runs per profile: at 6 % loss about 40 % of runs pay one loss recovery, and a
+    // median of 5 would fail about one test in four (m2.md 6.4)
+    let runs = env_u64("QSH_CHAOS_RUNS", 9).max(1);
     for p in profiles(&[CROSSBORDER, LOSSY, TERRIBLE]) {
         lab.start("flood-interrupt", p);
-        let runs = match p.name {
-            "crossborder" => runs,
-            "lossy" => runs.min(3),
-            _ => runs.min(2),
-        };
         let client = lab.client(&format!("flood-{}", p.name), "");
         let timeout = secs(if p.name == "crossborder" { 180 } else { 120 });
         let result = ctrl_c_runs(&client, runs, timeout, |client, t| {
@@ -1103,7 +1100,13 @@ fn flood_interrupt() {
         // S3, with a 16 KiB snapshot
         let snapshot_ms = 16384.0 * 8.0 / (p.rate_mbit * 1e6) * 1000.0;
         let budget50 = 2.0 * p.rtt_ms + 100.0 + snapshot_ms;
-        let budget95 = 3.0 * p.rtt_ms + 300.0 + snapshot_ms;
+        // Beyond S3's 10 % loss (terrible: 20 % each way) the p95 needs r95 = 3 loss recoveries
+        // of 9/8 R + 25 ms each (m2.md 6.4, approved); up to 10 % this is S3's own bound
+        let budget95 = if p.name == "terrible" {
+            2.0 * p.rtt_ms + 100.0 + snapshot_ms + 3.0 * (1.125 * p.rtt_ms + 25.0) + 200.0
+        } else {
+            3.0 * p.rtt_ms + 300.0 + snapshot_ms
+        };
         let p50 = quantile(&result.latencies, 0.5);
         let p95 = quantile(&result.latencies, 0.95);
         lab.measure(
@@ -1379,6 +1382,9 @@ fn nat_rebinding() {
         let c = coverage(&transcript(&t), "out");
         lab.measure("disconnects", json!(c.disconnects), "");
         lab.measure("remotes", json!(c.remotes), "");
+        // Learning needs QUIC: a session left on TLS (a lost QUIC packet let TLS win the race,
+        // and the late QUIC answer did not take it over) learns nothing
+        lab.measure("transports", json!(c.connected), "");
         // The learned keepalive, in the path memory file (WP-1 decides its name and place)
         let ka = learned_keepalive(&client.dir.join("state"));
         lab.check("path_memory_ka_s", json!(ka), "10", ka == Some(10), Some("WP-1"));
@@ -1407,6 +1413,16 @@ fn learned_keepalive(dir: &Path) -> Option<u64> {
     None
 }
 
+/// The remote address of the first QUIC connection a transcript records within `timeout`.
+fn wait_quic(transcript: &Path, timeout: Duration) -> Option<String> {
+    wait_record(
+        transcript,
+        |r| r["ev"] == "connected" && r["transport"].as_str().is_some_and(|t| t.eq_ignore_ascii_case("quic")),
+        timeout,
+    )
+    .map(|(r, _)| r["remote"].as_str().unwrap_or("").to_string())
+}
+
 /// `port-fallback`: the daemon's QUIC port is blocked, `extra_ports = [61443]` is not.
 #[test]
 fn port_fallback() {
@@ -1423,13 +1439,17 @@ fn port_fallback() {
         );
         let ready = term.wait_for("READY", 0, secs(60)).is_some();
         lab.check("session_started", json!(ready), "true", ready, None);
+        // QUIC on 61443 wins the race; or, when a lost QUIC packet let TLS on the primary port
+        // win (6 % loss), it answers late and takes the session over (m2.md 3.6, 5.3)
+        let quic = wait_quic(&t1, secs(20));
         let c = coverage(&transcript(&t1), "out");
-        let won = c.connected.first().cloned().zip(c.remotes.first().cloned());
+        lab.measure("first_attempts", json!(c.attempts), "");
+        lab.measure("first_connected", json!(c.connected), "");
         lab.check(
             "first_connection",
-            json!(won.as_ref().map(|(t, r)| format!("{t} {r}"))),
-            "quic to port 61443",
-            won.as_ref().is_some_and(|(t, r)| t == "quic" && r.ends_with(":61443")),
+            json!(quic),
+            "quic to port 61443 within 20 s",
+            quic.as_deref().is_some_and(|r| r.ends_with(":61443")),
             Some("WP-1, WP-4"),
         );
         drop(term);
@@ -1438,15 +1458,38 @@ fn port_fallback() {
         let _term = Term::spawn(client.qsh(Some(&t2), &["attach", HOST]), &client.log("t2.log"));
         let attached = wait_record(&t2, |r| r["ev"] == "connected", secs(60)).is_some();
         lab.check("reattached", json!(attached), "true", attached, None);
-        let c = coverage(&transcript(&t2), "out");
-        lab.measure("attempts", json!(c.attempts), "");
-        let first = c.attempts.first().cloned();
+        // The plan starts with what path memory says worked: QUIC on 61443, at once
+        let planned = transcript(&t2)
+            .into_iter()
+            .find(|r| r["ev"] == "plan")
+            .and_then(|r| r["attempts"].get(0).cloned())
+            .map(|a| {
+                format!(
+                    "{}:{}@{}ms",
+                    a["transport"].as_str().unwrap_or("?").to_lowercase(),
+                    a["port"],
+                    a["delay_ms"]
+                )
+            });
         lab.check(
             "remembered",
-            json!(first),
-            "first attempt quic:61443",
-            first.as_deref().is_some_and(|a| a.starts_with("quic:61443:")),
+            json!(planned),
+            "first attempt quic:61443@0ms",
+            planned.as_deref() == Some("quic:61443@0ms"),
             Some("WP-1, WP-4"),
+        );
+        // It wins; or, when a lost packet let TLS win, it answers late and the session moves
+        // to it (m2.md 3.6)
+        let quic = wait_quic(&t2, secs(20));
+        let c = coverage(&transcript(&t2), "out");
+        lab.measure("attempts", json!(c.attempts), "");
+        lab.measure("connected", json!(c.connected), "");
+        lab.check(
+            "on_quic",
+            json!(quic),
+            "a QUIC connection to port 61443 within 20 s",
+            quic.as_deref().is_some_and(|r| r.ends_with(":61443")),
+            Some("WP-1"),
         );
         lab.user_file(".config/qsh/config", None);
     }

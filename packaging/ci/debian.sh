@@ -52,6 +52,23 @@ cp -r "$tree/packaging/debian" "$tree/debian"
 sed -i "1s/^qsh ([^)]*)/qsh ($version-1)/" "$tree/debian/changelog"
 
 if [ "$vendor" = - ]; then
+	# Every crates.io dependency of the workspace's manifests (not the path crates; dependencies
+	# taken from [workspace.dependencies] are listed there) needs its librust-*-dev in
+	# Build-Depends, or dh-cargo's registry lacks it and cargo stops with "no matching package".
+	unlisted=$(cd "$tree" && awk '
+		/^\[/ { deps = ($0 ~ /^\[(workspace\.)?(dev-|build-)?dependencies\]$/); next }
+		deps && /^[A-Za-z0-9_-]+ *=/ && !/path *=/ && !/workspace *= *true/ {
+			name = $1; sub(/=.*/, "", name); gsub(/_/, "-", name); print tolower(name) }
+		' Cargo.toml crates/*/Cargo.toml xtask/Cargo.toml | sort -u |
+		while read -r crate; do
+			grep -q "^ librust-$crate-dev " debian/control || echo "$crate"
+		done)
+	if [ -n "$unlisted" ]; then
+		for crate in $unlisted; do
+			echo "::error file=packaging/debian/control::crate $crate is a dependency in Cargo.toml but librust-$crate-dev is not in Build-Depends"
+		done
+		exit 1
+	fi
 	# Which librust-*-dev Build-Depends the archive satisfies (semver: >= lower, << upper).
 	sed -n 's/^ \(librust-[^ ]*\) (\([<>=]*\) \([^)]*\)).*/\1 \2 \3/p' "$tree/debian/control" |
 		awk '$2 == ">=" { lo[$1] = $3; order[n++] = $1 } $2 == "<<" { hi[$1] = $3 }

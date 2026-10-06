@@ -117,8 +117,16 @@ fn stubs(bin: &Path) {
     script(
         &bin.join("firewall-cmd"),
         r#"#!/bin/sh
+# POSIX tools only: macOS's sed has no `-i` without a suffix and no `\n` in a replacement
+set -e
 zone="$FAKE_ROOT/etc/firewalld/zones/public.xml"
 runtime="$FW_STATE/runtime"
+# edit add|remove LINE: the zone file with LINE added before </zone>, or without LINE
+edit() {
+  awk -v op="$1" -v line="$2" 'op == "add" && $0 == "</zone>" { print line } op == "remove" && $0 == line { next } { print }' "$zone" > "$zone.new"
+  cat "$zone.new" > "$zone"
+  rm -f "$zone.new"
+}
 echo "firewall-cmd $*" >> "$FW_STATE/log"
 case "$1" in
   --state) echo running; exit 0 ;;
@@ -136,10 +144,10 @@ case "$1" in
     [ -f "$zone" ] || printf '<?xml version="1.0" encoding="utf-8"?>\n<zone>\n  <service name="ssh"/>\n</zone>\n' > "$zone"
     for a; do
       case "$a" in
-        --add-port=*) p=${a#--add-port=}; sed -i "s|</zone>|  <port protocol=\"${p#*/}\" port=\"${p%/*}\"/>\n</zone>|" "$zone" ;;
-        --remove-port=*) p=${a#--remove-port=}; sed -i "\|<port protocol=\"${p#*/}\" port=\"${p%/*}\"/>|d" "$zone" ;;
-        --add-service=*) sed -i "s|</zone>|  <service name=\"${a#--add-service=}\"/>\n</zone>|" "$zone" ;;
-        --remove-service=*) sed -i "\|<service name=\"${a#--remove-service=}\"/>|d" "$zone" ;;
+        --add-port=*) p=${a#--add-port=}; edit add "  <port protocol=\"${p#*/}\" port=\"${p%/*}\"/>" ;;
+        --remove-port=*) p=${a#--remove-port=}; edit remove "  <port protocol=\"${p#*/}\" port=\"${p%/*}\"/>" ;;
+        --add-service=*) edit add "  <service name=\"${a#--add-service=}\"/>" ;;
+        --remove-service=*) edit remove "  <service name=\"${a#--remove-service=}\"/>" ;;
       esac
     done
     echo success; exit 0 ;;
@@ -378,8 +386,14 @@ exit $status
 
 #[test]
 fn tune_applies_and_reverts_a_fake_root_byte_for_byte() {
+    // Reached through a symbolic link, as every temporary directory is on macOS (/tmp ->
+    // /private/tmp): only what is below the root is walked without following links
+    let real = PathBuf::from(format!("/tmp/qsht-{}-tune.real", std::process::id()));
     let dir = PathBuf::from(format!("/tmp/qsht-{}-tune", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
+    let _ = fs::remove_file(&dir);
+    let _ = fs::remove_dir_all(&real);
+    fs::create_dir_all(&real).unwrap();
+    std::os::unix::fs::symlink(&real, &dir).unwrap();
     let (root, bin, state) = (dir.join("root"), dir.join("bin"), dir.join("fw"));
     for d in [&bin, &state] {
         fs::create_dir_all(d).unwrap();
@@ -427,9 +441,9 @@ fn tune_applies_and_reverts_a_fake_root_byte_for_byte() {
         "reno cubic bbr\n"
     );
     assert!(root.join("var/lib/qsh/tune.json").exists());
-    assert!(fs::read_to_string(root.join("etc/firewalld/zones/public.xml"))
-        .unwrap()
-        .contains("60443-60542"));
+    let zone = fs::read_to_string(root.join("etc/firewalld/zones/public.xml")).unwrap();
+    let log = fs::read_to_string(state.join("log")).unwrap_or_default();
+    assert!(zone.contains("60443-60542"), "{zone}\n{log}\n{text}");
 
     // doctor agrees
     let mut c = Command::new(QSH_SERVER);
@@ -460,7 +474,8 @@ fn tune_applies_and_reverts_a_fake_root_byte_for_byte() {
     assert!(log.ends_with("firewall-cmd --reload\n"), "{log}");
     let (code, text) = tune(&root, &env, &["--revert", "--yes"]);
     assert_eq!((code, text.contains("nothing to revert")), (0, true), "{text}");
-    let _ = fs::remove_dir_all(&dir);
+    let _ = fs::remove_file(&dir);
+    let _ = fs::remove_dir_all(&real);
 }
 
 #[test]

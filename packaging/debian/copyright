@@ -19,6 +19,10 @@ Files: vendor/anstyle-1.0.14/*
 Copyright: The anstyle authors
 License: MIT or Apache-2.0
 
+Files: vendor/arrayvec-0.7.8/*
+Copyright: bluss
+License: MIT or Apache-2.0
+
 Files: vendor/asn1-rs-0.7.2/*
 Copyright: Pierre Chifflier
 License: MIT or Apache-2.0
@@ -294,6 +298,10 @@ Files: vendor/rustversion-1.0.23/*
 Copyright: David Tolnay
 License: MIT or Apache-2.0
 
+Files: vendor/ruzstd-0.8.1/*
+Copyright: Moritz Borcherding
+License: MIT
+
 Files: vendor/serde-1.0.229/*
 Copyright: Erick Tryzelaar
  David Tolnay
@@ -422,13 +430,31 @@ Files: vendor/tracing-core-0.1.36/*
 Copyright: Tokio Contributors
 License: MIT
 
+Files: vendor/twox-hash-2.1.5/*
+Copyright: Jake Goulding
+License: MIT
+
 Files: vendor/unicode-ident-1.0.26/*
 Copyright: David Tolnay
 License: (MIT or Apache-2.0) and Unicode-3.0
 
+Files: vendor/unicode-width-0.2.2/*
+Copyright: kwantam
+ Manish Goregaokar
+License: MIT or Apache-2.0
+
 Files: vendor/untrusted-0.9.0/*
 Copyright: Brian Smith
 License: ISC
+
+Files: vendor/vt100-0.16.2/*
+Copyright: Jesse Luehrs
+License: MIT
+
+Files: vendor/vte-0.15.0/*
+Copyright: Joe Wilm
+ Christian Duerr
+License: Apache-2.0 or MIT
 
 Files: vendor/wasi-0.11.1+wasi-snapshot-preview1/*
 Copyright: The Cranelift Project Developers

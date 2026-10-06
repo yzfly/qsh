@@ -16,7 +16,7 @@ fn stream(unacked: u64, last_ack: u64, rate: f64, sampled: Duration) -> Stream {
         end: last_ack + unacked,
         rate,
         sampled,
-        busy: false,
+        snapshots: 0,
     }
 }
 
@@ -125,7 +125,7 @@ fn backlog_trigger_with_samples_and_hysteresis() {
     assert_eq!(c.step(t1, &stream(300_000, 1_000_000, rate, s)), Step::Snapshot);
     // Nor while one is in flight
     let busy = Stream {
-        busy: true,
+        snapshots: 1,
         ..stream(300_000, 1_000_000, rate, s)
     };
     assert_eq!(c.step(t1, &busy), Step::Send);
@@ -175,10 +175,13 @@ fn input_trigger_waits_for_the_program_to_settle() {
     // Even right after a backlog snapshot (no hysteresis for input) …
     c.taken(t0, 5);
     c.input(t0 + MS, 2_000_000, 100_000);
-    // … but not while that snapshot is in flight: the output is held until it is acknowledged,
-    // then one fresh snapshot follows at once
-    let busy = Stream { busy: true, ..s };
-    assert_eq!(c.step(t0 + 200 * MS, &busy), Step::Hold(None));
+    // … and while that snapshot is in flight: the input's snapshot goes right behind it rather
+    // than a round trip later; only with two in flight is the output held until one of them
+    // is acknowledged
+    let busy = Stream { snapshots: 1, ..s };
+    assert_eq!(c.step(t0 + 200 * MS, &busy), Step::Snapshot);
+    let full = Stream { snapshots: 2, ..s };
+    assert_eq!(c.step(t0 + 200 * MS, &full), Step::Hold(None));
     assert_eq!(c.step(t0 + 201 * MS, &s), Step::Snapshot);
 }
 
@@ -307,7 +310,7 @@ fn ctrl_c(rtt: Duration, link: f64, snapshot: u64) -> Duration {
                 end: sent,
                 rate: rate.rate(now),
                 sampled: rate.sampled(now),
-                busy: false,
+                snapshots: 0,
             };
             match catchup.step(now, &s) {
                 Step::Snapshot if snapshot_bytes == 0 => {
