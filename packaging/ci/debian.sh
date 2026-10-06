@@ -7,7 +7,8 @@
 #
 # With - for the vendor tarball, it builds the way Debian itself has to: no profile, every crate
 # from the archive's librust-*-dev packages (dh-cargo). It first writes out/archive-crates.txt,
-# which of those the archive has at the version needed (useful on debian:unstable).
+# which of those the archive has at the version needed (useful on debian:testing and unstable).
+# Either way the packages are then linted, installed and smoke-tested.
 #
 # Uses the build profile pkg.qsh.vendored (crates from the orig-vendor component tarball): the
 # librust-*-dev route needs every dependency packaged at the right version, see
@@ -68,45 +69,48 @@ if [ "$vendor" = - ]; then
 			fi
 		done | tee "$out/archive-crates.txt"
 	echo "::notice title=$PRETTY_NAME librust-*-dev::$(grep -c '^ok' "$out/archive-crates.txt") of $(wc -l < "$out/archive-crates.txt") crate Build-Depends satisfied, see archive-crates.txt"
-	apt-get build-dep -y -q "$tree"
-	chown -R builder: "$work"
-	su builder -c "cd '$tree' && dpkg-buildpackage -us -uc -b"
-	cd "$work"
-	cp -- *.deb "$out/"
-	lintian --info --display-info --pedantic --fail-on error qsh-client_*.deb qsh-server_*.deb 2>&1 |
-		tee "$out/lintian.txt"
-	exit 0
-fi
-
-# Rust: the archive's when new enough, else a versioned package or rustup.
-msrv=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' "$tree/Cargo.toml")
-candidate=$(apt-cache policy rustc | sed -n 's/^ *Candidate: //p')
-build_flags=(-us -uc --build-profiles=pkg.qsh.vendored)
-rust_path=
-if [ -n "$candidate" ] && [ "$candidate" != "(none)" ] &&
-	dpkg --compare-versions "${candidate#*:}" ge "$msrv"; then
-	rust_from="the archive (rustc $candidate)"
-	apt-get build-dep -y -q --build-profiles=pkg.qsh.vendored "$tree"
-	# A full source + binary build: lintian checks the source package too.
-	build_flags+=(-sa)
-else
-	# Build-Depends without rustc and cargo, for apt-get build-dep.
-	mkdir -p /tmp/bdeps/debian
-	cp "$tree/debian/changelog" /tmp/bdeps/debian/
-	sed -E '/^ (cargo|rustc) \(/d' "$tree/debian/control" > /tmp/bdeps/debian/control
-	apt-get build-dep -y -q --build-profiles=pkg.qsh.vendored /tmp/bdeps
-	versioned=$(apt-cache pkgnames rustc-1. | sed -n 's/^rustc-\(1\.[0-9]*\)$/\1/p' | sort -V | tail -n 1)
-	if [ -n "$versioned" ] && dpkg --compare-versions "$versioned" ge "$msrv"; then
-		apt-get install -y -q --no-install-recommends "rustc-$versioned" "cargo-$versioned"
-		rust_path=/usr/lib/rust-$versioned/bin
-		rust_from="the archive's versioned rustc-$versioned"
-	else
-		curl -sSf https://sh.rustup.rs | env RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo \
-			sh -s -- -y --no-modify-path --profile minimal --default-toolchain "$msrv"
-		rust_path=$(RUSTUP_HOME=/opt/rustup /opt/cargo/bin/rustc --print sysroot)/bin
-		rust_from="rustup (Rust $msrv; the archive has rustc ${candidate:-none})"
+	# In unstable this can fail although every crate above is there: a crate's own dependencies
+	# may be mid-transition (uninstallable until the Rust team uploads the rest); testing never
+	# has such holes.
+	if ! apt-get build-dep -y -q "$tree"; then
+		echo "::warning title=$PRETTY_NAME librust-*-dev::the crates are in the archive but cannot be installed together (an archive transition in progress?), see apt's explanation in the log"
+		exit 1
 	fi
-	build_flags+=(-b -d)
+	# Source and binaries, as for an upload: lintian checks the source package too.
+	build_flags=(-us -uc -sa)
+	rust_path=
+	rust_from="the archive (rustc $(apt-cache policy rustc | sed -n 's/^ *Installed: //p')), crates from librust-*-dev"
+else
+	# Rust: the archive's when new enough, else a versioned package or rustup.
+	msrv=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' "$tree/Cargo.toml")
+	candidate=$(apt-cache policy rustc | sed -n 's/^ *Candidate: //p')
+	build_flags=(-us -uc --build-profiles=pkg.qsh.vendored)
+	rust_path=
+	if [ -n "$candidate" ] && [ "$candidate" != "(none)" ] &&
+		dpkg --compare-versions "${candidate#*:}" ge "$msrv"; then
+		rust_from="the archive (rustc $candidate)"
+		apt-get build-dep -y -q --build-profiles=pkg.qsh.vendored "$tree"
+		# A full source + binary build: lintian checks the source package too.
+		build_flags+=(-sa)
+	else
+		# Build-Depends without rustc and cargo, for apt-get build-dep.
+		mkdir -p /tmp/bdeps/debian
+		cp "$tree/debian/changelog" /tmp/bdeps/debian/
+		sed -E '/^ (cargo|rustc) \(/d' "$tree/debian/control" > /tmp/bdeps/debian/control
+		apt-get build-dep -y -q --build-profiles=pkg.qsh.vendored /tmp/bdeps
+		versioned=$(apt-cache pkgnames rustc-1. | sed -n 's/^rustc-\(1\.[0-9]*\)$/\1/p' | sort -V | tail -n 1)
+		if [ -n "$versioned" ] && dpkg --compare-versions "$versioned" ge "$msrv"; then
+			apt-get install -y -q --no-install-recommends "rustc-$versioned" "cargo-$versioned"
+			rust_path=/usr/lib/rust-$versioned/bin
+			rust_from="the archive's versioned rustc-$versioned"
+		else
+			curl -sSf https://sh.rustup.rs | env RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo \
+				sh -s -- -y --no-modify-path --profile minimal --default-toolchain "$msrv"
+			rust_path=$(RUSTUP_HOME=/opt/rustup /opt/cargo/bin/rustc --print sysroot)/bin
+			rust_from="rustup (Rust $msrv; the archive has rustc ${candidate:-none})"
+		fi
+		build_flags+=(-b -d)
+	fi
 fi
 echo "::notice title=$PRETTY_NAME::Rust from $rust_from"
 

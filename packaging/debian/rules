@@ -22,6 +22,7 @@ endif
 DEB_HOST_RUST_TYPE ?= $(shell rustc -vV | sed -n 's/^host: //p')
 
 export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+include /usr/share/dpkg/buildflags.mk
 export CARGO_HOME = $(CURDIR)/debian/cargo_home
 export DEB_CARGO_CRATE = qsh-cli_$(DEB_VERSION_UPSTREAM)
 
@@ -40,9 +41,14 @@ export CARGO_PROFILE_RELEASE_DEBUG = 2
 export RUSTFLAGS = --cap-lints warn -C linker=$(DEB_HOST_GNU_TYPE)-gcc \
 	$(foreach f,$(shell dpkg-buildflags --get LDFLAGS),-C link-arg=$(f))
 else
-# dh-cargo's wrapper: --target, -j, release profile, RUSTFLAGS from dpkg-buildflags.
+# dh-cargo's wrapper (/usr/share/cargo/bin/cargo, from the cargo package): adds --target and -j,
+# and its prepare-debian writes the rustflags (debug info, LDFLAGS as link args) and points
+# crates-io at the archive's crates. It needs these in the environment, as dh-cargo's own
+# buildsystem would set them.
 CARGO = /usr/share/cargo/bin/cargo
-CARGO_FLAGS =
+CARGO_FLAGS = --release
+export CFLAGS CXXFLAGS CPPFLAGS LDFLAGS
+export DEB_HOST_RUST_TYPE DEB_HOST_GNU_TYPE
 endif
 
 CARGO_TARGET_OUT = target/$(DEB_HOST_RUST_TYPE)/release
@@ -58,6 +64,9 @@ ifneq (,$(filter pkg.qsh.vendored,$(DEB_BUILD_PROFILES)))
 		'[source.vendored-sources]' 'directory = "$(CURDIR)/vendor"' \
 		'[net]' 'offline = true' > $(CARGO_HOME)/config.toml
 else
+	# Like dh-cargo: Cargo.lock pins crates.io versions, the archive has its own; cargo resolves
+	# against debian/cargo_registry instead. Kept aside so that clean restores the source.
+	if [ -e Cargo.lock ] && [ ! -e debian/Cargo.lock.upstream ]; then mv Cargo.lock debian/Cargo.lock.upstream; fi
 	$(CARGO) prepare-debian $(CURDIR)/debian/cargo_registry --link-from-system
 endif
 
@@ -90,6 +99,7 @@ endif
 
 override_dh_auto_clean:
 	rm -rf target debian/cargo_home debian/cargo_registry
+	if [ -e debian/Cargo.lock.upstream ]; then mv -f debian/Cargo.lock.upstream Cargo.lock; fi
 
 # dh_clean deletes *.orig files, and cargo checks vendor/*/Cargo.toml.orig against
 # .cargo-checksum.json.

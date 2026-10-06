@@ -6,8 +6,8 @@ with every change and can be handed to distribution maintainers as it is.
 
 | Directory | What | Built in CI |
 |---|---|---|
-| `debian/` | Debian / Ubuntu source package: `qsh-client`, `qsh-server` | Debian 13, Debian 12, Ubuntu 24.04 |
-| `rpm/qsh.spec` | Fedora spec (Rust packaging guidelines): `qsh`, `qsh-server` | Fedora (latest) |
+| `debian/` | Debian / Ubuntu source package: `qsh-client`, `qsh-server` | Debian 13, Debian 12, Ubuntu 24.04; Debian testing and unstable with archive crates |
+| `rpm/qsh.spec` | Fedora spec (Rust packaging guidelines): `qsh`, `qsh-server` | Fedora (latest); rawhide with Fedora crates |
 | `alpine/APKBUILD` | aports recipe: `qsh`, `qsh-server`, `-openrc`, `-doc`, completions | Alpine (latest) |
 | `arch/PKGBUILD` | AUR / Arch recipe | Arch Linux (latest) |
 | `homebrew/qsh.rb` | Homebrew formula | macOS (latest) |
@@ -44,10 +44,13 @@ hand:
 Lint errors fail a job; warnings are reported in the artifact (`lintian.txt`, `rpmlint.txt`,
 `namcap.txt`, `apkbuild-lint.txt`, `audit.txt`).
 
-Two more jobs build the way the distributions themselves must, without the vendor tarball, and
-are informative (`continue-on-error`) until they pass: `debian:unstable` against the archive's
-`librust-*-dev` (report: `archive-crates.txt`) and `fedora:rawhide` against `rust-*-devel`
-(report: `fedora-crates.txt`).
+Three more jobs build the way the distributions themselves must, without the vendor tarball, and
+then lint, install and smoke-test like the others: `debian:testing` and `debian:unstable` against
+the archive's `librust-*-dev` through dh-cargo (report: `archive-crates.txt`), and `fedora:rawhide`
+against `rust-*-devel` with `%generate_buildrequires` (report: `fedora-crates.txt`). Only
+`debian:unstable` is informative (`continue-on-error`): it is where an upload is built, but some
+crate of the archive is regularly uninstallable there for a few days while the Rust team uploads
+a transition; testing, where britney lets only installable sets in, has to pass.
 
 ## Building locally
 
@@ -129,9 +132,22 @@ source package too), Debian 12 (rustup 1.85) and Ubuntu 24.04 (`rustc-1.91`); te
 `initial-upload-closes-no-bugs`) and `hardening-no-fortify-functions` (info, normal for Rust);
 installs and works.
 
-Against the archive (debian:unstable, October 2026) every crate is there, at a version in the
-ranges of `debian/control`, since qsh moved to `rcgen` 0.14 and `clap_mangen` 0.3 (the versions
-unstable has): the plain dh-cargo build needs no new crate packages.
+Against the archive, without `vendor/` (the `debian:testing (archive crates)` job, October 2026):
+every crate is there at a version in the ranges of `debian/control` (15 of 15, e.g. clap 4.6.7,
+quinn 0.11.11, rcgen 0.14.7, rustls 0.23.45, tokio 1.53.1, toml 1.1.6), and qsh 0.2.1 builds with
+the plain dh-cargo route (rustc 1.95), its tests pass, lintian reports only the ITP placeholder and
+the `vendor/*` paragraphs of `debian/copyright` that a build without `vendor/` does not use
+(`superfluous-file-pattern`), and the installed packages pass the smoke test. No new crate
+packages are needed.
+
+In unstable the same Build-Depends are all there, but since 2026-10-04 they cannot be installed:
+`rust-synstructure` 0.14.0 was uploaded that day without a 0.13 compat package, while
+`librust-asn1-rs-dev` (0.7.2+ds-2) still depends on `librust-synstructure-0.13-dev`; the
+archive's `librust-rcgen-dev` depends on `x509-parser` and through it on `asn1-rs` whatever
+features qsh asks for (debcargo packages all of rcgen's features in one package). That is the
+Rust team's transition to finish (a new `rust-asn1-rs`, or a `rust-synstructure-0.13`), not
+something qsh can change: no qsh dependency version avoids it, and testing keeps the working set
+until it is done.
 
 For the archive (Debian, and from there Ubuntu):
 
@@ -144,7 +160,9 @@ For the archive (Debian, and from there Ubuntu):
    network changes") and put its number into `debian/changelog` (`Closes: #NNNNNN`).
 3. Drop the `vendor/*` paragraphs from `debian/copyright` and the vendored profile for the
    upload (or keep them for backports), set the changelog's distribution to `unstable`, build in
-   a clean chroot (`sbuild`), run `lintian --pedantic` and fix what it reports.
+   a clean chroot (`sbuild`), run `lintian --pedantic` and fix what it reports. The build needs an
+   installable unstable: wait for the `debian:unstable (archive crates)` job to be green (in
+   October 2026 it waits for the synstructure 0.14 transition, see above).
 4. Find a sponsor (the Debian Rust team, or debian-mentors through mentors.debian.net), since the
    maintainer is not a Debian Developer. Ubuntu picks the package up from Debian unstable.
 
@@ -154,8 +172,13 @@ Status: builds with `--with vendor` on Fedora (latest, 44), tests pass, rpmlint:
 0 warnings; bundled `Provides: bundled(crate(...))` generated from `cargo-vendor.txt`; installs
 and works.
 
-Against Fedora's crates (rawhide, October 2026) everything is packaged, at the versions qsh uses
-since it moved to `rcgen` 0.14 and `clap_mangen` 0.3 (the versions rawhide has).
+Against Fedora's crates (the `fedora:rawhide (Fedora crates)` job, October 2026) everything is
+packaged: all 42 generated `crate(...)` BuildRequires resolve (e.g. clap 4.6.7, quinn 0.11.12,
+rcgen 0.14.5, zeroize 1.9.0), and qsh 0.2.1 builds without `--with vendor`, its tests pass,
+rpmlint reports 0 errors and 0 warnings, and the installed packages pass the smoke test. The
+crates have to be installed with their documentation (Koji and mock do; the container image's
+`tsflags=nodocs` does not): `rust-*-devel` marks a crate's `README.md` `%doc`, and crates such as
+zeroize compile it in.
 
 For Fedora:
 
@@ -165,7 +188,10 @@ For Fedora:
    component Package Review).
 2. Then qsh itself: a review request for `qsh` with this spec built without `--with vendor`
    (vendored builds are allowed in Fedora only by exception, e.g. for EPEL; the spec supports
-   both). The license tag must be regenerated from `%{cargo_license_summary}` on every update.
+   both). The license tag must be regenerated from `%{cargo_license_summary}` on every update;
+   against Fedora's crates it lists only what is linked in, so the tag for the submission drops
+   `Unicode-3.0` (unicode-ident, build time only) that the vendored summary has, and Fedora's
+   ring is `Apache-2.0 AND ISC AND (MIT OR Apache-2.0)` (the summary is in the rawhide job's log).
 3. After approval: `fedpkg request-repo qsh`, import, build for rawhide and branched releases,
    Bodhi updates. EPEL 10 can use `--with vendor`.
 

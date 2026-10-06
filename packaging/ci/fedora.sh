@@ -8,6 +8,7 @@
 # Builds with `--with vendor` (crates from the vendor tarball). With - for the vendor tarball it
 # builds the way Fedora itself has to: crates from Fedora's rust-*-devel packages, BuildRequires
 # from %generate_buildrequires; it first writes out/fedora-crates.txt, which of those Fedora has.
+# Either way the packages are then linted, installed and smoke-tested.
 set -euxo pipefail
 
 src=$(realpath "$1")
@@ -34,6 +35,8 @@ if [ "$vendor" = - ]; then
 	dnf -y -q builddep "$top/SPECS/qsh.spec"
 	dnf -y -q install cargo rust
 	# The generated BuildRequires (crate(NAME/FEATURE) ranges), and which Fedora provides.
+	# rpmbuild -br exits 11 ("Failed build dependencies") while they are not installed yet: that
+	# is how it hands them over, in the buildreqs.nosrc.rpm (mock does the same loop).
 	su builder -c "rpmbuild -br '$top/SPECS/qsh.spec'" || true
 	rpm -qp --requires "$top"/SRPMS/qsh-*.buildreqs.nosrc.rpm | grep 'crate(' | sort -u |
 		while read -r dep; do
@@ -44,16 +47,18 @@ if [ "$vendor" = - ]; then
 			fi
 		done | tee "$out/fedora-crates.txt"
 	echo "::notice title=Fedora crates::$(grep -c '^ok' "$out/fedora-crates.txt") of $(wc -l < "$out/fedora-crates.txt") crate BuildRequires available, see fedora-crates.txt"
-	dnf -y -q builddep "$top"/SRPMS/qsh-*.buildreqs.nosrc.rpm
+	# With documentation (tsflags= overrides the image's nodocs): rust-*-devel marks a crate's
+	# README.md %doc, and many crates compile it in (#![doc = include_str!("../README.md")]).
+	# Koji and mock install docs; a nodocs install breaks the build ("couldn't read README.md").
+	dnf -y -q --setopt=tsflags= builddep "$top"/SRPMS/qsh-*.buildreqs.nosrc.rpm
 	su builder -c "rpmbuild -ba '$top/SPECS/qsh.spec'"
-	cp "$top"/RPMS/*/*.rpm "$out/"
-	exit 0
+else
+	dnf -y -q builddep --define '_with_vendor --with-vendor' "$top/SPECS/qsh.spec"
+	su builder -c "rpmbuild -ba --with vendor '$top/SPECS/qsh.spec'"
 fi
 
-dnf -y -q builddep --define '_with_vendor --with-vendor' "$top/SPECS/qsh.spec"
-su builder -c "rpmbuild -ba --with vendor '$top/SPECS/qsh.spec'"
-
-cp "$top"/RPMS/*/*.rpm "$top"/SRPMS/*.rpm "$out/"
+# Not the buildreqs.nosrc.rpm of the Fedora-crates route.
+cp "$top"/RPMS/*/*.rpm "$top"/SRPMS/*.src.rpm "$out/"
 cd "$out"
 ls -l
 
