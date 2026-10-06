@@ -1,0 +1,29 @@
+# qsh 项目约定（给 AI 编程助手）
+
+qsh：基于 QUIC 的现代远程 shell，「你能 `ssh host`，就能 `qsh host`，而且永不掉线」。目标是成为 Linux 发行版的标准组件。
+
+- 设计契约在 `docs/DESIGN.md`，协议规范在 `docs/protocol.md`，安全模型在 `docs/security.md`。改设计先改文档，再改代码。
+- 仓库 `yzfly/qsh`，分支 `main`。提交身份：`git -c user.name="yzfly" -c user.email="zphyix@gmail.com" commit ...`，commit message 不加任何 AI 署名。`gh` 前先 `gh auth switch --user yzfly`。
+- 用户需求清单在 `TODO.md`。
+- 代码和公开文档用英文（面向全球、面向发行版）；TODO.md 和本文件用中文。
+- 起点代码：TokenSSH 仓库的 `link/`（`~/yzfly/tokenssh/link`），复用逻辑，不沿用其线协议。
+
+## 工程标准（发行版标准组件）
+
+- `#![forbid(unsafe_code)]`，只有 `qsh-core/src/sys.rs` 允许 unsafe，每处写明理由。
+- 依赖要少、要是 Debian / Fedora 已打包的常见 crate；新增依赖先说明理由。`cargo deny check` 必须通过。
+- 每个解析器都要有 fuzz 目标；会话层要有属性测试；端到端测试用 fake ssh（见 `crates/qsh-cli/tests/`）。
+- 运行时不联网（协议本身除外），`qsh install` 在 cargo feature `self-install` 后面。
+- 路径遵循 FHS / XDG，见 DESIGN.md 第 3 节。
+
+## 构建资源（重要）
+
+这台服务器只有 4 核 8G，还跑着别的服务，可用内存常常只有 2G 左右。
+- 所有 cargo build / test / clippy 都排队、降优先级：`flock /tmp/heavy.lock nice -n 10 cargo ...`，并加 `-j 2`。
+- 开发时用 dev profile，不要在本地跑 release + fat LTO 构建（交给 CI）。
+- 2026-09-28 多个 agent 同时构建把机器拖到失联重启过。
+
+## 测试隔离
+
+- 测试用自己的临时目录、自己的端口、自己的 `XDG_RUNTIME_DIR`，绝不碰用户的 `~/.config/qsh`、绝不 kill 不是自己启动的进程。
+- 不要用 `pkill -f qsh`（会误杀别人的进程）；按 pid 清理。
