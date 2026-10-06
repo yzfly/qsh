@@ -875,10 +875,19 @@ Neither side may reorder, drop or duplicate bytes of an accepted message.
 **Input is committed to the session, not to the connection.** The server *receives* input when
 it accepts it into the session's input queue, which belongs to the session (it survives the
 connection) and is written to the pseudo-terminal in order. The server MUST keep reading the
-terminal stream while the queue has room (capacity at least 64 KiB, default 1 MiB), so that
-messages behind INPUT (RESIZE, DETACH, HANGUP, KEY_CONFIRM, ACK) are processed promptly even when
-the program is not reading its terminal; only when the queue is full does it stop reading the
-stream and let flow control hold the client back. Input that arrives after the pseudo-terminal
+terminal stream and processing every message on it whether or not the input queue (capacity at
+least 64 KiB, default 1 MiB) has room, so that messages behind INPUT (RESIZE, DETACH, HANGUP,
+KEY_CONFIRM, ACK) are processed promptly even when the program is not reading its input. INPUT
+that does not fit is *held*: it is not yet received and not acknowledged; the server accepts it
+into the queue, in order, as the program reads, and acknowledges it then. An INPUT_EOF behind
+held input takes effect after it. Held input is dropped with the attachment (the client resends
+it, section 7.3); an ACK answering DETACH covers only input received. (A server that stopped
+reading would deadlock a pipe session: the program stops reading stdin when its stdout is full
+of unacknowledged output, section 7.14.5, and the ACKs that would free it wait behind the
+input.) A client MUST NOT have more than `MAX_INPUT_IN_FLIGHT` (4 194 304) bytes of input sent on
+an attachment and not acknowledged; a server MAY fail the channel with FLOW_CONTROL_ERROR when it
+would hold more. Each endpoint MUST keep reading the terminal stream while a write on it is
+blocked (the channel-level counterpart of section 8.3). Input that arrives after the pseudo-terminal
 was closed (the program ended) is accepted, acknowledged and discarded. The client writes OUTPUT
 data to its terminal in order; output is received when it has been written.
 
@@ -961,7 +970,7 @@ output offsets (uncompressed bytes), so the window converts to the same time wit
 compression (section 7.12).
 
 **Client, input.** The client keeps all unacknowledged input in its replay buffer, with a
-capacity of at least 64 KiB (default 1 MiB). It MUST NOT discard unacknowledged input: dropping
+capacity of at least 64 KiB (default 1 MiB) and at most `MAX_INPUT_IN_FLIGHT` (section 7.4). It MUST NOT discard unacknowledged input: dropping
 keystrokes could change the meaning of what the user typed. When the buffer is full the client
 stops reading local input until acknowledgements free space.
 
@@ -2087,7 +2096,7 @@ qsh-server daemons in place follow them:
 | 0x02 | FRAME_ERROR | any | malformed message or mux frame | as above |
 | 0x03 | MESSAGE_TOO_LARGE | any | `Length` above the limit (section 3.2) | as above |
 | 0x04 | UNSUPPORTED_VERSION | connection | no common protocol version | bootstrap again; tell the user to upgrade |
-| 0x05 | FLOW_CONTROL_ERROR | connection | mux credit exceeded (section 8.3) | report a bug, reconnect |
+| 0x05 | FLOW_CONTROL_ERROR | connection or channel | mux credit exceeded (section 8.3); more unacknowledged input than `MAX_INPUT_IN_FLIGHT` (section 7.4) | report a bug, reconnect |
 | 0x06 | STREAM_LIMIT | connection | too many streams | as above |
 | 0x07 | TIMEOUT | connection | hello or authentication deadline missed (section 6.6), or nothing received for too long (section 12.5) | reconnect |
 | 0x08 | LIMIT_EXCEEDED | connection | pre-authentication or rate limit | back off, reconnect later |
@@ -2807,6 +2816,7 @@ detached-daemon requirement of section 10.4.
 | `HELLO_TIMEOUT` | 10 s from acceptance, handshake included | 5.1, 6.6 |
 | `AUTH_TIMEOUT` | 10 s | 6.6 |
 | `MAX_PREAUTH_BYTES` | 16 384 bytes | 6.6 |
+| `MAX_INPUT_IN_FLIGHT` | 4 194 304 bytes of input sent and not acknowledged | 7.4 |
 | Channel streams before authentication | 4 | 6.6 |
 | QUIC `initial_max_data` before authentication | ≤ 65 536 bytes | 6.6, 9.1 |
 | `MAX_PREAUTH_CONNS` (unauthenticated connections per daemon) | 64 | 6.6 |

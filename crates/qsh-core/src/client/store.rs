@@ -634,7 +634,16 @@ mod tests {
         assert!(store.lock("h", &[1; 16]).unwrap().is_none(), "held");
         assert_eq!(mode(&store.lock_path("h", &[1; 16])), 0o600);
         drop(lock);
-        assert!(!store.in_use("h", &[1; 16]));
+        // Other tests of this process fork (pty sessions): a child forked while the lock was held
+        // shares its open file description until it executes, so the release can take a moment
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while store.in_use("h", &[1; 16]) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the lock is still held after its release"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         store.remove("h", &[1; 16]).unwrap();
         assert!(!store.lock_path("h", &[1; 16]).exists());
         fs::remove_dir_all(root).unwrap();

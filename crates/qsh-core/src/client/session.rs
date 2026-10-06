@@ -40,6 +40,12 @@ const INPUT_PING_AFTER: Duration = Duration::from_secs(1);
 /// ACK output after this much, or this long after it arrived (section 7.5).
 const ACK_BYTES: u64 = 32768;
 const ACK_DELAY: Duration = Duration::from_millis(200);
+/// Local input is taken while less than this waits in the outbox: an ACK queued behind input
+/// waits for little more than this.
+const OUTBOX_INPUT: usize = 64 * 1024;
+/// How long the last messages of an attachment (an ACK after EXIT, DETACH, ERROR) may take to
+/// be written.
+const OUTBOX_FLUSH: Duration = Duration::from_secs(2);
 /// A connection that lasted this long was a working one: reconnect at once after it ends.
 const STABLE_AFTER: Duration = Duration::from_secs(10);
 const BACKOFF_FIRST: Duration = Duration::from_secs(1);
@@ -648,18 +654,12 @@ impl Session {
         if state.hangup {
             first.push(Message::Hangup);
         }
-        let mut bytes = Vec::new();
+        // Written by the pump, which reads the channel meanwhile: up to a replay buffer of
+        // input goes out here, and the server may need our ACKs before it can take it all
+        let mut outbox = Outbox::default();
         for m in &first {
-            bytes.extend(m.encode());
+            outbox.push(m);
         }
-        let written = async {
-            send.write_all(&bytes).await?;
-            send.flush().await
-        };
-        if let Err(e) = written.await {
-            return Ok(End::Lost(e.to_string()));
-        }
-        conn.sent();
         {
             let mut status = self.status.lock().unwrap();
             status.transport = Some(conn.transport());
@@ -675,10 +675,17 @@ impl Session {
         });
         notify(terminal, Event::Connected(conn.transport()));
         let had_pending = !pending.is_empty();
-        self.pump(conn, state, terminal, send, recv, had_pending).await
+        self.pump(conn, state, terminal, send, recv, outbox, had_pending).await
     }
 
     /// The attached terminal channel (sections 7.4 to 7.11).
+    ///
+    /// One task reads and writes the channel, and it never waits for a write while it could
+    /// read: messages to send go to an outbox, written as the transport takes them. Waiting
+    /// for a write of input before reading on would deadlock on a pipe session, where the
+    /// server may be unable to take more input until our ACKs of its output arrive, and its
+    /// output may wait for us to read it (7.4, 7.14.5).
+    #[allow(clippy::too_many_arguments)]
     async fn pump(
         &self,
         conn: &Arc<Conn>,
@@ -686,6 +693,7 @@ impl Session {
         terminal: &mut Terminal,
         mut send: SendStream,
         recv: BufReader<RecvStream>,
+        mut outbox: Outbox,
         had_pending: bool,
     ) -> Result<End, ClientError> {
         let (tx, mut rx) = mpsc::channel::<Result<Message, FramingError>>(64);
@@ -716,8 +724,15 @@ impl Session {
         let mut tick = tokio::time::interval(Duration::from_millis(250));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            let room = state.input.len() < INPUT_REPLAY;
+            let room = state.input.len() < INPUT_REPLAY && outbox.len() < OUTBOX_INPUT;
             tokio::select! {
+                written = send.write(outbox.pending()), if !outbox.is_empty() => match written {
+                    Ok(n) if n > 0 => {
+                        outbox.advance(n);
+                        conn.sent();
+                    }
+                    _ => return Ok(End::Lost("the channel broke".into())),
+                },
                 message = rx.recv() => {
                     conn.received();
                     let message = match message {
@@ -731,11 +746,11 @@ impl Session {
                             let error = state.pipe && matches!(message_ty, MessageTy::ErrorOutput);
                             if message_ty == MessageTy::ErrorOutput && !state.pipe {
                                 // stderr exists only on a pipe session (7.14.3)
-                                return Ok(protocol_violation(&mut send).await);
+                                return Ok(protocol_violation(&mut send, &mut outbox).await);
                             }
                             let stream = if error { &mut state.errors } else { &mut state.output };
                             if offset != stream.received() || data.is_empty() {
-                                return Ok(sequence_error(&mut send).await);
+                                return Ok(sequence_error(&mut send, &mut outbox).await);
                             }
                             let n = data.len() as u64;
                             transcript::record(Record::Output {
@@ -751,14 +766,14 @@ impl Session {
                             };
                             if sink.send(data).await.is_err() {
                                 // Nobody shows the output any more: leave the session running
-                                return Ok(detach(&mut send, &mut rx).await);
+                                return Ok(detach(&mut send, &mut outbox, &mut rx).await);
                             }
                             // offset + n cannot overflow: the decoder refuses such messages
                             *stream = Inbound::at(offset + n);
                             self.status.lock().unwrap().bytes_in += n;
                             let unacked = (state.output.received() - acked.0) + (state.errors.received() - acked.1);
                             if unacked >= ACK_BYTES {
-                                ack(conn, &mut send, state, &mut acked).await;
+                                ack(&mut outbox, state, &mut acked);
                                 ack_due = None;
                             } else {
                                 ack_due.get_or_insert_with(|| Instant::now() + ACK_DELAY);
@@ -767,10 +782,10 @@ impl Session {
                         Message::OutputGap { from, to } => {
                             if state.pipe {
                                 // A pipe session never skips output (7.14.5)
-                                return Ok(protocol_violation(&mut send).await);
+                                return Ok(protocol_violation(&mut send, &mut outbox).await);
                             }
                             if from != state.output.received() || from >= to {
-                                return Ok(sequence_error(&mut send).await);
+                                return Ok(sequence_error(&mut send, &mut outbox).await);
                             }
                             state.output = Inbound::at(to);
                             transcript::record(Record::Gap {
@@ -787,7 +802,7 @@ impl Session {
                         Message::Ack { received, .. } => {
                             // 7.5: beyond what was sent is an error, below the last is stale
                             if received > state.input.end() {
-                                return Ok(sequence_error(&mut send).await);
+                                return Ok(sequence_error(&mut send, &mut outbox).await);
                             }
                             state.input.ack(received);
                             if received == state.input.end() {
@@ -799,9 +814,10 @@ impl Session {
                             // EXIT comes after all output (7.10): of both streams on a pipe session
                             let errors_complete = !state.pipe || error_end == Some(state.errors.received());
                             if output_end != state.output.received() || !errors_complete {
-                                return Ok(sequence_error(&mut send).await);
+                                return Ok(sequence_error(&mut send, &mut outbox).await);
                             }
-                            let _ = write_message(&mut send, &state.ack()).await;
+                            outbox.push(&state.ack());
+                            let _ = outbox.flush(&mut send).await;
                             let _ = send.shutdown().await;
                             // The server finishes once it has our ACK and FIN: wait for that
                             // briefly, so they are not lost when this process exits right away
@@ -813,7 +829,7 @@ impl Session {
                         }
                         Message::Error { code, message } => return Ok(attach_error(code, message)),
                         Message::Unknown { .. } => {}
-                        _ => return Ok(protocol_violation(&mut send).await),
+                        _ => return Ok(protocol_violation(&mut send, &mut outbox).await),
                     }
                 }
                 input = terminal.input.recv(), if room && !state.input_closed => match input {
@@ -822,35 +838,24 @@ impl Session {
                         if messages.is_empty() {
                             continue;
                         }
-                        let mut out = Vec::new();
                         for m in &messages {
                             if let Message::Input { data, .. } = m {
                                 self.status.lock().unwrap().bytes_out += data.len() as u64;
                                 unanswered.get_or_insert_with(Instant::now);
                             }
-                            out.extend(m.encode());
+                            outbox.push(m);
                         }
-                        if send.write_all(&out).await.is_err() || send.flush().await.is_err() {
-                            return Ok(End::Lost("the channel broke".into()));
-                        }
-                        conn.sent();
                     }
                     Some(Input::Resize(size)) => {
                         state.size = size;
-                        if write_message(&mut send, &Message::Resize(size)).await.is_err() {
-                            return Ok(End::Lost("the channel broke".into()));
-                        }
-                        conn.sent();
+                        outbox.push(&Message::Resize(size));
                     }
-                    Some(Input::Detach) => return Ok(detach(&mut send, &mut rx).await),
+                    Some(Input::Detach) => return Ok(detach(&mut send, &mut outbox, &mut rx).await),
                     Some(Input::Hangup) => {
                         state.hangup = true;
                         if !hangup_sent {
                             hangup_sent = true;
-                            if write_message(&mut send, &Message::Hangup).await.is_err() {
-                                return Ok(End::Lost("the channel broke".into()));
-                            }
-                            conn.sent();
+                            outbox.push(&Message::Hangup);
                         }
                     }
                     None => state.input_closed = true,
@@ -858,7 +863,7 @@ impl Session {
                 _ = tick.tick() => {
                     let now = Instant::now();
                     if ack_due.is_some_and(|t| now >= t) {
-                        ack(conn, &mut send, state, &mut acked).await;
+                        ack(&mut outbox, state, &mut acked);
                         ack_due = None;
                     }
                     if conn.connection.is_closed() {
@@ -884,7 +889,8 @@ impl Session {
                     }
                     if conn.retiring() && state.input.is_empty() && !hangup_sent {
                         // Every byte of input acknowledged: nothing is in flight to lose
-                        ack(conn, &mut send, state, &mut acked).await;
+                        ack(&mut outbox, state, &mut acked);
+                        let _ = outbox.flush(&mut send).await;
                         return Ok(End::Moved);
                     }
                     let mut status = self.status.lock().unwrap();
@@ -928,12 +934,61 @@ async fn offline(
     }
 }
 
-async fn ack(conn: &Conn, send: &mut SendStream, state: &State, acked: &mut (u64, u64)) {
+/// ACK what was received since the last one.
+fn ack(outbox: &mut Outbox, state: &State, acked: &mut (u64, u64)) {
     let now = (state.output.received(), state.errors.received());
     if now != *acked {
-        let _ = write_message(send, &state.ack()).await;
-        conn.sent();
+        outbox.push(&state.ack());
         *acked = now;
+    }
+}
+
+/// Encoded messages waiting to be written on the terminal channel, in order.
+#[derive(Debug, Default)]
+struct Outbox {
+    bytes: Vec<u8>,
+    /// How much of `bytes` was written.
+    written: usize,
+}
+
+impl Outbox {
+    fn push(&mut self, message: &Message) {
+        if self.written == self.bytes.len() {
+            self.bytes.clear();
+            self.written = 0;
+        } else if self.written >= OUTBOX_INPUT {
+            self.bytes.drain(..self.written);
+            self.written = 0;
+        }
+        self.bytes.extend(message.encode());
+    }
+
+    fn pending(&self) -> &[u8] {
+        &self.bytes[self.written..]
+    }
+
+    fn len(&self) -> usize {
+        self.bytes.len() - self.written
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn advance(&mut self, n: usize) {
+        self.written += n;
+    }
+
+    /// Write everything, at the end of an attachment: for at most [`OUTBOX_FLUSH`].
+    async fn flush(&mut self, send: &mut SendStream) -> io::Result<()> {
+        let written = tokio::time::timeout(OUTBOX_FLUSH, async {
+            send.write_all(self.pending()).await?;
+            send.flush().await
+        })
+        .await;
+        self.bytes.clear();
+        self.written = 0;
+        written.unwrap_or_else(|_| Err(io::ErrorKind::TimedOut.into()))
     }
 }
 
@@ -953,31 +1008,34 @@ impl MessageTy {
     }
 }
 
-async fn protocol_violation(send: &mut SendStream) -> End {
-    let error = Message::Error {
+async fn protocol_violation(send: &mut SendStream, outbox: &mut Outbox) -> End {
+    outbox.push(&Message::Error {
         code: ErrorCode::PROTOCOL_VIOLATION,
         message: String::new(),
-    };
-    let _ = write_message(send, &error).await;
+    });
+    let _ = outbox.flush(send).await;
     End::Lost("unexpected message from the server".into())
 }
 
-async fn sequence_error(send: &mut SendStream) -> End {
-    let _ = write_message(
-        send,
-        &Message::Error {
-            code: ErrorCode::SEQUENCE_ERROR,
-            message: String::new(),
-        },
-    )
-    .await;
+async fn sequence_error(send: &mut SendStream, outbox: &mut Outbox) -> End {
+    outbox.push(&Message::Error {
+        code: ErrorCode::SEQUENCE_ERROR,
+        message: String::new(),
+    });
+    let _ = outbox.flush(send).await;
     let _ = send.shutdown().await;
     End::Fatal(ClientError::SessionLost("SEQUENCE_ERROR".into()))
 }
 
 /// DETACH, then wait up to 2 s for the server's FIN so typed input is not lost (7.11).
-async fn detach(send: &mut SendStream, rx: &mut mpsc::Receiver<Result<Message, FramingError>>) -> End {
-    let _ = write_message(send, &Message::Detach).await;
+async fn detach(
+    send: &mut SendStream,
+    outbox: &mut Outbox,
+    rx: &mut mpsc::Receiver<Result<Message, FramingError>>,
+) -> End {
+    // After the input before it (7.11)
+    outbox.push(&Message::Detach);
+    let _ = outbox.flush(send).await;
     let _ = send.shutdown().await;
     let _ = tokio::time::timeout(Duration::from_secs(2), async {
         while let Some(Ok(_)) = rx.recv().await {}
@@ -1076,6 +1134,38 @@ mod tests {
 
     /// Review H2 (client side): the one more attach after SEQUENCE_ERROR, and the one reissue,
     /// come back after an attachment that worked for a while.
+    /// Messages leave the outbox whole and in order, however the transport splits the writes.
+    #[test]
+    fn the_outbox_keeps_order_across_partial_writes() {
+        let mut outbox = Outbox::default();
+        let messages: Vec<Message> = (0..40u64)
+            .map(|i| Message::Input {
+                offset: i * 4000,
+                data: vec![i as u8; 4000],
+            })
+            .collect();
+        let mut wire = Vec::new();
+        let mut sent = messages.iter();
+        // Pushes between partial writes, enough to compact the written part away
+        while !outbox.is_empty() || sent.len() > 0 {
+            if let Some(m) = sent.next() {
+                outbox.push(m);
+            }
+            let n = outbox.len().min(1500);
+            wire.extend_from_slice(&outbox.pending()[..n]);
+            outbox.advance(n);
+        }
+        let mut at = 0;
+        for m in &messages {
+            let (decoded, used) = crate::proto::message::decode_from(&wire[at..], MAX_TERMINAL)
+                .unwrap()
+                .unwrap();
+            assert_eq!(&decoded, m);
+            at += used;
+        }
+        assert_eq!(at, wire.len());
+    }
+
     #[test]
     fn retries_come_back_after_a_stable_attachment() {
         let mut r = Retries::default();

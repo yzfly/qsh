@@ -257,16 +257,15 @@ async fn udp_blocked_is_remembered_and_the_next_race_starts_tls_at_once() {
     assert_eq!(fake.log(), [(Transport::Quic, 60443, 0), (Transport::Tls, 60443, 400)]);
     let e = entry(&pool, NET);
     assert_eq!(e.transport(Transport::Tls).unwrap().port, Some(60443));
-    assert!(e.transport(Transport::Quic).is_none(), "QUIC has not timed out yet");
-    // The QUIC attempt goes on in the background and times out: TLS worked, so it is a fact
-    // about this network
+    assert_eq!(e.last(), Some(Transport::Tls));
+    // QUIC started first and has had no answer while TLS, started 400 ms later, connected:
+    // recorded as a timeout here at once, not 8 s later when the attempt gives up
+    assert!(e.blocked(Transport::Quic, paths::now()), "{e:?}");
+    // The attempt goes on in the background and does time out: not counted twice
     tokio::time::sleep(S(9)).await;
     let e = entry(&pool, NET);
-    assert!(e.blocked(Transport::Quic, paths::now()), "{e:?}");
-    assert_eq!(
-        e.transport(Transport::Quic).unwrap().fail.as_ref().unwrap().kind(),
-        Some(FailureKind::Timeout)
-    );
+    let fail = e.transport(Transport::Quic).unwrap().fail.clone().unwrap();
+    assert_eq!((fail.kind(), fail.n), (Some(FailureKind::Timeout), 1));
     // The connection dies; the next race starts TLS at once and leaves QUIC out
     close(&conn).await;
     fake.restart_log();
@@ -534,4 +533,92 @@ async fn liveness_rules_per_transport() {
     assert!(quic.dead().is_none());
     tokio::time::sleep(S(26)).await;
     assert_eq!(quic.dead().as_deref(), Some("nothing received for 75 s"));
+}
+
+/// A QUIC attempt marked as failing because a slower transport won the race is cleared at
+/// once when its answer comes after all.
+#[tokio::test(start_paused = true)]
+async fn a_late_answer_clears_the_mark_of_a_lost_race() {
+    let fake = Fake::new();
+    fake.set(Transport::Quic, 60443, Behaviour::Connect(S(1)));
+    fake.set(Transport::Tls, 60443, Behaviour::Connect(MS(100)));
+    let pool = pool(&fake, &network(NET));
+    let conn = pool.get(&target(&[]), &ClientConfig::new("box")).await.unwrap();
+    assert_eq!(conn.transport(), Transport::Tls);
+    assert!(entry(&pool, NET).blocked(Transport::Quic, paths::now()));
+    tokio::time::sleep(S(2)).await;
+    let e = entry(&pool, NET);
+    assert!(!e.blocked(Transport::Quic, paths::now()), "{e:?}");
+    assert!(e.transport(Transport::Quic).unwrap().ok.is_some());
+    // TLS won the last race: on the same day it goes first next time
+    assert_eq!(e.last(), Some(Transport::Tls));
+}
+
+/// The chaos scenario `udp-blocked-memory` (S1), exactly: a session over QUIC; UDP is blocked
+/// mid-session and the connection dies; the reconnect wins on TLS while its QUIC attempt is
+/// still unanswered; the client is killed a second later (no orderly end, QUIC's own 8 s
+/// timeout never fires); a new process on the same network (`qsh attach`) starts TLS at once
+/// and leaves QUIC out.
+#[tokio::test(start_paused = true)]
+async fn after_udp_is_blocked_mid_session_the_next_process_starts_tls_at_once() {
+    let dir = std::env::temp_dir().join(format!("qsh-pool-s1-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let file = dir.join("state/paths.json");
+    let process = |fake: &Arc<Fake>| {
+        let net = network(NET);
+        Pool::build(
+            Arc::new(QuicClient::new()),
+            Arc::new(FakeConnector(fake.clone())),
+            Some(PathMemory::open(&file)),
+            Box::new(move || net.lock().unwrap().clone()),
+        )
+    };
+    let config = ClientConfig::new("box");
+    // A crossborder path: QUIC answers in 1 RTT, TLS in 2
+    let fake = Fake::new();
+    fake.set(Transport::Quic, 60443, Behaviour::Connect(MS(270)));
+    fake.set(Transport::Tls, 60443, Behaviour::Connect(MS(540)));
+    let first = process(&fake);
+    let conn = first.get(&target(&[]), &config).await.unwrap();
+    assert_eq!(conn.transport(), Transport::Quic);
+    // UDP blocked mid-session: the connection dies, QUIC handshakes get no answer
+    fake.set(Transport::Quic, 60443, Behaviour::Fail(S(8), io::ErrorKind::TimedOut));
+    close(&conn).await;
+    fake.restart_log();
+    let conn = first.get(&target(&[]), &config).await.unwrap();
+    assert_eq!(conn.transport(), Transport::Tls);
+    // The remembered winner QUIC first, TLS 1.5 × its 270 ms handshake later
+    assert_eq!(fake.log(), [(Transport::Quic, 60443, 0), (Transport::Tls, 60443, 405)]);
+    // What the next process needs is on disk at once (written on a blocking thread)
+    let on_disk = || PathMemory::open(&file).entry(HOST, NET);
+    for _ in 0..500 {
+        if on_disk().is_some_and(|e| e.blocked(Transport::Quic, paths::now())) {
+            break;
+        }
+        std::thread::sleep(MS(10));
+    }
+    let e = on_disk().expect("written");
+    assert!(e.blocked(Transport::Quic, paths::now()), "{e:?}");
+    assert_eq!(e.last(), Some(Transport::Tls));
+    // Killed: no Drop of the pool, nothing more written
+    std::mem::forget(first);
+    std::mem::forget(conn);
+
+    // `qsh attach` in a new process, on the same network, UDP still blocked
+    let fake = Fake::new();
+    fake.set(Transport::Tls, 60443, Behaviour::Connect(MS(540)));
+    let second = process(&fake);
+    let started = Instant::now();
+    let conn = second.get(&target(&[]), &config).await.unwrap();
+    assert_eq!(conn.transport(), Transport::Tls);
+    assert_eq!(fake.log(), [(Transport::Tls, 60443, 0)]);
+    assert_eq!(started.elapsed(), MS(540), "one TLS handshake, nothing waited for");
+    let planned = paths::plan(Some(&e), &target(&[]), &config.race, paths::now());
+    assert_eq!(planned.skipped, [Transport::Quic]);
+    assert_eq!(
+        (planned.plan.attempts[0].transport, planned.plan.attempts[0].delay),
+        (Transport::Tls, Duration::ZERO)
+    );
+    drop((conn, second));
+    let _ = std::fs::remove_dir_all(&dir);
 }

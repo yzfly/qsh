@@ -6,16 +6,8 @@
 name: Packaging
 
 on:
+  # Manual only while the repository is private (Actions minutes); run before every release
   workflow_dispatch:
-  schedule:
-    # Weekly: new distribution releases and toolchains appear without a commit of ours.
-    - cron: "23 5 * * 3"
-  push:
-    branches: [main]
-    paths:
-      - "packaging/**"
-      - "Cargo.lock"
-      - ".github/workflows/packaging.yml"
 
 permissions:
   contents: read

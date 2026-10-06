@@ -602,7 +602,7 @@ pub struct Attempt {
 /// and the QUIC settings of the connections it makes.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Plan {
-    /// The attempts, sorted by start time (QUIC before TLS before the pipe at equal times).
+    /// The attempts, sorted by start time (at equal times, in order of preference).
     pub attempts: Vec<Attempt>,
     /// The QUIC settings of the connections (the learned keep-alive, m2.md 4.4).
     pub quic: quic::Options,
@@ -618,7 +618,8 @@ impl Plan {
         )
     }
 
-    /// A plan from `(transport, start, remembered port)`: each transport's candidate ports
+    /// A plan from `(transport, start, remembered port)`, in order of preference for attempts
+    /// that start at the same time: each transport's candidate ports
     /// ([`Target::candidates`]) from its start, [`PORT_STAGGER`] apart; transports without a
     /// start or without a port are left out, and so are the direct attempts beyond
     /// [`MAX_DIRECT_ATTEMPTS`] (the latest ones).
@@ -637,7 +638,9 @@ impl Plan {
                 });
             }
         }
-        attempts.sort_by_key(|a| (a.delay, a.transport));
+        // Stable: at equal times the order of `starts` decides (path memory puts the remembered
+        // winner first)
+        attempts.sort_by_key(|a| a.delay);
         let mut direct = 0;
         attempts.retain(|a| {
             if a.transport == Transport::Ssh {
@@ -846,6 +849,9 @@ pub struct Race {
     errors: RaceError,
     /// Set when the race is over: attempts that have not started yet never will.
     over: Arc<std::sync::atomic::AtomicBool>,
+    /// The attempts that started, and those whose outcome came out of [`Race::next_event`].
+    started: Arc<Mutex<Vec<Attempt>>>,
+    finished: Vec<Attempt>,
 }
 
 impl fmt::Debug for Race {
@@ -868,14 +874,16 @@ impl Race {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let connected = Arc::new(AtomicBool::new(false));
         let over = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(Mutex::new(Vec::new()));
         let mut tasks = Vec::new();
         for attempt in plan.attempts.iter().copied() {
-            let (tx, target, connector, connected, over) = (
+            let (tx, target, connector, connected, over, started) = (
                 tx.clone(),
                 target.clone(),
                 connector.clone(),
                 connected.clone(),
                 over.clone(),
+                started.clone(),
             );
             let options = plan.quic;
             let task = tokio::spawn(async move {
@@ -888,6 +896,7 @@ impl Race {
                     return;
                 }
                 let begun = tokio::time::Instant::now();
+                started.lock().unwrap().push(attempt);
                 let result = connector.connect(&target, &attempt, &options).await;
                 if result.is_ok() {
                     connected.store(true, Ordering::SeqCst);
@@ -905,12 +914,15 @@ impl Race {
             tasks,
             errors: RaceError::default(),
             over,
+            started,
+            finished: Vec::new(),
         }
     }
 
     /// The next attempt that connected or failed; None when every attempt has.
     pub async fn next_event(&mut self) -> Option<RaceEvent> {
         let finished = self.rx.recv().await?;
+        self.finished.push(finished.attempt);
         Some(match finished.result {
             Ok(connection) => RaceEvent::Connected(Box::new(Won {
                 connection,
@@ -936,6 +948,24 @@ impl Race {
                 return Some(won.connection);
             }
         }
+    }
+
+    /// The attempts that started and have not come out of [`Race::next_event`] yet: still
+    /// waiting for an answer.
+    pub fn running(&self) -> Vec<Attempt> {
+        let started = self.started.lock().unwrap();
+        let mut finished = self.finished.clone();
+        started
+            .iter()
+            .filter(|a| match finished.iter().position(|f| f == *a) {
+                Some(i) => {
+                    finished.swap_remove(i);
+                    false
+                }
+                None => true,
+            })
+            .copied()
+            .collect()
     }
 
     /// Record why a handed-out connection was not usable.

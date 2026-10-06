@@ -571,11 +571,15 @@ fn bind_tcp(port: u16) -> io::Result<TcpListener> {
 /// The first port of `range` free on both UDP and TCP, bound.
 fn bind_ports(range: &RangeInclusive<u16>) -> Result<(u16, UdpSocket, TcpListener), StartError> {
     for port in range.clone() {
-        let Ok(udp) = sys::udp_any(port) else { continue };
-        // Port 0 (tests): the TCP port must be the UDP one
-        let port = udp.local_addr()?.port();
-        let Ok(tcp) = bind_tcp(port) else { continue };
-        return Ok((port, udp, tcp));
+        // Port 0 (tests): any port the kernel picks for UDP, whose TCP twin must be free too;
+        // another program may hold it on TCP, so pick again a few times
+        let tries = if port == 0 { 64 } else { 1 };
+        for _ in 0..tries {
+            let Ok(udp) = sys::udp_any(port) else { continue };
+            let port = udp.local_addr()?.port();
+            let Ok(tcp) = bind_tcp(port) else { continue };
+            return Ok((port, udp, tcp));
+        }
     }
     Err(StartError::NoFreePort(range.clone()))
 }

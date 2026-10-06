@@ -205,6 +205,8 @@ pub struct PtySession {
     input: Mutex<Option<Sender<InputItem>>>,
     /// Input bytes queued for the program and not yet written (section 7.4).
     input_queued: Arc<AtomicUsize>,
+    /// Woken when the program took input from the queue: input an attachment holds may fit.
+    pub input_drained: Arc<Notify>,
     /// Output produced by the program: a pipe session's stdout, kept until acknowledged; on a
     /// tty session kept as scrollback, acknowledged or not, the oldest dropped past capacity.
     pub output: Mutex<ReplayBuffer>,
@@ -285,6 +287,7 @@ impl PtySession {
             master: Mutex::new(p.master),
             input: Mutex::new(Some(p.input)),
             input_queued: Arc::new(AtomicUsize::new(p.input_queued)),
+            input_drained: Arc::new(Notify::new()),
             output: Mutex::new(p.output),
             errors: Mutex::new(p.errors),
             sink: Mutex::new(SinkSlot(None)),
@@ -1065,11 +1068,12 @@ fn spawn_writer(session: &Arc<PtySession>, input: ParkedInput, cancel: &Arc<sys:
     let cancel = cancel.clone();
     let pausing = session.pausing.clone();
     let queued = session.input_queued.clone();
+    let drained = session.input_drained.clone();
     let running = IoThread::start(&session.io_threads);
     std::thread::Builder::new()
         .name("qsh-session-in".into())
         .spawn(move || {
-            if let Some(parked) = write_input(input, &queued, &cancel, &pausing) {
+            if let Some(parked) = write_input(input, &queued, &drained, &cancel, &pausing) {
                 if let Some(s) = weak.upgrade() {
                     s.parked.lock().unwrap().input = Some(parked);
                 }
@@ -1083,6 +1087,7 @@ fn spawn_writer(session: &Arc<PtySession>, input: ParkedInput, cancel: &Arc<sys:
 fn write_input(
     input: ParkedInput,
     queued: &AtomicUsize,
+    drained: &Notify,
     cancel: &sys::Cancel,
     pausing: &AtomicBool,
 ) -> Option<ParkedInput> {
@@ -1112,6 +1117,9 @@ fn write_input(
             };
             queued.fetch_sub(written, Ordering::SeqCst);
             pending.drain(..written);
+            if written > 0 {
+                drained.notify_waiters();
+            }
         }
         if !pausing.load(Ordering::SeqCst) && pending.is_empty() && eof {
             // The program reads end of file

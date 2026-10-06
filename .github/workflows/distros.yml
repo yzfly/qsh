@@ -6,17 +6,8 @@
 name: Distributions
 
 on:
+  # Manual only while the repository is private (Actions minutes); run before every release
   workflow_dispatch:
-  schedule:
-    - cron: "41 3 * * 0"
-  push:
-    branches: [main]
-    paths:
-      - "crates/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "packaging/test/**"
-      - ".github/workflows/distros.yml"
 
 permissions:
   contents: read

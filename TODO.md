@@ -41,3 +41,9 @@
 - [ ] WP-2 智能追帧（vt100 画面模型 + SNAPSHOT）与 zstd 压缩 → 0.4.0
 - [ ] WP-3 `doctor` / `tune`（按发行版）→ 0.5.0
 - [x] 只用发行版自带 crate 构建：Fedora rawhide、Debian testing 通过（CI 必过项）；Debian unstable 卡在上游 synstructure 迁移，等 Rust 团队
+
+## 2026-10-06 用户要求
+
+- [x] 0.5.0 做完之前不公开发布，不要把有 bug 的代码公开：仓库已改回私有（0 star / fork）；0.3.0、0.4.0 只在 main 上完成和验证，不打 tag；0.5.0 全部测试通过后再公开并发版
+- [ ] 在本地做详尽测试：`scripts/local-test.sh`（全量测试 + 本地无 root 的真实 sshd 端到端 + sudo 网络命名空间里的本地混沌测试，严格隔离、不动宿主网络）；CI 改为 push 只跑 Linux，其余手动触发、发版前跑一轮
+- [x] 清理磁盘：2.9G → 19G 空闲（TokenSSH 38 个干净的旧 agent 工作树、mingjian 的构建产物）

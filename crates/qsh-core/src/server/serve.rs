@@ -1,7 +1,7 @@
 //! Serving qsh/1 connections on the daemon: the control stream (protocol.md section 5),
 //! authentication (section 6) and terminal channels (sections 7 and 7.14), on any transport.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -34,6 +34,8 @@ const SILENT_CONNECTION: Duration = Duration::from_secs(90);
 const HANGUP_WAIT: Duration = Duration::from_secs(2);
 /// Output messages sent after a hangup at most; the rest is announced as skipped (7.11).
 const HANGUP_MESSAGES: usize = 64;
+/// Messages from the client handled in a row before the attachment sends again.
+const MESSAGES_PER_TURN: usize = 256;
 
 /// Open connections, for GOAWAY and the close on shutdown.
 #[derive(Debug, Default)]
@@ -703,6 +705,55 @@ fn exit_message(session: &PtySession, outs: &[Out], status: ExitStatus) -> Messa
     }
 }
 
+/// Input of an attachment that arrived while the session's input queue was full (7.4): not
+/// received yet, so not acknowledged, and taken into the queue in order as the program reads.
+/// The client bounds it: it never has more than its input replay buffer unacknowledged.
+#[derive(Default)]
+struct Held {
+    bytes: VecDeque<u8>,
+    /// INPUT_EOF that arrived behind the held bytes (7.14.4).
+    eof: Option<u64>,
+}
+
+impl Held {
+    /// The offset the next INPUT must start at, `received` being the end of the input received.
+    fn end(&self, received: u64) -> u64 {
+        received + self.bytes.len() as u64
+    }
+}
+
+/// Move held input into the session's input queue while it has room, then a held INPUT_EOF;
+/// `next_input` follows what was received.
+fn accept_held(session: &PtySession, generation: u64, held: &mut Held, next_input: &mut u64) -> Result<(), ErrorCode> {
+    while !held.bytes.is_empty() {
+        let room = INPUT_QUEUE.saturating_sub(session.input_queued());
+        if room == 0 {
+            return Ok(());
+        }
+        let mut input = session.input_received.lock().unwrap();
+        // Taken over meanwhile: input not yet received is dropped, the client resends it
+        if session.current_generation() != generation {
+            return Err(ErrorCode::SESSION_TAKEN_OVER);
+        }
+        let n = held.bytes.len().min(room).min(PREFERRED_DATA);
+        let chunk: Vec<u8> = held.bytes.drain(..n).collect();
+        match input.inbound.accept(*next_input, &chunk) {
+            crate::session::Accepted::New(bytes) if bytes.len() == n => session.write_input(chunk),
+            _ => return Err(ErrorCode::SEQUENCE_ERROR),
+        }
+        *next_input = input.inbound.received();
+    }
+    if let Some(offset) = held.eof.take() {
+        let mut input = session.input_received.lock().unwrap();
+        if session.current_generation() != generation {
+            return Err(ErrorCode::SESSION_TAKEN_OVER);
+        }
+        input.eof = Some(offset);
+        session.close_input();
+    }
+    Ok(())
+}
+
 async fn terminal(
     conn: &Conn,
     session: &Arc<PtySession>,
@@ -736,6 +787,12 @@ async fn terminal(
         session.redraw();
     }
     let mut exit_sent = false;
+    // Input that does not fit in the input queue now. The stream is read on regardless: ACKs
+    // behind the input may be what the program waits for (7.14.5), and RESIZE, DETACH, HANGUP
+    // and KEY_CONFIRM must not wait for the program to read its input (7.4)
+    let mut held = Held::default();
+    // Input received, as the last ACK (or ATTACHED) told the client
+    let mut acked_input = next_input;
 
     // Messages are read by a task so that a partly read message is never lost to select!
     let (tx, mut rx) = mpsc::channel::<Result<Message, FramingError>>(64);
@@ -765,13 +822,28 @@ async fn terminal(
         let changed = session.changed.notified();
         tokio::pin!(changed);
         changed.as_mut().enable();
+        let drained = session.input_drained.notified();
+        tokio::pin!(drained);
+        drained.as_mut().enable();
         if session.is_removed() && !exit_sent {
             // Hung up by `qsh kill`, a TTL or the daemon stopping (7.11)
             return ending(session, &mut outs, send).await;
         }
+        // Held input the queue has room for now
+        if let Err(code) = accept_held(session, generation, &mut held, &mut next_input) {
+            return Outcome::Error(code);
+        }
 
-        // Output, paced: at most PACING_WINDOW in flight per stream (7.6)
         let mut batch = Vec::new();
+        // The input received since the last ACK (7.5)
+        if next_input != acked_input {
+            batch.push(Message::Ack {
+                received: next_input,
+                error_received: None,
+            });
+            acked_input = next_input;
+        }
+        // Output, paced: at most PACING_WINDOW in flight per stream (7.6)
         let mut redraw = false;
         if !exit_sent {
             for out in outs.iter_mut() {
@@ -805,10 +877,13 @@ async fn terminal(
             m = rx.recv() => m,
             // New output, the exit, a newer attach and removal all notify: no polling
             _ = &mut changed => continue,
+            // The program read input: held input may fit now
+            _ = &mut drained, if !held.bytes.is_empty() => continue,
         };
-        // Everything that is already there, then one ACK for the input (7.5)
+        // What is already there (a bounded number, so that output is not held back), then
+        // one ACK for the input at the top of the loop (7.5)
         let mut next = first;
-        let mut input_arrived = false;
+        let mut processed = 0;
         loop {
             let message = match next {
                 None => {
@@ -832,49 +907,43 @@ async fn terminal(
             session.touch();
             match message {
                 Message::Input { offset, data } => {
-                    if data.is_empty() || offset != next_input {
+                    if data.is_empty() || offset != held.end(next_input) {
                         return Outcome::Error(ErrorCode::SEQUENCE_ERROR);
-                    }
-                    // The queue is full: stop reading the stream until the program reads (7.4)
-                    while session.input_queued() >= INPUT_QUEUE {
-                        if session.current_generation() != generation || session.is_removed() {
-                            break;
-                        }
-                        tokio::time::sleep(Duration::from_millis(20)).await;
-                    }
-                    let mut input = session.input_received.lock().unwrap();
-                    // Taken over meanwhile: input not yet accepted is dropped, the client resends
-                    if session.current_generation() != generation {
-                        return Outcome::Error(ErrorCode::SESSION_TAKEN_OVER);
                     }
                     // INPUT after the input was closed (7.14.4)
-                    if input.eof.is_some() {
+                    if held.eof.is_some() || session.input_received.lock().unwrap().eof.is_some() {
                         return Outcome::Error(ErrorCode::SEQUENCE_ERROR);
                     }
-                    match input.inbound.accept(offset, &data) {
-                        crate::session::Accepted::New(bytes) => session.write_input(bytes.to_vec()),
-                        _ => return Outcome::Error(ErrorCode::SEQUENCE_ERROR),
+                    // More unacknowledged input than any client keeps (7.6)
+                    if held.bytes.len() + data.len() > MAX_INPUT_IN_FLIGHT {
+                        return Outcome::Error(ErrorCode::FLOW_CONTROL_ERROR);
                     }
-                    next_input = input.inbound.received();
-                    input_arrived = true;
+                    held.bytes.extend(data);
+                    if let Err(code) = accept_held(session, generation, &mut held, &mut next_input) {
+                        return Outcome::Error(code);
+                    }
                 }
                 Message::InputEof { offset } => {
                     if !pipe {
                         return Outcome::Error(ErrorCode::PROTOCOL_VIOLATION);
                     }
-                    let mut input = session.input_received.lock().unwrap();
-                    if session.current_generation() != generation {
-                        return Outcome::Error(ErrorCode::SESSION_TAKEN_OVER);
-                    }
-                    match input.eof {
+                    let closed = {
+                        let input = session.input_received.lock().unwrap();
+                        if session.current_generation() != generation {
+                            return Outcome::Error(ErrorCode::SESSION_TAKEN_OVER);
+                        }
+                        input.eof
+                    };
+                    match closed.or(held.eof) {
                         // Repeated after a reconnect: ignored
                         Some(at) if at == offset => {}
                         Some(_) => return Outcome::Error(ErrorCode::SEQUENCE_ERROR),
-                        None if offset != input.inbound.received() => return Outcome::Error(ErrorCode::SEQUENCE_ERROR),
-                        None => {
-                            input.eof = Some(offset);
-                            session.close_input();
-                        }
+                        None if offset != held.end(next_input) => return Outcome::Error(ErrorCode::SEQUENCE_ERROR),
+                        // Closed once the input before it is in the queue
+                        None => held.eof = Some(offset),
+                    }
+                    if let Err(code) = accept_held(session, generation, &mut held, &mut next_input) {
+                        return Outcome::Error(code);
                     }
                 }
                 Message::Ack {
@@ -918,7 +987,8 @@ async fn terminal(
                     }
                 }
                 Message::Detach => {
-                    // All input before it was processed: acknowledge it and finish (7.11)
+                    // All input before it was processed: acknowledge what was received and
+                    // finish (7.11). Input still held was not received: the client keeps it
                     let _ = write(
                         send,
                         &[Message::Ack {
@@ -937,23 +1007,14 @@ async fn terminal(
                 Message::Unknown { .. } => {}
                 _ => return Outcome::Error(ErrorCode::PROTOCOL_VIOLATION),
             }
+            processed += 1;
+            if processed == MESSAGES_PER_TURN {
+                break;
+            }
             match rx.try_recv() {
                 Ok(m) => next = Some(m),
                 Err(_) => break,
             }
-        }
-        if input_arrived
-            && write(
-                send,
-                &[Message::Ack {
-                    received: next_input,
-                    error_received: None,
-                }],
-            )
-            .await
-            .is_err()
-        {
-            return Outcome::Finished;
         }
     }
 }

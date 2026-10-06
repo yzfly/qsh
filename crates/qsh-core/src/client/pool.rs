@@ -130,8 +130,38 @@ impl Ctx {
         self.memory.entry(&self.host, &self.network)
     }
 
+    /// Change the entry. What the next connection on this network depends on (the transports
+    /// blocked here, the last winner, the keepalive interval) is written at once, in the
+    /// background: a client may be killed a second after a reconnect, and the next one must
+    /// start with what this one learned. The rest waits for the next write (every 10 s).
     fn update(&self, change: impl FnOnce(&mut paths::Entry)) {
-        self.memory.update(&self.host, &self.network, paths::now(), change);
+        let now = paths::now();
+        let mut decisive = false;
+        self.memory.update(&self.host, &self.network, now, |e| {
+            let before = (e.blocked_now(now), e.last.clone(), e.ka);
+            change(e);
+            decisive = (e.blocked_now(now), e.last.clone(), e.ka) != before;
+        });
+        if decisive {
+            flush_now(&self.memory);
+        }
+    }
+}
+
+/// Write path memory now, in the background when there is a runtime.
+fn flush_now(memory: &Arc<PathMemory>) {
+    let flush = {
+        let memory = memory.clone();
+        move || {
+            if let Err(e) = memory.flush() {
+                log::debug(format_args!("path memory not written: {e}"));
+            }
+        }
+    };
+    if tokio::runtime::Handle::try_current().is_ok() {
+        tokio::task::spawn_blocking(flush);
+    } else {
+        flush();
     }
 }
 
@@ -459,11 +489,27 @@ impl Pool {
                         handshake.as_millis()
                     ));
                     record_attempt(attempt, "won");
+                    // Attempts that started no later than the winner and are still waiting
+                    // for an answer: on this network they lost to a slower handshake. That
+                    // is a timeout here, recorded now rather than when their own timeout
+                    // fires (8 s, by which time a client may be gone); an answer that comes
+                    // later still clears it (`conclude`).
+                    let unanswered: Vec<Transport> = race
+                        .running()
+                        .into_iter()
+                        .filter(|a| {
+                            a.transport != attempt.transport
+                                && a.transport != Transport::Ssh
+                                && a.delay <= attempt.delay
+                        })
+                        .map(|a| a.transport)
+                        .collect();
+                    failures.extend(unanswered.iter().map(|&t| (t, FailureKind::Timeout)));
                     self.won(ctx, attempt, handshake, &failures);
                     let quic_keepalive = (conn.transport() == Transport::Quic).then_some(plan.quic.keep_alive);
                     conn.set_keepalive(quic_keepalive, ctx.keepalive);
                     *conn.attempts.lock().unwrap() = attempts(ctx, planned, attempt.transport, race.errors());
-                    self.conclude(race, ctx, attempt.transport);
+                    self.conclude(race, ctx, attempt.transport, unanswered);
                     return Ok(conn);
                 }
                 Ok(Err(e)) => {
@@ -533,17 +579,18 @@ impl Pool {
             for (t, kind) in failed {
                 e.failed(t, kind, unix);
             }
-            e.succeeded(attempt.transport, attempt.port, handshake, unix);
+            e.won(attempt.transport, attempt.port, handshake, unix);
         });
     }
 
     /// The race is decided: let the attempts still running finish, and record what they
-    /// show (a late success, or a failure, now that another transport worked).
-    fn conclude(&self, race: Race, ctx: &Ctx, winner: Transport) {
+    /// show (a late success, or a failure, now that another transport worked). `marked`:
+    /// transports already recorded as failed by this race.
+    fn conclude(&self, race: Race, ctx: &Ctx, winner: Transport, marked: Vec<Transport>) {
         let pool = self.me.clone();
         let ctx = ctx.clone();
         let mut worked = vec![winner];
-        let mut failed: Vec<Transport> = Vec::new();
+        let mut failed: Vec<Transport> = marked;
         race.conclude(move |attempt, outcome| {
             record_attempt(
                 attempt,
@@ -922,14 +969,9 @@ impl Monitor {
     fn set_keepalive(&mut self, conn: &Conn, k: Duration, why: &str) {
         self.ctx.keepalive = k;
         conn.set_network_keepalive(k);
+        // Written at once (Ctx::update)
         self.ctx.update(|e| e.set_keepalive(k));
         record_event("keepalive", json!({"k_ms": k.as_millis() as u64, "why": why}));
-        let memory = self.ctx.memory.clone();
-        tokio::task::spawn_blocking(move || {
-            if let Err(e) = memory.flush() {
-                log::debug(format_args!("path memory not written: {e}"));
-            }
-        });
     }
 
     /// Probe one transport that failed here and whose retry time came (m2.md 3.6).
@@ -1018,12 +1060,16 @@ impl Probe {
             Ok((conn, attempt, handshake)) => {
                 record_event("probe", json!({"transport": transport.to_string(), "outcome": "ok"}));
                 log::debug(format_args!("{transport} works here again"));
-                self.ctx
-                    .update(|e| e.succeeded(transport, attempt.port, handshake, unix));
                 let quic_keepalive = (conn.transport() == Transport::Quic).then_some(self.ctx.keepalive);
                 conn.set_keepalive(quic_keepalive, self.ctx.keepalive);
-                if let Err(conn) = pool.upgrade(&self.slot, &self.old, conn, &self.ctx) {
-                    goodbye(&conn, "probe").await;
+                match pool.upgrade(&self.slot, &self.old, conn, &self.ctx) {
+                    // The sessions use it now: the one to start with next time
+                    Ok(()) => self.ctx.update(|e| e.won(transport, attempt.port, handshake, unix)),
+                    Err(conn) => {
+                        self.ctx
+                            .update(|e| e.succeeded(transport, attempt.port, handshake, unix));
+                        goodbye(&conn, "probe").await;
+                    }
                 }
             }
             Err(kind) => {

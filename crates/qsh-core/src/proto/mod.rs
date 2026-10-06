@@ -56,8 +56,14 @@ pub mod limits {
     pub const RESEND_CHUNK: usize = 16384;
     /// A client abandons a hello or an ATTACH that gets no answer within this time (12.1).
     pub const ATTACH_TIMEOUT: Duration = Duration::from_secs(5);
-    /// Input the server queues for a session's terminal before it stops reading the stream.
+    /// Input the server queues for a session's terminal or stdin pipe. Input that arrives
+    /// while the queue is full is held, unacknowledged, until the program reads.
     pub const INPUT_QUEUE: usize = 1 << 20;
+    /// Input a client may have sent and not had acknowledged on an attachment: the most the
+    /// server holds beyond a full input queue (`MAX_INPUT_IN_FLIGHT`, section 7.6). A client
+    /// keeps at most its input replay buffer unacknowledged (1 MiB, a little more with the
+    /// last chunk); beyond this the server fails the channel with FLOW_CONTROL_ERROR.
+    pub const MAX_INPUT_IN_FLIGHT: usize = 4 << 20;
     /// The server closes a connection without attachments after this long (GOAWAY IDLE).
     pub const IDLE_CONNECTION: Duration = Duration::from_secs(60);
     /// Unauthenticated connections per daemon, counted from acceptance (`MAX_PREAUTH_CONNS`).

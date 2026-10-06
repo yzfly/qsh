@@ -588,6 +588,133 @@ async fn a_pipe_session_round_trip() {
     assert_eq!(err, b"done\n");
 }
 
+/// Send `data` as INPUT from `offset`, in messages of at most 16 KiB.
+async fn send_input(ch: &mut Channel, offset: u64, data: &[u8]) {
+    for (i, chunk) in data.chunks(16384).enumerate() {
+        ch.send(Message::Input {
+            offset: offset + (i * 16384) as u64,
+            data: chunk.to_vec(),
+        })
+        .await;
+    }
+}
+
+/// The flow-control cycle of a pipe session (protocol.md 7.4, 7.14.5): `cat` stops reading its
+/// stdin when its stdout is full, its stdout is full until the client's ACKs free the replay
+/// buffer, and those ACKs arrive behind input. A server that stopped reading the stream while
+/// the input queue was full never saw them: the transfer stopped for good. The server must
+/// hold such input (unacknowledged) and read on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pipe_session_reads_acks_behind_input_it_cannot_take_yet() {
+    // A small replay buffer: `cat` blocks after 64 KiB of unacknowledged output
+    let d = TestDaemon::start("pipeflow", 64 << 10).await;
+    let c = d.boot(r#"{"qsh":1,"versions":[1],"tty":false,"command":"cat"}"#).await;
+    let client = hello(c.tcp, pin(&c)).await;
+    let mut ch = attach(&client, &c, &key(&c), 0, ATTACH_FRESH).await;
+    let Some(Message::Attached { next_key, .. }) = ch.next().await else {
+        panic!("not attached")
+    };
+    ch.send(Message::KeyConfirm { key_id: next_key.id() }).await;
+    let data: Vec<u8> = (0..2u32 << 20).map(|i| (i % 251) as u8).collect();
+    let half = data.len() / 2;
+    let done = tokio::time::timeout(Duration::from_secs(60), async {
+        // A replay buffer of input, output not acknowledged: the input queue fills, since
+        // `cat` soon cannot write
+        send_input(&mut ch, 0, &data[..half]).await;
+        let mut out = Vec::new();
+        let mut input_acked = 0;
+        while input_acked < half as u64 {
+            match ch.next().await.expect("a message") {
+                Message::Output { offset, data } => {
+                    assert_eq!(offset, out.len() as u64);
+                    out.extend(data);
+                }
+                Message::Ack { received, .. } => input_acked = received,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        // All of it acknowledged: the client may send as much again, then the end of input,
+        // and then the ACK the program waits for: behind input the queue has no room for
+        send_input(&mut ch, half as u64, &data[half..]).await;
+        ch.send(Message::InputEof {
+            offset: data.len() as u64,
+        })
+        .await;
+        ch.send(Message::Ack {
+            received: out.len() as u64,
+            error_received: Some(0),
+        })
+        .await;
+        loop {
+            match ch.next().await.expect("EXIT") {
+                Message::Output { offset, data } => {
+                    assert_eq!(offset, out.len() as u64);
+                    out.extend(data);
+                    ch.send(Message::Ack {
+                        received: out.len() as u64,
+                        error_received: Some(0),
+                    })
+                    .await;
+                }
+                Message::Ack { received, .. } => input_acked = received,
+                Message::Exit { output_end, status, .. } => {
+                    assert_eq!(output_end, out.len() as u64);
+                    assert_eq!(status, ExitStatus::Exited(0));
+                    break;
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        (out, input_acked)
+    })
+    .await;
+    let (out, input_acked) = done.expect("the transfer stalled: ACKs behind input were not read");
+    assert_eq!(input_acked, data.len() as u64);
+    assert!(out == data, "stdout differs");
+}
+
+/// Input the server holds is bounded: a client that sends far more than it may have
+/// unacknowledged (protocol.md 7.6) fails the channel with FLOW_CONTROL_ERROR, instead of
+/// making the daemon buffer without limit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn input_beyond_what_a_client_may_have_unacknowledged_is_refused() {
+    let d = TestDaemon::start("pipehold", 64 << 10).await;
+    let c = d.boot(r#"{"qsh":1,"versions":[1],"tty":false,"command":"cat"}"#).await;
+    let client = hello(c.tcp, pin(&c)).await;
+    let mut ch = attach(&client, &c, &key(&c), 0, ATTACH_FRESH).await;
+    let Some(Message::Attached { .. }) = ch.next().await else {
+        panic!("not attached")
+    };
+    // Output never acknowledged: `cat` blocks, the queue fills, and the rest is held
+    let Channel { mut send, mut recv } = ch;
+    let writer = tokio::spawn(async move {
+        let data = vec![b'x'; 8 << 20];
+        for (i, chunk) in data.chunks(16384).enumerate() {
+            let m = Message::Input {
+                offset: (i * 16384) as u64,
+                data: chunk.to_vec(),
+            };
+            if write_message(&mut send, &m).await.is_err() {
+                break;
+            }
+        }
+        send
+    });
+    let code = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            match read_message(&mut recv, MAX_TERMINAL).await {
+                Ok(Some(Message::Error { code, .. })) => return Some(code),
+                Ok(Some(_)) => continue,
+                _ => return None,
+            }
+        }
+    })
+    .await
+    .expect("an answer in time");
+    writer.abort();
+    assert_eq!(code, Some(ErrorCode::FLOW_CONTROL_ERROR));
+}
+
 /// Review H1: `qsh-server bootstrap` refuses a runtime directory others may use, instead of
 /// talking to whatever listens there; and it does not change the directory.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

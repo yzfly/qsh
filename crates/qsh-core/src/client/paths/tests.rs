@@ -231,8 +231,9 @@ fn corrupted_files_and_entries_are_ignored_and_replaced() {
         r#""port":443,"fail":{"kind":"refused","n":1,"retry":1}"#,
     );
     let bad_ka = good("ka.example").replace(r#""day""#, r#""ka":0.1,"day""#);
+    let bad_last = good("last.example").replace(r#""day""#, r#""last":"udp","day""#);
     let file = format!(
-        r#"{{"qsh_paths":1,"salt":"{salt}","entries":[{},{{"d":"zz","n":"00","day":1}},{bad_loss},{bad_kind},{bad_ka},"junk",{}]}}"#,
+        r#"{{"qsh_paths":1,"salt":"{salt}","entries":[{},{{"d":"zz","n":"00","day":1}},{bad_loss},{bad_kind},{bad_ka},{bad_last},"junk",{}]}}"#,
         good("ok.example"),
         good("ok.example").replace("443", "444")
     );
@@ -248,7 +249,7 @@ fn corrupted_files_and_entries_are_ignored_and_replaced() {
         Some(443),
         "the first of two entries with the same keys counts"
     );
-    for host in ["loss.example", "kind.example", "ka.example"] {
+    for host in ["loss.example", "kind.example", "ka.example", "last.example"] {
         assert!(memory.entry(host, NET).is_none(), "{host}");
     }
     let unusable: Vec<(Vec<u8>, u32)> = vec![
@@ -469,7 +470,27 @@ fn ties_and_the_configuration_decide_the_rest() {
         attempts(&plan(Some(&e), &t, &race, NOW))[0],
         (Transport::Quic, 60443, 0)
     );
-    // ... unless QUIC is marked as failing (its retry passed): then the one that kept working
+    // ... unless the other one won the last race here: days are coarse, the last winner is
+    // not, and it goes first among the attempts at 0 ms
+    let mut e = entry(&[
+        (Transport::Tls, ok(TODAY, None, None)),
+        (Transport::Quic, ok(TODAY, None, None)),
+    ]);
+    e.won(Transport::Tls, 60443, ms(600), NOW);
+    assert_eq!(e.last, Some("tls".into()));
+    let planned = plan(Some(&e), &t, &race, NOW);
+    assert_eq!(
+        attempts(&planned)[..2],
+        [(Transport::Tls, 60443, 0), (Transport::Quic, 60443, 0)]
+    );
+    // A more recent day still counts first
+    let mut older = e.clone();
+    older.transports.tls.as_mut().unwrap().ok = Some(TODAY - 1);
+    assert_eq!(
+        attempts(&plan(Some(&older), &t, &race, NOW))[0],
+        (Transport::Quic, 60443, 0)
+    );
+    // ... and so does QUIC marked as failing (its retry passed): then the one that kept working
     let mut quic = ok(TODAY, None, None);
     quic.fail = blocked(NOW).fail;
     let e = entry(&[(Transport::Tls, ok(TODAY, None, None)), (Transport::Quic, quic)]);

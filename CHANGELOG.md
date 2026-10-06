@@ -11,6 +11,44 @@ needs a section `## [X.Y.Z] - YYYY-MM-DD` here before its tag is pushed.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-06
+
+Connections that learn (milestone M2, part 1).
+
+### Added
+
+- Path memory: per network, qsh remembers which transport and port worked and starts with it
+  at once; a transport that is blocked there is skipped, then re-probed in the background
+  (1 min up to 24 h). When a better transport comes back, sessions move to it without a
+  visible reconnect. Stored as salted hashes in `$XDG_STATE_HOME/qsh/paths.json` (`path_memory`
+  in qsh_config(5)).
+- NAT keepalive learning: when the server sees the client's address change on an idle
+  connection, the NAT forgot it; the keepalive interval for that network halves (down to 5 s)
+  and slowly grows back. Idle QUIC connections otherwise send nothing, which spares phone
+  radios. `keepalive = "auto"` or a number of seconds.
+- Extra ports: `extra_ports` in the `[server]` table; the daemon binds each it can on UDP and
+  TCP and announces them; clients try them when the first port is blocked.
+- In-place daemon upgrade: when a newer `qsh-server` reaches the daemon (or on
+  `qsh-server upgrade`, or by itself when idle), it executes the new version in its own
+  process: same process id, same ports, every session and its programs kept; clients reconnect
+  within about a second. If the new version cannot take over, the old one carries on. The
+  systemd unit reloads with `qsh-server upgrade`.
+- The daemon asks for 4 MiB UDP buffers and uses BBR for TLS over TCP where the kernel has it.
+
+### Changed
+
+- `qsh-server status` reports ports, extra ports, sessions and upgrade state.
+
+### Fixed
+
+- A command moving much data both ways (`qsh host -- cat < big > out`) could stall forever on a
+  fast network: the server stopped reading the stream while the program's input queue was
+  full, so the acknowledgements that would let the program write (and then read) waited behind
+  input. The server now always reads the stream and holds input it cannot take yet (up to
+  4 MiB); output keeps flowing during a large paste into a terminal session too.
+- After UDP was blocked during a session, a new `qsh attach` still tried QUIC first: the
+  failure is now recorded when TLS wins the race, and the last winner breaks ties.
+
 ## [0.2.1] - 2026-10-06
 
 ### Fixed
@@ -88,7 +126,8 @@ The first preview. The protocol and command line may still change before 1.0.
   Linux 9, Alpine, Arch, openSUSE Tumbleweed and Amazon Linux 2023, with UDP blocked and with
   only ssh reachable.
 
-[Unreleased]: https://github.com/yzfly/qsh/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/yzfly/qsh/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/yzfly/qsh/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/yzfly/qsh/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/yzfly/qsh/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/yzfly/qsh/compare/v0.1.0...v0.1.1

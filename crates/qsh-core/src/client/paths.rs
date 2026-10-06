@@ -169,6 +169,11 @@ pub struct Entry {
     /// The learned NAT keepalive interval in seconds; absent: the default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ka: Option<f64>,
+    /// The transport that won the last race here (`quic`, `tls`, `ssh`), or that the sessions
+    /// last moved to: which of two transports that worked the same day worked last, without
+    /// storing a time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last: Option<String>,
 }
 
 fn ewma(old: Option<f64>, sample: f64) -> f64 {
@@ -294,6 +299,23 @@ impl Entry {
         }
     }
 
+    /// `transport` won a race on `port` (or the sessions moved to it): it worked, and it is
+    /// the one to start with next time ([`Entry::last`]).
+    pub fn won(&mut self, transport: Transport, port: u16, handshake: Duration, now: u64) {
+        self.succeeded(transport, port, handshake, now);
+        self.last = Some(name(transport).to_string());
+    }
+
+    /// The transport that won the last race here.
+    pub fn last(&self) -> Option<Transport> {
+        self.last.as_deref().and_then(parse_name)
+    }
+
+    /// The transports considered blocked at `now`.
+    pub fn blocked_now(&self, now: u64) -> Vec<Transport> {
+        TRANSPORTS.into_iter().filter(|&t| self.blocked(t, now)).collect()
+    }
+
     /// Remember the keepalive interval `k`.
     pub fn set_keepalive(&mut self, k: Duration) {
         self.ka = Some((k.as_secs_f64() * 10.0).round() / 10.0);
@@ -313,10 +335,24 @@ impl Entry {
             && self.day <= day_of(now) + 1
             && self.loss.is_none_or(|l| (0.0..=1.0).contains(&l))
             && self.ka.is_none_or(|k| k.is_finite() && (1.0..=3600.0).contains(&k))
+            && self.last.as_deref().is_none_or(|l| parse_name(l).is_some())
     }
 }
 
 const TRANSPORTS: [Transport; 3] = [Transport::Quic, Transport::Tls, Transport::Ssh];
+
+/// A transport's name in the file.
+fn name(t: Transport) -> &'static str {
+    match t {
+        Transport::Quic => "quic",
+        Transport::Tls => "tls",
+        Transport::Ssh => "ssh",
+    }
+}
+
+fn parse_name(name: &str) -> Option<Transport> {
+    TRANSPORTS.into_iter().find(|&t| self::name(t) == name)
+}
 
 /// The keyed hash that names a destination or a network in the file.
 fn keyed(salt: &[u8; 32], label: &[u8], data: &[u8]) -> [u8; 16] {
@@ -681,8 +717,8 @@ pub struct Planned {
 /// after 400 ms, the pipe after 3 s, each transport's ports 300 ms apart). With one:
 ///
 /// 1. the winner (the transport with the most recent success; among those, one not marked
-///    as failing, then QUIC before TLS before the pipe) starts at once, on its remembered
-///    port;
+///    as failing, then the one that won the last race here, then QUIC before TLS before the
+///    pipe) starts at once, on its remembered port, first among the attempts at 0 ms;
 /// 2. transports blocked here (a failure whose retry time is ahead) are left out, unless that
 ///    would leave nothing;
 /// 3. when QUIC starts before TLS and has a handshake time, TLS starts
@@ -706,17 +742,22 @@ pub fn plan(entry: Option<&Entry>, target: &Target, race: &RaceConfig, now: u64)
     if in_race.is_empty() {
         return default();
     }
+    // `ok` is a day: among transports that worked the same day, the last race's winner
+    let last = entry.last();
     let winner = in_race
         .iter()
         .filter_map(|&t| {
             let r = entry.transport(t)?;
             Some((t, r.ok?, r.fail.is_none()))
         })
-        .max_by_key(|&(t, ok, clean)| (clean, ok, std::cmp::Reverse(t)))
+        .max_by_key(|&(t, ok, clean)| (clean, ok, Some(t) == last, std::cmp::Reverse(t)))
         .map(|(t, _, _)| t);
-    let mut starts: Vec<(Transport, Duration)> = in_race
-        .iter()
-        .map(|&t| {
+    // The winner first: it is preferred among the attempts that start at once
+    let order = winner
+        .into_iter()
+        .chain(in_race.iter().copied().filter(|&t| Some(t) != winner));
+    let mut starts: Vec<(Transport, Duration)> = order
+        .map(|t| {
             let start = if Some(t) == winner {
                 Duration::ZERO
             } else {

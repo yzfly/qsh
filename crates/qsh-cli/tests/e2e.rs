@@ -257,6 +257,74 @@ fn a_pipe_session_is_byte_exact() {
     assert!(out.stdout == data, "the bytes differ");
 }
 
+/// Pipe `data` through `qsh srv -- cat` in `world`: stdin fed and stdout read at once, as a
+/// shell pipeline does. Fails (after killing qsh) if it does not end within `limit`.
+fn cat_through(world: &World, data: &[u8], limit: Duration) -> Vec<u8> {
+    use std::io::Read;
+    let mut child = world
+        .qsh(&["srv", "--", "cat"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let input = data.to_vec();
+    let feeder = std::thread::spawn(move || {
+        let _ = stdin.write_all(&input);
+    });
+    let mut stdout = child.stdout.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        let mut out = Vec::new();
+        let _ = stdout.read_to_end(&mut out);
+        out
+    });
+    let deadline = Instant::now() + patience(limit);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let got = reader.join().unwrap().len();
+            panic!("the transfer stalled: {got} of {} bytes after {limit:?}", data.len());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    feeder.join().unwrap();
+    let mut stderr = String::new();
+    let _ = child.stderr.take().unwrap().read_to_string(&mut stderr);
+    assert_eq!(status.code(), Some(0), "{stderr}");
+    reader.join().unwrap()
+}
+
+/// The chaos harness's `bytes-exact` stall: a pipe session moving much data both ways stopped
+/// for good when the server's input queue was full of input that `cat` could not take (its
+/// stdout full of unacknowledged output) and the client's ACKs waited behind more input. A
+/// replay buffer of 1 MiB (the least allowed) makes the cycle certain; on every transport.
+#[test]
+fn a_pipe_session_moving_much_both_ways_does_not_stall() {
+    let data: Vec<u8> = (0..24u32 << 20)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    for transport in ["quic", "tls", "ssh"] {
+        let mut world = World::new(&format!("flow{transport}"));
+        world.set("QSH_TRANSPORTS", transport);
+        let config = world.dir.join("config/qsh");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(config.join("config"), "[server]\nreplay_bytes = \"1M\"\n").unwrap();
+        std::fs::set_permissions(
+            config.join("config"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .unwrap();
+        let out = cat_through(&world, &data, Duration::from_secs(120));
+        assert_eq!(out.len(), data.len(), "over {transport}");
+        assert!(out == data, "the bytes differ over {transport}");
+    }
+}
+
 /// Pipe sessions keep stderr apart (to qsh's stderr), and deliver the end of input.
 #[test]
 fn a_pipe_session_keeps_stderr_apart_and_ends_input() {
