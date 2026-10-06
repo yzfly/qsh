@@ -22,10 +22,9 @@
 
 ## 下一步（M1 日常可用）
 
-- [ ] `qsh install HOST` 和首次连接时提议安装（按远端架构从 Release 下载或从本机拷贝，校验 SHA256SUMS）
-- [ ] `qsh attach / ls / kill`，会话凭据存 `$XDG_STATE_HOME/qsh/sessions/`（0600）
-- [ ] 网络变化监听（Linux netlink、macOS route socket），QUIC 立即迁移
-- [ ] 配置文件 `/etc/qsh/qsh_config`、`~/.config/qsh/config`
-- [ ] 断线时的状态提示行打磨
+- [x] v0.2.0（2026-10-06）：`qsh install` 和首次连接提议安装、`qsh attach / ls / kill` + 本地会话凭据、配置文件、网络变化监听（立即迁移 + 探测）、全屏程序底行断线提示；终端会话保留已确认输出作滚动历史（新窗口 attach 能看到最近输出）
+- [ ] 小问题：`qsh --help` 里 `[user@]host` 两边的反引号被原样显示
+- [ ] `keepalive`、`predict` 配置项还没接上（M2 / M3）
+- [ ] `qsh kill --all` 对每个会话各跑一次 ssh（密码用户会被问多次），考虑一次 ssh 批量结束
 - [ ] 发行版打包实际跑通（Debian / Fedora / Alpine / Arch 用各自工具构建一次），AUR 先上
 - [ ] M2 预研：`qsh-server doctor / tune`（各发行版防火墙、UDP 缓冲、BBR）、路径记忆、保活学习、智能追帧
