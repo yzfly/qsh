@@ -632,3 +632,37 @@ async fn a_full_window_sends_no_gaps() {
     assert!((1..=40).contains(&more), "{more} gaps for the window the ACK opened");
     ch.send(Message::Hangup).await;
 }
+
+/// Compression is never the bottleneck: on a fast path with an encoder slower than the path
+/// (the test hook `QSH_TEST_ENCODER_RATE`, as on an armv7 board or in a debug build), the
+/// output goes raw after the first frames, at the path's speed, and nothing falls out of the
+/// replay buffer. Compressing everything from the first output made the encoder set the pace,
+/// kept the first output back while a whole window was compressed, and overflowed the buffer
+/// of `seq 1 2000000` on the clean chaos profile (an OUTPUT_GAP with catchup off).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slow_encoder_never_throttles_a_fast_path() {
+    let _flood = FLOODS.lock().await;
+    let d = TestDaemon::start("slowzstd", |_| {}).await;
+    // A fast link (no throttle) and an encoder of 1 MB/s, read when the attachment starts
+    std::env::set_var("QSH_TEST_THROTTLE", "0");
+    std::env::set_var("QSH_TEST_ENCODER_RATE", "1000000");
+    let c = d.tty("seq 1 400000").await;
+    let client = hello(&c, &["zstd"]).await;
+    let mut ch = attach(&client, &c, 0, ATTACH_FRESH).await;
+    let mut s = Stream::default();
+    let took = pump(&mut ch, &mut s, Duration::from_secs(60), |s| s.exited).await;
+    std::env::set_var("QSH_TEST_THROTTLE", THROTTLE);
+    std::env::remove_var("QSH_TEST_ENCODER_RATE");
+    eprintln!(
+        "{} bytes in {took:?}; {} frames carried {} bytes; {} gaps",
+        s.out.len(),
+        s.frames,
+        s.compressed_bytes,
+        s.gaps
+    );
+    assert_eq!(s.gaps, 0, "output fell out of the replay buffer");
+    assert!(s.out.len() > 2_000_000);
+    // Everything compressed would take 2.7 s at the encoder's speed
+    assert!(s.frames <= 10, "{} frames: the encoder set the pace", s.frames);
+    assert!(took < Duration::from_secs(2), "{took:?}");
+}

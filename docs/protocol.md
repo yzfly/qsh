@@ -1497,9 +1497,11 @@ path's rate is `T × ρ`, with `ρ` the moving average of compressed size / raw 
 frames (the same average that decides "compressible" above); while it is sent uncompressed it is
 `T`. Comparing `T` itself with the limit would make compression turn itself off on a slow path
 as soon as it worked (`T` rises above the limit) and back on when `T` fell again. Before the
-attachment has a delivery-rate sample the path's rate is unknown (QUIC's congestion window over
-its round trip says nothing about a slow link behind a fast first hop), and the stream is
-compressed; the first samples decide.
+first delivery-rate sample `T` is the initial estimate of section 7.6. Compression must never
+be the bottleneck: a sender compresses only while its encoder is clearly faster (the reference
+implementation: twice) than the path carries raw bytes, and stops when the delivery rate
+approaches the encoder's speed, unless it still delivers clearly more (1.25 times) than the
+raw rate measured without it; a slow CPU on a fast path sends raw.
 
 ### 7.13 Session lifetime
 

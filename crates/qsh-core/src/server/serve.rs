@@ -62,6 +62,24 @@ const MESSAGES_PER_TURN: usize = 256;
 /// PONGs waiting to be written on a connection, at most: beyond, a PING is not answered (a
 /// peer that keeps sending PINGs without reading the answers cannot grow the queue).
 const PENDING_PONGS: usize = 16;
+/// Output is written as soon as a batch holds this much (wire bytes) or took this long to build
+/// (compressing), rather than once a whole window is built.
+const BATCH_BYTES: usize = 256 * 1024;
+const BATCH_TIME: Duration = Duration::from_millis(10);
+
+/// The wire size of the output in `batch`, about.
+fn wire_bytes(batch: &[Message]) -> usize {
+    batch
+        .iter()
+        .map(|m| match m {
+            Message::Output { data, .. } | Message::ErrorOutput { data, .. } => data.len(),
+            Message::OutputZstd { frame, .. } => frame.len(),
+            Message::Snapshot { data, .. } => data.len(),
+            _ => 0,
+        })
+        .sum()
+}
+
 /// How long the final ACK after DETACH may take to write.
 const DETACH_ACK: Duration = Duration::from_secs(2);
 /// After the snapshot that answers input (m2.md 6.4), while it is not acknowledged, a PING on
@@ -774,6 +792,8 @@ struct Out {
     /// Panics of the zstd encoder on this attachment (contained; the message went
     /// uncompressed). After [`ENCODER_FAULTS`] it compresses no more.
     encoder_faults: u32,
+    /// The test hook [`slow_encoder`].
+    slow_encoder: Option<f64>,
 }
 
 impl Out {
@@ -787,6 +807,7 @@ impl Out {
             rate: Rate::new(initial_rate),
             squeeze: (zstd && stream == Stream::Output).then(Squeeze::new),
             encoder_faults: 0,
+            slow_encoder: slow_encoder(),
         }
     }
 
@@ -794,7 +815,12 @@ impl Out {
     /// encoder (contained, [`crate::fault`]) is logged, the data goes uncompressed, and after
     /// [`ENCODER_FAULTS`] of them the attachment compresses no more.
     fn compress(&mut self, session: &PtySession, data: &[u8]) -> Option<Vec<u8>> {
+        let started = Instant::now();
         let frame = codec::compress(data);
+        if let Some(rate) = self.slow_encoder {
+            let at_least = Duration::from_secs_f64(data.len() as f64 / rate);
+            std::thread::sleep(at_least.saturating_sub(started.elapsed()));
+        }
         self.compressed(session, frame)
     }
 
@@ -918,9 +944,10 @@ impl Out {
         }
         self.sent = start + bytes.len() as u64;
         if compress && self.squeeze.is_some() && bytes.len() >= pacing::COMPRESS_MIN {
+            let started = Instant::now();
             if let Some(frame) = self.compress(session, &bytes) {
                 if let Some(squeeze) = self.squeeze.as_mut() {
-                    squeeze.record(Instant::now(), bytes.len(), frame.len(), self.sent);
+                    squeeze.record(Instant::now(), bytes.len(), frame.len(), started.elapsed(), self.sent);
                 }
                 if frame.len() * 10 <= bytes.len() * 9 {
                     batch.push(Message::OutputZstd { offset: start, frame });
@@ -1176,6 +1203,20 @@ async fn send_snapshot(
     out.snapshots.push_back((snapshot.offset, snapshot.data.len() as u64));
     catchup.taken(now, snapshot.offset);
     snapshot.redraw
+}
+
+/// A slow encoder for the tests (`QSH_TEST_ENCODER_RATE`, input bytes per second, in builds with
+/// the `test-hooks` feature, read when an attachment starts): each compression then takes at
+/// least as long as that rate says, as on a host whose CPU is slow for its path (an armv7
+/// board on gigabit Ethernet, or a debug build).
+fn slow_encoder() -> Option<f64> {
+    if !cfg!(feature = "test-hooks") {
+        return None;
+    }
+    std::env::var("QSH_TEST_ENCODER_RATE")
+        .ok()
+        .and_then(|r| r.parse::<f64>().ok())
+        .filter(|r| *r > 0.0)
 }
 
 /// A slow link for the tests (`QSH_TEST_THROTTLE`, bytes per second, in builds with the
@@ -1462,6 +1503,7 @@ async fn terminal(
             }
             // Output, paced: at most a window in flight per stream (7.6, m2.md 6.3)
             let rtt = conn.rtt();
+            let turn = Instant::now();
             let mut gap = false;
             for (i, out) in outs.iter_mut().enumerate() {
                 if i == 0 && held_output {
@@ -1486,15 +1528,12 @@ async fn terminal(
                     }
                     let room = (window - in_flight) as usize;
                     let ready = out.end(session).saturating_sub(out.sent);
-                    // Before the first delivery-rate sample the path's rate is unknown: the
-                    // initial estimate is QUIC's congestion window over its round trip, which
-                    // says nothing about a slow link behind a fast first hop (or the test
-                    // link). Compress then; the samples decide (m2.md 7.2)
-                    let path_rate = if out.rate.sampled(now).is_zero() { 0.0 } else { rate };
+                    let sampled = !out.rate.sampled(now).is_zero();
+                    let sent = out.sent;
                     let compress = out
                         .squeeze
-                        .as_ref()
-                        .is_some_and(|z| z.wanted(now, path_rate, ready, out.sent));
+                        .as_mut()
+                        .is_some_and(|z| z.wanted(now, rate, sampled, ready, sent));
                     let max = if compress { MAX_ZSTD_CONTENT } else { PREFERRED_DATA };
                     let before = batch.len();
                     match out.next(session, max.min(room), compress, &mut batch) {
@@ -1506,6 +1545,12 @@ async fn terminal(
                     }
                     if let Some(t) = throttle.as_mut() {
                         t.spend(&batch[before..]);
+                    }
+                    // A batch is written once it is built: a whole window (up to 8 MiB) built
+                    // first, compressed, kept the first output back for a second while the
+                    // replay buffer overflowed. Write what is ready and come back for more
+                    if turn.elapsed() >= BATCH_TIME || wire_bytes(&batch) >= BATCH_BYTES {
+                        break;
                     }
                 }
             }

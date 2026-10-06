@@ -81,7 +81,7 @@ fn bursts_of_acks_do_not_inflate_the_rate() {
     let t = rate.rate(now);
     assert!(t < 2_000_000.0, "{t}");
     assert!(window(t, rtt, false) < 1 << 20);
-    assert!(Squeeze::new().wanted(now, t, 4096, 0));
+    assert!(Squeeze::new().wanted(now, t, true, 4096, 0));
     // A real increase is followed, doubling per sample at most
     for _ in 0..40 {
         now += 20 * MS;
@@ -188,32 +188,68 @@ fn input_trigger_waits_for_the_program_to_settle() {
 #[test]
 fn compression_stops_on_incompressible_output_and_tries_again() {
     let t0 = Instant::now();
+    let fast = Duration::from_micros(100); // 64 KiB in 100 µs: an encoder far faster than these paths
     let mut z = Squeeze::new();
-    assert!(z.wanted(t0, 1e6, 4096, 0));
+    assert!(z.wanted(t0, 1e6, true, 4096, 0));
     // Fast paths, keystroke echoes: raw
-    assert!(!z.wanted(t0, 9.0 * 1048576.0, 4096, 0));
+    let mut f = Squeeze::new();
+    assert!(!f.wanted(t0, 9.0 * 1048576.0, true, 4096, 0));
     // A path of 2 MiB/s carries 8 MiB/s of output compressed to a quarter: still slow
     for _ in 0..20 {
-        z.record(t0, 65536, 16384, 0);
+        z.record(t0, 65536, 16384, fast, 0);
     }
-    assert!(z.wanted(t0, 8.0 * 1048576.0, 4096, 0));
+    assert!(z.wanted(t0, 8.0 * 1048576.0, true, 4096, 0));
     let mut z = Squeeze::new();
-    assert!(!z.wanted(t0, 1e6, 100, 0));
+    assert!(!z.wanted(t0, 1e6, true, 100, 0));
     // A compressed tarball: off after a few frames …
     let mut sent = 0;
     for _ in 0..10 {
-        z.record(t0, 65536, 65600, sent);
+        z.record(t0, 65536, 65600, fast, sent);
         sent += 65536;
     }
-    assert!(!z.wanted(t0 + MS, 1e6, 65536, sent));
+    assert!(!z.wanted(t0 + MS, 1e6, true, 65536, sent));
     // … tried again after 2 s or 1 MiB
-    assert!(z.wanted(t0 + Duration::from_secs(2), 1e6, 65536, sent));
-    assert!(z.wanted(t0 + MS, 1e6, 65536, sent + (1 << 20)));
+    assert!(z.wanted(t0 + Duration::from_secs(2), 1e6, true, 65536, sent));
+    let mut y = Squeeze::new();
+    assert!(y.wanted(t0, 1e6, true, 65536, 0));
+    for _ in 0..10 {
+        y.record(t0, 65536, 65600, fast, 0);
+    }
+    assert!(!y.wanted(t0 + MS, 1e6, true, 65536, 0));
+    assert!(y.wanted(t0 + MS, 1e6, true, 65536, 1 << 20));
     // Text again: on
     for _ in 0..3 {
-        z.record(t0, 65536, 9000, sent);
+        z.record(t0, 65536, 9000, fast, sent);
     }
-    assert!(z.wanted(t0 + MS, 1e6, 65536, sent));
+    assert!(z.wanted(t0 + MS, 1e6, true, 65536, sent));
+}
+
+/// Compression is never the bottleneck: it does not start when the encoder is not clearly
+/// faster than the path carries raw bytes, and stops when the delivery rate reaches the
+/// encoder's speed, unless it still delivers clearly more than the raw rate.
+#[test]
+fn a_slow_encoder_never_throttles_a_path() {
+    let t0 = Instant::now();
+    let mib = 1048576.0;
+    // An encoder of 2 MiB/s (64 KiB in 31 ms) on an unknown path: it starts, …
+    let slow = Duration::from_micros(31_250);
+    let mut z = Squeeze::new();
+    assert!(z.wanted(t0, 1.0 * mib, false, 65536, 0));
+    z.record(t0, 65536, 20000, slow, 0);
+    // … the delivery rate reaches half the encoder's speed with nothing measured raw: off
+    assert!(!z.wanted(t0 + MS, 1.0 * mib, true, 65536, 65536));
+    // Raw, the path carries 3 MiB/s (below COMPRESS_BELOW): the encoder is not twice as fast,
+    // so it stays off, also after the retry time
+    assert!(!z.wanted(t0 + 3000 * MS, 3.0 * mib, true, 65536, 4 << 20));
+    // A path of 300 kB/s raw: worth it again after the retry time
+    assert!(z.wanted(t0 + 6000 * MS, 300_000.0, true, 65536, 8 << 20));
+    // Encoder-bound now (1.2 MiB/s of output, more than half its speed), but four times the
+    // raw rate: it stays on
+    assert!(z.wanted(t0 + 6100 * MS, 1.2 * mib, true, 65536, 9 << 20));
+    // A path measured before compressing faster than half the encoder: never starts
+    let mut w = Squeeze::new();
+    w.record(t0, 65536, 20000, slow, 0);
+    assert!(!w.wanted(t0, 1.5 * mib, true, 65536, 0));
 }
 
 #[test]

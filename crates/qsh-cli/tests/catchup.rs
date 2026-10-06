@@ -106,16 +106,42 @@ fn compression_is_byte_exact_and_faster_on_a_slow_link() {
     world.set("QSH_TEST_THROTTLE", THROTTLE);
     let expected = build_log(20_000);
     let mut times = Vec::new();
-    for config in ["", "[defaults]\ncompression = \"off\"\n"] {
+    let mut onsets = Vec::new();
+    for (i, config) in ["", "[defaults]\ncompression = \"off\"\n"].into_iter().enumerate() {
         configure(&world, config);
+        // When the first compressed frame arrived and how many there were: what to look at
+        // when the time is off
+        let transcript = world.dir.join(format!("zstd-{i}.jsonl"));
+        world.set("QSH_TRANSCRIPT", transcript.display().to_string());
         let start = Instant::now();
         let out = world.qsh(&["srv", LOG]).stdin(Stdio::null()).output().unwrap();
         let took = start.elapsed();
         assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
         assert!(out.stdout == expected.as_bytes(), "the output differs with {config:?}");
-        eprintln!("{} bytes with {config:?}: {took:?}", out.stdout.len());
+        let records: Vec<serde_json::Value> = std::fs::read_to_string(&transcript)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        let outputs: Vec<&serde_json::Value> = records.iter().filter(|r| r["ev"] == "output").collect();
+        let frames = outputs.iter().filter(|r| r.get("zstd").is_some()).count();
+        let first = outputs.first().and_then(|r| r["ms"].as_u64());
+        let first_frame = outputs
+            .iter()
+            .find(|r| r.get("zstd").is_some())
+            .and_then(|r| r["ms"].as_u64());
+        let raw_before: u64 = outputs
+            .iter()
+            .take_while(|r| r.get("zstd").is_none())
+            .filter_map(|r| r["len"].as_u64())
+            .sum();
+        let onset = format!(
+            "{frames} frames; first output at {first:?} ms, first frame at {first_frame:?} ms after {raw_before} raw bytes"
+        );
+        eprintln!("{} bytes with {config:?}: {took:?}; {onset}", out.stdout.len());
         times.push(took);
+        onsets.push(onset);
     }
     // Including the connection and bootstrap, which take the same in both
-    assert!(times[0] < times[1] / 2, "{times:?}");
+    assert!(times[0] < times[1] / 2, "{times:?}; {onsets:?}");
 }

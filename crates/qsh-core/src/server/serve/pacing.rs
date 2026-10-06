@@ -287,37 +287,86 @@ impl Catchup {
 pub(super) struct Squeeze {
     /// Recent frames' compressed / raw (EWMA, α = 0.25).
     ratio: f64,
-    /// Compression is off since (when, output sent by then).
+    /// The stream looked incompressible, since (when, output sent by then).
     off: Option<(Instant, u64)>,
+    /// The policy compresses now (chunks too small to compress aside).
+    on: bool,
+    /// The encoder's speed: raw bytes per second of encoding (EWMA, α = 0.25), once measured.
+    encoder: Option<f64>,
+    /// The delivery rate measured while not compressing: what the path carries raw.
+    raw: Option<f64>,
+    /// Compression was stopped because the encoder was the bottleneck, since (when, output
+    /// sent by then).
+    stopped: Option<(Instant, u64)>,
 }
+
+/// Compression starts only if the encoder is at least this many times as fast as the path's
+/// raw rate, and stops when the delivery rate reaches the encoder's speed divided by it.
+const ENCODER_HEADROOM: f64 = 2.0;
+/// While the encoder is the bottleneck, compression goes on only if it delivers at least this
+/// many times the raw rate measured without it.
+const ENCODER_WIN: f64 = 1.25;
 
 impl Squeeze {
     pub(super) fn new() -> Squeeze {
-        Squeeze { ratio: 0.5, off: None }
+        Squeeze {
+            ratio: 0.5,
+            off: None,
+            on: false,
+            encoder: None,
+            raw: None,
+            stopped: None,
+        }
     }
 
-    /// Whether to compress a chunk of `ready` bytes now, at delivery rate `rate`, with `sent`
-    /// output sent so far. The rate is in output offsets: while compression is on it counts
-    /// what the frames carried, so the path's own rate is that times the ratio (otherwise
-    /// compression would raise `T` past the limit and turn itself off).
-    pub(super) fn wanted(&self, now: Instant, rate: f64, ready: u64, sent: u64) -> bool {
-        let path = if self.off.is_none() {
-            rate * self.ratio.min(1.0)
-        } else {
-            rate
-        };
-        path < COMPRESS_BELOW
-            && ready >= COMPRESS_MIN as u64
-            && self.off.is_none_or(|(since, at)| {
-                now.saturating_duration_since(since) >= RETRY_AFTER || sent.saturating_sub(at) >= RETRY_BYTES
+    /// Whether to compress a chunk of `ready` bytes now, at delivery rate `rate` (`sampled`:
+    /// measured, not the initial estimate), with `sent` output sent so far.
+    ///
+    /// The rate is in output offsets: while compressing it counts what the frames carried, so
+    /// the path's own rate is that times the ratio (otherwise compression would raise `T` past
+    /// the limit and turn itself off). Compression must never be the bottleneck: it starts
+    /// only if the encoder is clearly faster than the path carries raw bytes, and stops when
+    /// the delivery rate approaches the encoder's speed (the encoder, not the path, sets the
+    /// pace then, and `T` no longer says what the path could carry), unless it still delivers
+    /// clearly more than the raw rate measured without it.
+    pub(super) fn wanted(&mut self, now: Instant, rate: f64, sampled: bool, ready: u64, sent: u64) -> bool {
+        let retry = |since: Option<(Instant, u64)>| {
+            since.is_none_or(|(at, offset): (Instant, u64)| {
+                now.saturating_duration_since(at) >= RETRY_AFTER || sent.saturating_sub(offset) >= RETRY_BYTES
             })
+        };
+        if self.on {
+            let encoder_bound = sampled && self.encoder.is_some_and(|e| rate * ENCODER_HEADROOM >= e);
+            let still_better = self.raw.is_some_and(|r| rate >= ENCODER_WIN * r);
+            if (encoder_bound && !still_better) || self.off.is_some() || rate * self.ratio.min(1.0) >= COMPRESS_BELOW {
+                if encoder_bound && !still_better {
+                    self.stopped = Some((now, sent));
+                }
+                self.on = false;
+            }
+        } else {
+            if sampled {
+                self.raw = Some(rate);
+            }
+            let encoder_ok = self.encoder.is_none_or(|e| e >= ENCODER_HEADROOM * rate);
+            if rate < COMPRESS_BELOW && encoder_ok && retry(self.off) && retry(self.stopped) {
+                self.on = true;
+                self.off = None;
+                self.stopped = None;
+            }
+        }
+        self.on && ready >= COMPRESS_MIN as u64
     }
 
-    /// A chunk of `raw` bytes compressed to `frame` bytes.
-    pub(super) fn record(&mut self, now: Instant, raw: usize, frame: usize, sent: u64) {
+    /// A chunk of `raw` bytes compressed to `frame` bytes in `took`.
+    pub(super) fn record(&mut self, now: Instant, raw: usize, frame: usize, took: Duration, sent: u64) {
         let sample = frame as f64 / raw.max(1) as f64;
         self.ratio = 0.75 * self.ratio + 0.25 * sample.min(1.5);
-        self.off = (self.ratio >= COMPRESSIBLE).then_some((now, sent));
+        if self.ratio >= COMPRESSIBLE {
+            self.off = Some((now, sent));
+        }
+        let speed = raw as f64 / took.as_secs_f64().max(1e-6);
+        self.encoder = Some(self.encoder.map_or(speed, |e| 0.75 * e + 0.25 * speed));
     }
 }
 

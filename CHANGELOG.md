@@ -89,7 +89,9 @@ milestones and were not released; their changes are listed here.
   status: the stall made qsh race the other transports and move the session, losing the exit
   status that was on its way. A session that hung up now stays on its connection, and when it
   finds the session gone after a reconnect it exits with 129, as the hang-up does.
-- Compression starts with the first output instead of after the first rate sample.
+- Compression is used only when it pays: it starts on a slow path from the first output, and it
+  never becomes the bottleneck (it stops when the encoder, not the network, sets the pace, e.g. on
+  a slow CPU); output is written in batches of at most 256 KiB, so a fast path starts at once.
 - When the path dies mid-session (UDP blocked, a NAT that drops the flow), typing gets an answer
   over another transport within about 4.5 s at 270 ms RTT instead of 11 s: unanswered input
   makes qsh race the other transports in the background, keeping the current connection until
