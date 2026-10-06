@@ -8,3 +8,10 @@
 - [ ] 目标是成为 Linux 发行版里的标准组件：按最高标准做产品设计和技术架构（docs/DESIGN.md 第 3 节「标准组件门槛」）
 - [ ] 在各个 Linux 发行版上支持连接的自主优化（DESIGN.md 第 7 节；`qsh-server doctor` / `tune`，路径记忆、保活学习、端口回退、智能追帧）
 - [ ] 把生态做好：协议规范、`qsh-core` 库、发行版打包、安装脚本、文档
+
+## 进度
+
+- [x] M0 设计契约 docs/DESIGN.md、协议规范 docs/protocol.md、安全模型 docs/security.md（2026-10-05）
+- [x] M0 工程化：README（中英）、许可证、CI / 发版 / 发行版矩阵流水线、打包文件、安装脚本
+- [x] M0 核心：qsh-core + qsh / qsh-server，QUIC / TLS / ssh 管道三路竞速、断线续传、本机测试 63 项全过
+- [ ] M0 收尾：GitHub CI 全绿、9 个发行版端到端通过、对抗性代码审查的问题修完、协议补记实现中的偏差（bootstrap `tty`、KEY_CONFIRM 无状态文件时的行为等），然后公开仓库、发 v0.1.0
