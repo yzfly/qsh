@@ -321,24 +321,28 @@ async fn the_daemon_budget_applies_from_the_first_byte() {
 }
 
 /// Raw frames written by the test's `peer`, and every frame the mux under test sent back.
-async fn frames_from(mux_out: &mut (impl tokio::io::AsyncRead + Unpin), wait: Duration) -> Vec<Frame> {
+async fn frames_until(
+    mux_out: &mut (impl tokio::io::AsyncRead + Unpin),
+    done: impl Fn(&[Frame]) -> bool,
+) -> Vec<Frame> {
     let mut buf = Vec::new();
-    let _ = tokio::time::timeout(wait, async {
+    let mut frames = Vec::new();
+    let mut at = 0;
+    // Generous: a slow or emulated machine may take a while; done() ends it early
+    let _ = tokio::time::timeout(Duration::from_secs(30), async {
         let mut chunk = [0u8; 4096];
-        loop {
+        while !done(&frames) {
             match mux_out.read(&mut chunk).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => buf.extend_from_slice(&chunk[..n]),
             }
+            while let Ok(Some((f, n))) = Frame::decode(&buf[at..]) {
+                frames.push(f);
+                at += n;
+            }
         }
     })
     .await;
-    let mut frames = Vec::new();
-    let mut at = 0;
-    while let Ok(Some((f, n))) = Frame::decode(&buf[at..]) {
-        frames.push(f);
-        at += n;
-    }
     frames
 }
 
@@ -361,15 +365,16 @@ async fn a_client_refuses_streams_the_server_opens() {
         }
     }
     bw.write_all(&out).await.unwrap();
-    let frames = frames_from(&mut br, Duration::from_millis(500)).await;
+    let reset = |stream| Frame::Reset {
+        stream,
+        code: ErrorCode::UNKNOWN_CHANNEL,
+    };
+    let frames = frames_until(&mut br, |frames| {
+        [1u64, 5, 9].iter().all(|s| frames.contains(&reset(*s)))
+    })
+    .await;
     for stream in [1u64, 5, 9] {
-        assert!(
-            frames.contains(&Frame::Reset {
-                stream,
-                code: ErrorCode::UNKNOWN_CHANNEL
-            }),
-            "{frames:?}"
-        );
+        assert!(frames.contains(&reset(stream)), "{frames:?}");
     }
     {
         let st = client.inner.state.lock().unwrap();

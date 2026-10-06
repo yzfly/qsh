@@ -11,6 +11,22 @@ needs a section `## [X.Y.Z] - YYYY-MM-DD` here before its tag is pushed.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-06
+
+### Fixed
+
+- `qsh --help`, the man pages and zsh completions showed literal backticks around `[user@]host`.
+- Tests no longer depend on the machine's speed (distribution builders run them on slow and
+  emulated machines): deadlines instead of fixed sleeps, a time scale for every wait
+  (`QSH_TEST_TIME_SCALE`), large outputs without relying on a fast `yes`, the daemon's real
+  readiness. The ticker used by tests traps SIGINT, as bash may otherwise ignore a ^C that
+  arrives while a child exits.
+
+### Changed
+
+- rcgen 0.14 and clap_mangen 0.3, the versions Debian and Fedora package; certificates are
+  unchanged.
+
 ## [0.2.0] - 2026-10-06
 
 ### Added
@@ -72,7 +88,8 @@ The first preview. The protocol and command line may still change before 1.0.
   Linux 9, Alpine, Arch, openSUSE Tumbleweed and Amazon Linux 2023, with UDP blocked and with
   only ssh reachable.
 
-[Unreleased]: https://github.com/yzfly/qsh/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/yzfly/qsh/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/yzfly/qsh/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/yzfly/qsh/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/yzfly/qsh/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/yzfly/qsh/releases/tag/v0.1.0

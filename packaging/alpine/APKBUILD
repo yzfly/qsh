@@ -38,10 +38,7 @@ build() {
 }
 
 check() {
-	# The skipped test expects `yes` to outrun the server's pacing within two seconds; busybox
-	# yes, one write per line, does not.
-	cargo test --frozen --package qsh-core --package qsh-cli -- \
-		--skip a_hangup_with_much_pending_output_ends_with_gap_and_exit
+	cargo test --frozen --package qsh-core --package qsh-cli
 }
 
 package() {

@@ -23,7 +23,7 @@ impl Term {
     }
 
     async fn wait_for(&self, needle: &str) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let deadline = tokio::time::Instant::now() + patience(Duration::from_secs(30));
         while !self.text().contains(needle) {
             assert!(
                 tokio::time::Instant::now() < deadline,
@@ -91,7 +91,7 @@ fn hub_sessions_share_one_connection_and_resume_together() {
             .await
         });
         let socket = paths.hub_socket();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + patience(Duration::from_secs(5));
         while tokio::net::UnixStream::connect(&socket).await.is_err() {
             assert!(tokio::time::Instant::now() < deadline, "the hub did not start");
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -113,8 +113,12 @@ fn hub_sessions_share_one_connection_and_resume_together() {
         t1.wait_for("ping-1").await;
         t2.wait_for("ping-2").await;
 
+        // One connection for all; QUIC, or TLS when a slow machine let it win the race
+        let connections = |stats: &serde_json::Value| {
+            stats["quic_connections"].as_u64().unwrap() + stats["tls_connections"].as_u64().unwrap()
+        };
         let stats = world.stats();
-        assert_eq!(stats["quic_connections"], 1, "one connection for all: {stats}");
+        assert_eq!(connections(&stats), 1, "one connection for all: {stats}");
         assert_eq!(stats["channels"], 3, "{stats}");
         let status = hub::request(&paths, Request::Status).await.unwrap().unwrap();
         assert_eq!(status["sessions"].as_array().unwrap().len(), 3, "{status}");
@@ -131,7 +135,7 @@ fn hub_sessions_share_one_connection_and_resume_together() {
         let expected: Vec<u64> = (1..=*seen.last().unwrap()).collect();
         assert_eq!(seen, expected, "ticks lost or repeated across the reconnect");
         let stats = world.stats();
-        assert_eq!(stats["quic_connections"], 2, "{stats}");
+        assert_eq!(connections(&stats), 2, "{stats}");
 
         // Exit statuses pass through the hub; a client that detaches leaves its session
         t1.input.send(Input::Data(b"\x04".to_vec())).await.unwrap();

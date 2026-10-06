@@ -11,7 +11,7 @@ license.workspace = true
 qsh-cli = { path = "../crates/qsh-cli" }
 clap.workspace = true
 # Only here, never in the shipped programs
-clap_mangen = "0.2"
+clap_mangen = "0.3"
 clap_complete = "4.5"
 
 [lints]

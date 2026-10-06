@@ -206,7 +206,7 @@ impl Drop for World {
         }
         // The sessions' programs get SIGHUP when the daemon stops; kill what is left
         let home = self.dir.join("home");
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + patience(Duration::from_secs(5));
         let mut left = processes_in(&home);
         while !left.is_empty() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(100));
@@ -347,8 +347,22 @@ pub fn free_port() -> u16 {
     }
 }
 
+/// How long to wait for something that takes `timeout` on a fast machine: that times
+/// QSH_TEST_TIME_SCALE (default 6). Distributions build and test on slow, loaded and emulated
+/// machines (riscv64 or armv7 under qemu: ten times slower, with pauses of seconds); only a
+/// failing test waits the whole time. Every wait of these helpers goes through this.
+pub fn patience(timeout: Duration) -> Duration {
+    let scale = std::env::var("QSH_TEST_TIME_SCALE")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(6)
+        .max(1);
+    timeout * scale
+}
+
+/// Wait until `done`, at most [`patience`]`(timeout)`; then fail if `must`.
 pub fn wait_until(timeout: Duration, mut done: impl FnMut() -> bool, what: &str, must: bool) {
-    let deadline = Instant::now() + timeout;
+    let deadline = Instant::now() + patience(timeout);
     while !done() {
         if Instant::now() >= deadline {
             assert!(!must, "timed out waiting for {what}");
@@ -365,16 +379,33 @@ pub struct Tty {
     pub out: Arc<Mutex<Vec<u8>>>,
     /// The terminal itself, to look at its modes.
     pub slave: fs::File,
+    /// Where qsh's stderr goes instead of the terminal ([`Tty::spawn_logged`]).
+    pub log: Option<PathBuf>,
 }
 
 impl Tty {
-    pub fn spawn(mut command: Command) -> Tty {
+    pub fn spawn(command: Command) -> Tty {
+        Tty::start(command, None)
+    }
+
+    /// Like [`Tty::spawn`], with stderr appended to `log`: run qsh with `-vv` this way to get its
+    /// log, which is printed when the test fails. qsh's own messages (escapes like `~s`, notices)
+    /// go there too; see [`Tty::wait_for_log`].
+    pub fn spawn_logged(command: Command, log: PathBuf) -> Tty {
+        Tty::start(command, Some(log))
+    }
+
+    fn start(mut command: Command, log: Option<PathBuf>) -> Tty {
         let (master, slave) = qsh_core::sys::openpty(100, 30).unwrap();
         let slave = fs::File::from(slave);
+        let stderr = match &log {
+            Some(path) => fs::OpenOptions::new().create(true).append(true).open(path).unwrap(),
+            None => slave.try_clone().unwrap(),
+        };
         command
             .stdin(slave.try_clone().unwrap())
             .stdout(slave.try_clone().unwrap())
-            .stderr(slave.try_clone().unwrap());
+            .stderr(stderr);
         let child = command.spawn().unwrap();
         let master = fs::File::from(master);
         let mut reader = master.try_clone().unwrap();
@@ -394,6 +425,29 @@ impl Tty {
             master,
             out,
             slave,
+            log,
+        }
+    }
+
+    /// What qsh wrote to its log so far ([`Tty::spawn_logged`]).
+    pub fn log_text(&self) -> String {
+        self.log
+            .as_ref()
+            .and_then(|path| fs::read(path).ok())
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_default()
+    }
+
+    /// Wait for `needle` in qsh's log ([`Tty::spawn_logged`]).
+    pub fn wait_for_log(&self, needle: &str, timeout: Duration) {
+        let deadline = Instant::now() + patience(timeout);
+        while !self.log_text().contains(needle) {
+            assert!(
+                Instant::now() < deadline,
+                "no {needle:?} in the log {:?}",
+                self.log_text()
+            );
+            std::thread::sleep(Duration::from_millis(50));
         }
     }
 
@@ -406,8 +460,9 @@ impl Tty {
         String::from_utf8_lossy(&self.out.lock().unwrap()).into_owned()
     }
 
+    /// Wait for `needle` on the terminal, at most [`patience`]`(timeout)`.
     pub fn wait_for(&self, needle: &str, timeout: Duration) {
-        let deadline = Instant::now() + timeout;
+        let deadline = Instant::now() + patience(timeout);
         while !self.text().contains(needle) {
             assert!(Instant::now() < deadline, "no {needle:?} in {:?}", self.text());
             std::thread::sleep(Duration::from_millis(50));
@@ -419,8 +474,9 @@ impl Tty {
         self.master.flush().unwrap();
     }
 
+    /// qsh's exit code, waiting at most [`patience`]`(timeout)` for it to exit.
     pub fn exit_code(&mut self, timeout: Duration) -> i32 {
-        let deadline = Instant::now() + timeout;
+        let deadline = Instant::now() + patience(timeout);
         loop {
             if let Some(status) = self.child.try_wait().unwrap() {
                 return status.code().unwrap_or(-1);
@@ -435,6 +491,10 @@ impl Drop for Tty {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if self.log.is_some() && (std::thread::panicking() || std::env::var_os("QSH_TEST_LOGS").is_some()) {
+            eprintln!("--- qsh log\n{}", self.log_text());
+            eprintln!("--- qsh terminal\n{:?}", self.text());
+        }
     }
 }
 
@@ -451,4 +511,14 @@ pub fn ticks(text: &str) -> Vec<u64> {
         .collect()
 }
 
-pub const TICKER: &str = "i=0; while [ $i -lt 100000 ]; do i=$((i+1)); echo tick-$i; sleep 0.05; done";
+/// Prints `tick-N` every 50 ms; ends with status 130 on Ctrl-C.
+///
+/// The trap is what makes Ctrl-C end it in every shell. Without it, bash (the login shell of
+/// the test user on Arch, and /bin/sh there) applies "wait and cooperative exit": a SIGINT that
+/// arrives while it waits for a child which then exits normally (a `sleep` that had just
+/// finished) is taken as handled by the child, and the loop goes on. The terminal still echoes
+/// the `^C`. That made `an_interactive_session_survives_a_killed_transport` hang once on Arch.
+/// With a trap the shell runs it once the child is gone, whatever the child's status. (No
+/// single quotes in it: hub.rs runs it as `sh -c 'TICKER'`.)
+pub const TICKER: &str =
+    "trap \"exit 130\" INT; i=0; while [ $i -lt 100000 ]; do i=$((i+1)); echo tick-$i; sleep 0.05; done";

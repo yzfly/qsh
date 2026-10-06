@@ -252,18 +252,24 @@ mod tests {
 
     #[test]
     fn a_source_that_fails_too_often_is_blocked_until_its_bucket_refills() {
+        let refill = Duration::from_millis(500);
         let gate = Arc::new(Gate::new(Limits {
             failure_burst: 3,
-            failure_refill: Duration::from_millis(200),
+            failure_refill: refill,
             ..Limits::default()
         }));
+        let started = Instant::now();
         for _ in 0..3 {
             assert!(gate.admit(ip("192.0.2.9")).is_ok());
             gate.failed("192.0.2.9".parse().unwrap());
         }
-        assert_eq!(gate.admit(ip("192.0.2.9")).unwrap_err(), Refusal::Blocked);
+        let refused = gate.admit(ip("192.0.2.9")).map(|_| ());
+        // Unless this machine was so slow that a token came back meanwhile
+        if started.elapsed() < refill {
+            assert_eq!(refused, Err(Refusal::Blocked));
+        }
         assert!(gate.admit(ip("192.0.2.10")).is_ok());
-        std::thread::sleep(Duration::from_millis(250));
+        std::thread::sleep(refill + Duration::from_millis(50));
         assert!(gate.admit(ip("192.0.2.9")).is_ok());
     }
 }

@@ -8,7 +8,7 @@ default-members = ["crates/qsh-core", "crates/qsh-cli"]
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 # quinn 0.11.11 needs 1.85; that is also the rustc of Debian 13 (trixie)
 rust-version = "1.85"
@@ -18,12 +18,12 @@ homepage = "https://github.com/yzfly/qsh"
 authors = ["yzfly <zphyix@gmail.com>"]
 
 [workspace.dependencies]
-qsh-core = { path = "crates/qsh-core", version = "0.2.0", default-features = false }
+qsh-core = { path = "crates/qsh-core", version = "0.2.1", default-features = false }
 tokio = { version = "1.40", default-features = false }
 quinn = { version = "0.11.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rustls = { version = "0.23.20", default-features = false, features = ["ring", "std"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
-rcgen = { version = "0.13", default-features = false, features = ["ring", "crypto"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "crypto"] }
 ring = "0.17.8"
 serde = { version = "1.0.200", features = ["derive"] }
 serde_json = "1.0.120"

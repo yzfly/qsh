@@ -15,6 +15,9 @@ use qsh_core::Paths;
 use tokio::io::BufReader;
 use tokio::sync::oneshot;
 
+/// How long a daemon may take to start: generous, for slow and emulated builders.
+const STARTUP: Duration = Duration::from_secs(30);
+
 struct TestDaemon {
     paths: Paths,
     dir: PathBuf,
@@ -35,17 +38,30 @@ impl TestDaemon {
         // The tests cause AUTH_FAILED on purpose, all from 127.0.0.1
         config.preauth.failure_burst = 1000;
         let (stop, stopped) = oneshot::channel::<()>();
-        let task = tokio::spawn(async move {
+        let mut task = tokio::spawn(async move {
             Daemon::run_until(config, async {
                 let _ = stopped.await;
             })
             .await
             .map_err(|e| e.to_string())
         });
-        for _ in 0..200 {
-            if paths.control_socket().exists() {
+        // Ready once its control socket accepts connections (it is bound after the ports and
+        // the certificate, which a slow or emulated machine takes a while to make). The daemon
+        // runs in this process: its log is this test's captured stderr
+        let deadline = tokio::time::Instant::now() + STARTUP;
+        loop {
+            if let Ok(Some(_)) = paths.connect_private(&paths.control_socket()).await {
                 break;
             }
+            if task.is_finished() {
+                let ended = (&mut task).await;
+                panic!("the daemon {name} ended before it was ready: {ended:?}");
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the daemon {name} is not ready after {STARTUP:?}: nothing accepts on {}",
+                paths.control_socket().display()
+            );
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         TestDaemon {
@@ -77,7 +93,7 @@ impl TestDaemon {
             let _ = stop.send(());
         }
         if let Some(task) = self.task.take() {
-            tokio::time::timeout(Duration::from_secs(10), task)
+            tokio::time::timeout(STARTUP, task)
                 .await
                 .expect("the daemon stops")
                 .unwrap()
@@ -135,7 +151,7 @@ struct Channel {
 
 impl Channel {
     async fn next(&mut self) -> Option<Message> {
-        tokio::time::timeout(Duration::from_secs(15), read_message(&mut self.recv, MAX_TERMINAL))
+        tokio::time::timeout(Duration::from_secs(60), read_message(&mut self.recv, MAX_TERMINAL))
             .await
             .expect("a message in time")
             .unwrap()
@@ -177,13 +193,46 @@ fn pin(c: &Credentials) -> Fingerprint {
     Fingerprint::from_hex(&c.cert_sha256).unwrap()
 }
 
+/// Wait until `path` exists: a session program's sign that it got somewhere. Generous, for
+/// slow and emulated builders.
+async fn wait_for_file(path: &std::path::Path) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while !path.exists() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no {} after 60 s",
+            path.display()
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// A program that writes `mib` MiB to its terminal in large writes, whatever the speed of the
+/// system's `yes` (busybox's writes a line at a time), then creates `marker`.
+fn big_writer(mib: u32, marker: &std::path::Path) -> String {
+    format!(
+        "head -c {} /dev/zero | tr '\\\\0' y; touch {}",
+        mib << 20,
+        marker.display()
+    )
+}
+
 /// Review H2: an ACK the client sent before an OUTPUT_GAP reached it is valid (protocol.md
 /// 7.5); the attachment goes on. It used to fail with SEQUENCE_ERROR.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_ack_in_flight_across_a_gap_is_accepted() {
     let d = TestDaemon::start("gap", 64 * 1024).await;
+    // 1 MiB at once overflows the 64 KiB replay buffer while the client does not read; then
+    // output that goes on for good
+    let marker = d.dir.join("written");
+    let command = format!(
+        "{}; while :; do head -c 1048576 /dev/zero | tr '\\\\0' y; done",
+        big_writer(1, &marker)
+    );
     let c = d
-        .boot(r#"{"qsh":1,"versions":[1],"cols":80,"rows":24,"command":"yes"}"#)
+        .boot(&format!(
+            r#"{{"qsh":1,"versions":[1],"cols":80,"rows":24,"command":"{command}"}}"#
+        ))
         .await;
     let client = hello(c.tcp, pin(&c)).await;
     let mut ch = attach(&client, &c, &key(&c), 0, ATTACH_FRESH).await;
@@ -208,8 +257,8 @@ async fn an_ack_in_flight_across_a_gap_is_accepted() {
                     .await;
                 }
                 if outputs == 1 {
-                    // A slow reader: `yes` overflows the replay buffer meanwhile
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    // A slow reader: the program overflows the replay buffer meanwhile
+                    wait_for_file(&marker).await;
                 }
             }
             Message::OutputGap { from, to } if outputs > 0 && !gap_acked => {
@@ -298,20 +347,36 @@ async fn stalled_handshakes_are_capped_per_source() {
     let status = qsh_core::server::request_status(&d.paths).await.unwrap().unwrap();
     let pending = status["stats"]["unauthenticated"].as_u64().unwrap();
     assert!(pending <= 8, "{status}");
-    // The refused ones were closed at once: reading gives the end
+    // The refused ones were closed at once: reading gives the end. Read all of them together,
+    // the 8 admitted ones (which say nothing) until the deadline: a slow machine needs a while
+    // to get to all 40
+    let mut reads = tokio::task::JoinSet::new();
+    for mut s in held {
+        reads.spawn(async move {
+            let mut b = [0u8; 1];
+            let read = tokio::time::timeout(Duration::from_secs(5), tokio::io::AsyncReadExt::read(&mut s, &mut b));
+            (matches!(read.await, Ok(Ok(0))), s)
+        });
+    }
     let mut closed = 0;
-    for s in &mut held {
-        let mut b = [0u8; 1];
-        if let Ok(Ok(0)) =
-            tokio::time::timeout(Duration::from_millis(50), tokio::io::AsyncReadExt::read(s, &mut b)).await
-        {
-            closed += 1;
-        }
+    let mut held = Vec::new();
+    while let Some(read) = reads.join_next().await {
+        let (eof, s) = read.unwrap();
+        closed += usize::from(eof);
+        held.push(s);
     }
     assert!(closed >= 32, "{closed} closed");
-    // Once they go, a real client gets in
+    // Once they go, a real client gets in, when the daemon has seen them go
     drop(held);
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    let deadline = tokio::time::Instant::now() + STARTUP;
+    loop {
+        let status = qsh_core::server::request_status(&d.paths).await.unwrap().unwrap();
+        if status["stats"]["unauthenticated"].as_u64() == Some(0) {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{status}");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
     let client = hello(c.tcp, pin(&c)).await;
     let mut ch = attach(&client, &c, &key(&c), LATEST, ATTACH_FRESH).await;
     assert!(matches!(ch.next().await, Some(Message::Attached { .. })));
@@ -348,9 +413,9 @@ async fn only_auth_failures_count_and_never_against_an_attached_connection() {
     let other = hello(c.tcp, pin(&c)).await;
     for _ in 0..3 {
         let mut bad = attach(&other, &c, &wrong, LATEST, ATTACH_FRESH).await;
-        let _ = tokio::time::timeout(Duration::from_secs(3), read_message(&mut bad.recv, MAX_TERMINAL)).await;
+        let _ = tokio::time::timeout(Duration::from_secs(10), read_message(&mut bad.recv, MAX_TERMINAL)).await;
     }
-    tokio::time::timeout(Duration::from_secs(5), other.conn.closed())
+    tokio::time::timeout(Duration::from_secs(30), other.conn.closed())
         .await
         .expect("closed after three failures");
 }
@@ -360,14 +425,21 @@ async fn only_auth_failures_count_and_never_against_an_attached_connection() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_hangup_with_much_pending_output_ends_with_gap_and_exit() {
     let d = TestDaemon::start("hup", 8 << 20).await;
+    // 6 MiB: far more than the pacing window (512 KiB) and the messages sent after a hangup
+    // (64 of 16 KiB) together, within the replay buffer; then a program SIGHUP ends
+    let marker = d.dir.join("written");
+    let command = format!("{}; exec sleep 1000", big_writer(6, &marker));
     let c = d
-        .boot(r#"{"qsh":1,"versions":[1],"cols":80,"rows":24,"command":"yes"}"#)
+        .boot(&format!(
+            r#"{{"qsh":1,"versions":[1],"cols":80,"rows":24,"command":"{command}"}}"#
+        ))
         .await;
     let client = hello(c.tcp, pin(&c)).await;
     let mut ch = attach(&client, &c, &key(&c), 0, ATTACH_FRESH).await;
     assert!(matches!(ch.next().await, Some(Message::Attached { .. })));
-    // Never acknowledge: pacing holds the server back while `yes` fills the replay buffer
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Never acknowledge: pacing holds the server back while the program fills the replay
+    // buffer. Once it is done, the server has it all but what is still in the terminal
+    wait_for_file(&marker).await;
     ch.send(Message::Hangup).await;
     let mut received = 0u64;
     let mut gap = false;

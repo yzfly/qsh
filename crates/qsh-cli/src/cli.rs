@@ -35,8 +35,8 @@ pub struct QshArgs {
     /// ssh options
     #[command(flatten)]
     pub ssh: SshArgs,
-    /// `[user@]host`, or a host alias from ~/.ssh/config
-    #[arg(value_name = "DESTINATION")]
+    /// Where to connect: user@host or host, or a host alias from ~/.ssh/config
+    #[arg(value_name = "DESTINATION", help = "[user@]host, or a host alias from ~/.ssh/config")]
     pub destination: String,
     /// Command to run instead of a login shell
     #[arg(value_name = "COMMAND", trailing_var_arg = true, allow_hyphen_values = true)]
@@ -177,17 +177,20 @@ pub enum QshCommand {
                       Without SESSION: the only detached session, or a choice among them."
     )]
     Attach {
-        /// `[user@]host` the session runs on
-        #[arg(value_name = "DESTINATION")]
+        /// The host the session runs on (user@host or host)
+        #[arg(value_name = "DESTINATION", help = "[user@]host the session runs on")]
         destination: String,
-        /// Session id (or a unique prefix of it) or name, as `qsh ls` shows them
+        /// Session id (or a unique prefix of it) or name, as qsh ls shows them
         #[arg(value_name = "SESSION")]
         session: Option<String>,
     },
     /// List sessions: on DESTINATION (over ssh), or the saved ones of every host
     Ls {
-        /// `[user@]host` to ask; without it, the sessions saved on this machine (no network)
-        #[arg(value_name = "DESTINATION")]
+        /// The host to ask (user@host or host); without it, the sessions saved on this machine
+        #[arg(
+            value_name = "DESTINATION",
+            help = "[user@]host to ask; without it, the sessions saved on this machine (no network)"
+        )]
         destination: Option<String>,
         /// Print JSON, for scripts
         #[arg(long)]
@@ -195,10 +198,10 @@ pub enum QshCommand {
     },
     /// End a session: its programs get SIGHUP
     Kill {
-        /// `[user@]host` the session runs on
-        #[arg(value_name = "DESTINATION")]
+        /// The host the session runs on (user@host or host)
+        #[arg(value_name = "DESTINATION", help = "[user@]host the session runs on")]
         destination: String,
-        /// Session id (or a unique prefix of it) or name, as `qsh ls` shows them
+        /// Session id (or a unique prefix of it) or name, as qsh ls shows them
         #[arg(value_name = "SESSION", required_unless_present = "all", conflicts_with = "all")]
         session: Option<String>,
         /// End every session on DESTINATION
@@ -213,8 +216,8 @@ pub enum QshCommand {
                       over; as a last resort it runs the install script on the host. Only in \
                       builds with the cargo feature self-install.")]
     Install {
-        /// `[user@]host` to install on
-        #[arg(value_name = "DESTINATION")]
+        /// The host to install on (user@host or host)
+        #[arg(value_name = "DESTINATION", help = "[user@]host to install on")]
         destination: String,
         /// Copy this qsh-server binary instead (built for the host's system)
         #[arg(long, value_name = "FILE")]
@@ -279,8 +282,8 @@ pub const RESERVED: &[&str] = &["doctor"];
     name = "qsh-server",
     version,
     about = "Server side of qsh: the per-user daemon, and the commands qsh runs over ssh",
-    long_about = "qsh-server needs no root and no configuration: `qsh HOST` runs \
-                  `qsh-server bootstrap` over ssh, which starts the per-user daemon on demand. \
+    long_about = "qsh-server needs no root and no configuration: qsh HOST runs \
+                  qsh-server bootstrap over ssh, which starts the per-user daemon on demand. \
                   The daemon listens on the first port of 60443-60542 free on both UDP and TCP.",
     after_help = "Environment: QSH_SERVER_PORTS=FIRST-LAST sets the port range of daemons \
                   started on demand."
@@ -432,6 +435,41 @@ mod tests {
         assert!(help.contains("attach") && help.contains("DESTINATION"), "{help}");
         let help = parse_qsh(["qsh", "ls", "--help"]).unwrap_err().to_string();
         assert!(help.contains("--json"), "{help}");
+    }
+
+    /// What --help, the man pages and the completions show is plain text: no Markdown from doc
+    /// comments (backticks), and [user@]host as written.
+    #[test]
+    fn help_texts_are_plain() {
+        fn texts(cmd: &clap::Command, out: &mut Vec<String>) {
+            out.extend(
+                [cmd.get_about(), cmd.get_long_about(), cmd.get_after_help()]
+                    .into_iter()
+                    .flatten()
+                    .map(|t| t.to_string()),
+            );
+            for arg in cmd.get_arguments() {
+                out.extend(
+                    [arg.get_help(), arg.get_long_help()]
+                        .into_iter()
+                        .flatten()
+                        .map(|t| t.to_string()),
+                );
+            }
+            for sub in cmd.get_subcommands() {
+                texts(sub, out);
+            }
+        }
+        let mut all = Vec::new();
+        texts(&qsh_command(), &mut all);
+        texts(&ServerArgs::command(), &mut all);
+        for text in &all {
+            assert!(!text.contains('`'), "{text:?}");
+        }
+        let help = parse_qsh(["qsh", "--help"]).unwrap_err().to_string();
+        assert!(help.contains("[user@]host, or a host alias"), "{help}");
+        let help = parse_qsh(["qsh", "attach", "--help"]).unwrap_err().to_string();
+        assert!(help.contains("[user@]host the session runs on"), "{help}");
     }
 
     #[test]

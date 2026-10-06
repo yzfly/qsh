@@ -1945,7 +1945,10 @@ mod tests {
     /// After a network change every connection is probed: one that answers is kept, one that
     /// answers nothing is closed (its sessions then race the transports again), and sessions
     /// waiting out a back-off are woken.
-    #[tokio::test]
+    ///
+    /// On paused time: the probe's 300 ms pass only once everything else waits, so the PONG
+    /// over the in-memory pipe is always handled first, however slow the machine.
+    #[tokio::test(start_paused = true)]
     async fn a_network_change_probes_connections_and_wakes_waiting_sessions() {
         for answer in [true, false] {
             let (a, b) = tokio::io::duplex(1 << 16);

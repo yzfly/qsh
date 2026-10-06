@@ -129,18 +129,16 @@ source package too), Debian 12 (rustup 1.85) and Ubuntu 24.04 (`rustc-1.91`); te
 `initial-upload-closes-no-bugs`) and `hardening-no-fortify-functions` (info, normal for Rust);
 installs and works.
 
-Against the archive (debian:unstable, October 2026) every crate is there except two at a
-semver-incompatible version: `rcgen` (unstable has 0.14, qsh uses 0.13) and `clap_mangen`
-(0.3, xtask uses 0.2). Moving qsh to rcgen 0.14 and clap_mangen 0.3 makes the plain dh-cargo
-build possible with no new crate packages.
+Against the archive (debian:unstable, October 2026) every crate is there, at a version in the
+ranges of `debian/control`, since qsh moved to `rcgen` 0.14 and `clap_mangen` 0.3 (the versions
+unstable has): the plain dh-cargo build needs no new crate packages.
 
 For the archive (Debian, and from there Ubuntu):
 
 1. Every dependency must be in the archive as `librust-*-dev` at a version that satisfies the
    semver ranges (the `>=` / `<<` pairs in `debian/control`); vendored crates are not accepted in
-   Debian main. The `debian:unstable (archive crates)` job checks this on every run. Today that
-   means bumping rcgen and clap_mangen upstream (above); a crate that is missing or too old is
-   packaged with `debcargo` in the Rust team's `debcargo-conf` repository
+   Debian main. The `debian:unstable (archive crates)` job checks this on every run. A crate that
+   is missing or too old is packaged with `debcargo` in the Rust team's `debcargo-conf` repository
    (salsa.debian.org/rust-team/debcargo-conf), one merge request per crate.
 2. File an ITP (`reportbug wnpp`, "ITP: qsh -- remote shell over QUIC whose sessions survive
    network changes") and put its number into `debian/changelog` (`Closes: #NNNNNN`).
@@ -156,13 +154,13 @@ Status: builds with `--with vendor` on Fedora (latest, 44), tests pass, rpmlint:
 0 warnings; bundled `Provides: bundled(crate(...))` generated from `cargo-vendor.txt`; installs
 and works.
 
-Against Fedora's crates (rawhide, October 2026) the same two are missing as in Debian: `rcgen`
-0.13 (Fedora has 0.14) and `clap_mangen` 0.2 (0.3); everything else is packaged.
+Against Fedora's crates (rawhide, October 2026) everything is packaged, at the versions qsh uses
+since it moved to `rcgen` 0.14 and `clap_mangen` 0.3 (the versions rawhide has).
 
 For Fedora:
 
-1. Bump rcgen and clap_mangen upstream, then the `fedora:rawhide (Fedora crates)` job builds
-   without `--with vendor`. A crate that is still missing gets a `rust-CRATE` package: generate
+1. The `fedora:rawhide (Fedora crates)` job builds without `--with vendor`. A crate that is
+   missing (after a future dependency change) gets a `rust-CRATE` package: generate
    it with `rust2rpm CRATE`, submit a review request in Red Hat Bugzilla (product Fedora,
    component Package Review).
 2. Then qsh itself: a review request for `qsh` with this spec built without `--with vendor`

@@ -1,12 +1,12 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH qsh-server 1  "qsh-server 0.2.0" 
+.TH qsh-server 1  "qsh-server 0.2.1" 
 .SH NAME
 qsh\-server \- Server side of qsh: the per\-user daemon, and the commands qsh runs over ssh
 .SH SYNOPSIS
 \fBqsh\-server\fR [\fB\-v \fR]... [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] <\fIsubcommands\fR>
 .SH DESCRIPTION
-qsh\-server needs no root and no configuration: `qsh HOST` runs `qsh\-server bootstrap` over ssh, which starts the per\-user daemon on demand. The daemon listens on the first port of 60443\-60542 free on both UDP and TCP.
+qsh\-server needs no root and no configuration: qsh HOST runs qsh\-server bootstrap over ssh, which starts the per\-user daemon on demand. The daemon listens on the first port of 60443\-60542 free on both UDP and TCP.
 .SH OPTIONS
 .TP
 \fB\-v\fR
@@ -39,7 +39,7 @@ Print this message or the help of the given subcommand(s)
 .SH EXTRA
 Environment: QSH_SERVER_PORTS=FIRST\-LAST sets the port range of daemons started on demand.
 .SH VERSION
-v0.2.0
+v0.2.1
 .SH FILES
 .TP
 .I $XDG_RUNTIME_DIR/qsh/control.sock

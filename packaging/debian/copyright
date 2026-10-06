@@ -19,6 +19,22 @@ Files: vendor/anstyle-1.0.14/*
 Copyright: The anstyle authors
 License: MIT or Apache-2.0
 
+Files: vendor/asn1-rs-0.7.2/*
+Copyright: Pierre Chifflier
+License: MIT or Apache-2.0
+
+Files: vendor/asn1-rs-derive-0.6.0/*
+Copyright: Pierre Chifflier
+License: MIT or Apache-2.0
+
+Files: vendor/asn1-rs-impl-0.2.0/*
+Copyright: Pierre Chifflier
+License: MIT or Apache-2.0
+
+Files: vendor/autocfg-1.5.1/*
+Copyright: Josh Stone
+License: Apache-2.0 or MIT
+
 Files: vendor/bumpalo-3.20.3/*
 Copyright: Nick Fitzgerald
 License: MIT or Apache-2.0
@@ -64,7 +80,7 @@ Files: vendor/clap_lex-1.1.1/*
 Copyright: The clap_lex authors
 License: MIT or Apache-2.0
 
-Files: vendor/clap_mangen-0.2.33/*
+Files: vendor/clap_mangen-0.3.3/*
 Copyright: The clap_mangen authors
 License: MIT or Apache-2.0
 
@@ -72,8 +88,20 @@ Files: vendor/cpufeatures-0.3.1/*
 Copyright: RustCrypto Developers
 License: MIT or Apache-2.0
 
+Files: vendor/data-encoding-2.11.1/*
+Copyright: The data-encoding authors
+License: MIT
+
+Files: vendor/der-parser-10.0.0/*
+Copyright: Pierre Chifflier
+License: MIT or Apache-2.0
+
 Files: vendor/deranged-0.5.8/*
 Copyright: Jacob Pratt
+License: MIT or Apache-2.0
+
+Files: vendor/displaydoc-0.2.7/*
+Copyright: Jane Lusby
 License: MIT or Apache-2.0
 
 Files: vendor/equivalent-1.0.2/*
@@ -129,6 +157,10 @@ Files: vendor/js-sys-0.3.106/*
 Copyright: The wasm-bindgen Developers
 License: MIT or Apache-2.0
 
+Files: vendor/lazy_static-1.5.1/*
+Copyright: Marvin Löbel
+License: MIT or Apache-2.0
+
 Files: vendor/libc-0.2.190/*
 Copyright: The libc authors
 License: MIT or Apache-2.0
@@ -142,14 +174,38 @@ Copyright: Andrew Gallant
  bluss
 License: Unlicense or MIT
 
+Files: vendor/minimal-lexical-0.2.1/*
+Copyright: Alex Huszagh
+License: MIT or Apache-2.0
+
 Files: vendor/mio-1.2.4/*
 Copyright: Carl Lerche
  Thomas de Zeeuw
  Tokio Contributors
 License: MIT
 
+Files: vendor/nom-7.1.3/*
+Copyright: contact@geoffroycouprie.com
+License: MIT
+
+Files: vendor/num-bigint-0.4.8/*
+Copyright: The Rust Project Developers
+License: MIT or Apache-2.0
+
 Files: vendor/num-conv-0.1.0/*
 Copyright: Jacob Pratt
+License: MIT or Apache-2.0
+
+Files: vendor/num-integer-0.1.47/*
+Copyright: The Rust Project Developers
+License: MIT or Apache-2.0
+
+Files: vendor/num-traits-0.2.19/*
+Copyright: The Rust Project Developers
+License: MIT or Apache-2.0
+
+Files: vendor/oid-registry-0.8.1/*
+Copyright: Pierre Chifflier
 License: MIT or Apache-2.0
 
 Files: vendor/once_cell-1.21.4/*
@@ -202,7 +258,7 @@ Files: vendor/rand_pcg-0.10.2/*
 Copyright: The Rand Project Developers
 License: MIT or Apache-2.0
 
-Files: vendor/rcgen-0.13.2/*
+Files: vendor/rcgen-0.14.7/*
 Copyright: The rcgen authors
 License: MIT or Apache-2.0
 
@@ -217,6 +273,10 @@ License: MIT or Apache-2.0
 Files: vendor/rustc-hash-2.1.3/*
 Copyright: The Rust Project Developers
 License: Apache-2.0 or MIT
+
+Files: vendor/rusticata-macros-4.1.0/*
+Copyright: Pierre Chifflier
+License: MIT or Apache-2.0
 
 Files: vendor/rustls-0.23.45/*
 Copyright: The rustls authors
@@ -286,9 +346,17 @@ Copyright: Isis Lovecruft
  Henry de Valence
 License: BSD-3-Clause
 
+Files: vendor/syn-2.0.119/*
+Copyright: David Tolnay
+License: MIT or Apache-2.0
+
 Files: vendor/syn-3.0.6/*
 Copyright: David Tolnay
 License: MIT or Apache-2.0
+
+Files: vendor/synstructure-0.13.2/*
+Copyright: Nika Layzell
+License: MIT
 
 Files: vendor/thiserror-2.0.21/*
 Copyright: David Tolnay
@@ -304,6 +372,11 @@ Copyright: Jacob Pratt
 License: MIT or Apache-2.0
 
 Files: vendor/time-core-0.1.7/*
+Copyright: Jacob Pratt
+ Time contributors
+License: MIT or Apache-2.0
+
+Files: vendor/time-macros-0.2.25/*
 Copyright: Jacob Pratt
  Time contributors
 License: MIT or Apache-2.0
@@ -432,6 +505,10 @@ License: MIT or Apache-2.0
 Files: vendor/winnow-1.0.4/*
 Copyright: The winnow authors
 License: MIT
+
+Files: vendor/x509-parser-0.18.1/*
+Copyright: Pierre Chifflier
+License: MIT or Apache-2.0
 
 Files: vendor/yasna-0.5.2/*
 Copyright: Masaki Hara

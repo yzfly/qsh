@@ -201,7 +201,7 @@ impl Identity {
         let generated = rcgen::generate_simple_self_signed(vec![SERVER_NAME.to_string()]).map_err(io::Error::other)?;
         Ok(Identity {
             cert: generated.cert.der().clone(),
-            key: PrivatePkcs8KeyDer::from(generated.key_pair.serialize_der()),
+            key: PrivatePkcs8KeyDer::from(generated.signing_key.serialize_der()),
         })
     }
 
@@ -502,6 +502,43 @@ mod tests {
         let b = Identity::load_or_create(&dir).unwrap();
         assert_eq!(a.fingerprint(), b.fingerprint());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The daemon's certificate stays what it was with rcgen 0.13 (checked on the DER, without
+    /// an X.509 parser): an ECDSA P-256 key in PKCS#8, signed with ecdsa-with-SHA256 by itself
+    /// (issuer = subject), for the protocol's server name, valid from 1975 to 4096.
+    #[test]
+    fn the_identity_is_a_self_signed_p256_certificate_valid_for_ever() {
+        use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+        fn count(haystack: &[u8], needle: &[u8]) -> usize {
+            haystack.windows(needle.len()).filter(|w| *w == needle).count()
+        }
+        let identity = Identity::generate().unwrap();
+        let key = EcdsaKeyPair::from_pkcs8(
+            &ECDSA_P256_SHA256_ASN1_SIGNING,
+            identity.key.secret_pkcs8_der(),
+            &SystemRandom::new(),
+        )
+        .expect("a P-256 key");
+        let cert = identity.cert.as_ref();
+        assert_eq!(
+            count(cert, key.public_key().as_ref()),
+            1,
+            "the certificate is for this key"
+        );
+        // ecdsa-with-SHA256: in the TBS certificate and before the signature
+        assert_eq!(
+            count(cert, &[0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02]),
+            2
+        );
+        // Issuer and subject: the same name
+        assert_eq!(count(cert, b"rcgen self signed cert"), 2);
+        // The subject alternative name: dNSName [2]
+        let san = [&[0x82, SERVER_NAME.len() as u8][..], SERVER_NAME.as_bytes()].concat();
+        assert_eq!(count(cert, &san), 1);
+        // notBefore (UTCTime) and notAfter (GeneralizedTime)
+        assert_eq!(count(cert, b"\x17\x0d750101000000Z"), 1);
+        assert_eq!(count(cert, b"\x18\x0f40960101000000Z"), 1);
     }
 
     /// A TLS handshake succeeds against the pinned certificate and fails against another, with

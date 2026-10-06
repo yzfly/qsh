@@ -10,7 +10,9 @@ use common::*;
 
 #[test]
 fn a_command_round_trip_keeps_output_input_and_exit_code() {
-    let world = World::new("echo");
+    let mut world = World::new("echo");
+    // QUIC only, for the connection count below: on a slow machine TLS, 400 ms later, could win
+    world.set("QSH_TRANSPORTS", "quic");
     // No terminal: plain bytes out, the remote exit status back
     let out = world
         .qsh(&["srv", "--", "echo hi; exit 7"])
@@ -81,26 +83,28 @@ fn a_host_without_qsh_server_exits_42_with_a_hint() {
 fn when_udp_is_blocked_tls_wins() {
     let mut world = World::new("tls");
     world.block_udp();
-    let started = Instant::now();
-    let out = world
-        .qsh(&["srv", "echo over-tls"])
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
-    assert_eq!(
-        String::from_utf8_lossy(&out.stdout),
-        "over-tls\n",
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    // Well before QUIC's 8 s timeout: TLS started 400 ms in and won
-    assert!(
-        started.elapsed() < Duration::from_secs(6),
-        "took {:?}",
+    let run = || {
+        let started = Instant::now();
+        let out = world
+            .qsh(&["srv", "echo over-tls"])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "over-tls\n",
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         started.elapsed()
-    );
+    };
+    // The first run starts the daemon, which a slow machine takes a while for; the second is
+    // timed: well before QUIC's 8 s timeout, TLS started 400 ms in and won
+    run();
+    let took = run();
+    assert!(took < Duration::from_secs(6), "took {took:?}");
     let stats = world.stats();
-    assert_eq!(stats["tls_connections"], 1, "{stats}");
+    assert_eq!(stats["tls_connections"], 2, "{stats}");
     assert_eq!(stats["quic_connections"], 0, "{stats}");
 }
 
@@ -112,13 +116,15 @@ fn an_interactive_session_survives_a_killed_transport() {
     // Only the ssh pipe gets through: its process can be killed to break the connection
     world.block_udp();
     world.block_tcp();
-    let mut tty = Tty::spawn(world.qsh(&["srv", TICKER]));
+    // qsh's log (and its messages, like ~s) in a file, printed if this fails
+    let log = world.dir.join("qsh.log");
+    let mut tty = Tty::spawn_logged(world.qsh(&["-vv", "srv", TICKER]), log);
     tty.wait_for("tick-5\r", Duration::from_secs(20));
     assert_eq!(world.stats()["pipe_connections"], 1);
 
     // Escapes: ~s shows the connection
     tty.send(b"\r~s");
-    tty.wait_for("srv over ssh", Duration::from_secs(5));
+    tty.wait_for_log("srv over ssh", Duration::from_secs(10));
 
     // The ssh pipe: the fake ssh's shells and qsh-server pipe under them
     let pipes = descendants(tty.child.id(), "pipe --version");
@@ -135,7 +141,7 @@ fn an_interactive_session_survives_a_killed_transport() {
     );
     // While the client reconnects (back-off, then the pipe's 3 s head start for QUIC and TLS)
     // the ticker goes on; afterwards everything it printed arrives
-    tty.wait_for(&format!("tick-{}\r", before + 120), Duration::from_secs(40));
+    tty.wait_for(&format!("tick-{}\r", before + 120), Duration::from_secs(60));
     let seen = ticks(&tty.text());
     let expected: Vec<u64> = (1..=*seen.last().unwrap()).collect();
     assert_eq!(seen, expected, "ticks lost or repeated across the reconnect");
@@ -145,6 +151,54 @@ fn an_interactive_session_survives_a_killed_transport() {
     // Ctrl-C reaches the remote program; its status comes back
     tty.send(b"\x03");
     assert_eq!(tty.exit_code(Duration::from_secs(15)), 130);
+}
+
+/// The ticker the tests interrupt with Ctrl-C ends on it in every shell, even when the SIGINT
+/// comes right after one of its `sleep`s ended normally: bash then takes the signal as handled
+/// by the child and goes on, unless the script traps it (see [`TICKER`]). The shell is stopped
+/// in the middle of a `sleep` and only continued once that has ended and Ctrl-C was typed, which
+/// is the race made certain.
+#[test]
+fn the_ticker_ends_on_ctrl_c_in_every_shell() {
+    let mut seen = std::collections::HashSet::new();
+    let shells = [
+        "/bin/sh",
+        "/bin/bash",
+        "/bin/dash",
+        "/bin/zsh",
+        "/usr/bin/zsh",
+        "/bin/ksh",
+    ]
+    .into_iter()
+    .filter(|s| std::fs::canonicalize(s).is_ok_and(|real| seen.insert(real)));
+    for shell in shells {
+        let mut command = std::process::Command::new(shell);
+        command.args(["-c", TICKER]);
+        // Its own session, with the terminal as its controlling terminal: ^C is a SIGINT
+        qsh_core::sys::spawn_on_pty(&mut command);
+        let mut tty = Tty::spawn(command);
+        tty.wait_for("tick-3\r", Duration::from_secs(20));
+        let pid = tty.child.id() as i32;
+        // In the middle of the `sleep 0.05` after tick-3
+        std::thread::sleep(Duration::from_millis(25));
+        signal(pid, "-STOP");
+        std::thread::sleep(Duration::from_millis(300));
+        tty.send(b"\x03");
+        std::thread::sleep(Duration::from_millis(100));
+        signal(pid, "-CONT");
+        // Ended: by its trap (130), or by the signal itself (as qsh would report it: 128 + 2)
+        let deadline = Instant::now() + patience(Duration::from_secs(20));
+        let status = loop {
+            if let Some(status) = tty.child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "{shell} went on after ^C: {:?}", tty.text());
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        use std::os::unix::process::ExitStatusExt;
+        let code = status.code().or(status.signal().map(|s| 128 + s));
+        assert_eq!(code, Some(130), "{shell}: {status:?}");
+    }
 }
 
 #[test]
@@ -273,9 +327,9 @@ fn attach_hint(text: &str) -> String {
 }
 
 /// A new client attaches FRESH with output from 0 and gets everything the server still buffers.
-/// A tty session keeps acknowledged output as scrollback (up to the replay capacity), so that is
-/// the whole history from tick 1, in order, without holes; the previous client ran long enough
-/// (tick 12, about 600 ms) for its ACKs (every 250 ms) to reach the server first.
+/// A tty session keeps its output as scrollback, acknowledged or not (up to the replay
+/// capacity), so that is the whole history from tick 1, in order, without holes; the previous
+/// client ran long enough (tick 12) for its ACKs to reach the server first, which used to trim it.
 fn assert_replays_the_whole_history(all: &[u64]) {
     assert_eq!(all.first(), Some(&1), "the scrollback is replayed from the start");
     let expected: Vec<u64> = (1..=*all.last().unwrap()).collect();

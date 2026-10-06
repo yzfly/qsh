@@ -658,8 +658,11 @@ pub fn account(home: &Path, shell: Option<&Path>) -> Account {
 mod tests {
     use super::*;
 
+    /// How long the waits of these tests last at most: generous, for slow and emulated builders.
+    const PATIENCE: Duration = Duration::from_secs(60);
+
     async fn wait_for(s: &PtySession, stream: Stream, needle: &str) -> String {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + PATIENCE;
         loop {
             let text = {
                 let out = s.buffer(stream).lock().unwrap();
@@ -678,7 +681,7 @@ mod tests {
     }
 
     async fn wait_exit(s: &PtySession) -> ExitStatus {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + PATIENCE;
         loop {
             if let Some(status) = s.exit_status() {
                 return status;
@@ -766,7 +769,14 @@ mod tests {
             ..Default::default()
         };
         let s = PtySession::start(SessionId::generate(), SessionKey::generate(), &spawn, &sh(), 100_000).unwrap();
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // The buffer fills up, however long the program takes to get there
+        let deadline = Instant::now() + PATIENCE;
+        while s.output.lock().unwrap().len() < 100_000 {
+            assert!(Instant::now() < deadline, "the buffer did not fill");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // ... and stays full: the program is held back, nothing is dropped
+        tokio::time::sleep(Duration::from_millis(200)).await;
         {
             let out = s.output.lock().unwrap();
             assert_eq!((out.base(), out.len()), (0, 100_000));
@@ -819,16 +829,16 @@ mod tests {
             assert_eq!(io_threads.load(Ordering::SeqCst), if pipe { 3 } else { 2 });
             s.hang_up();
             // The threads that held the master or the pipes let go at once, although the
-            // background sleep still has the terminal or pipes open
-            let deadline = Instant::now() + Duration::from_secs(2);
+            // background sleep still has the terminal or pipes open: before the SIGKILL, while
+            // the program still runs (measured by that, not by a clock: builders are slow)
+            let deadline = Instant::now() + PATIENCE;
             while io_threads.load(Ordering::SeqCst) > 0 {
                 assert!(Instant::now() < deadline, "descriptors still held");
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
+            assert!(s.exit_status().is_none(), "the descriptors were held until the SIGKILL");
             // The program ignores SIGHUP: SIGKILL 5 s later reaps it
-            let status = tokio::time::timeout(Duration::from_secs(10), wait_exit(&s))
-                .await
-                .unwrap();
+            let status = wait_exit(&s).await;
             assert_eq!(
                 status,
                 ExitStatus::Signaled {
@@ -838,7 +848,7 @@ mod tests {
             );
             // Nothing but this test holds the session any more
             drop(s);
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + PATIENCE;
             while weak.strong_count() > 0 {
                 assert!(Instant::now() < deadline, "the session is still held");
                 tokio::time::sleep(Duration::from_millis(20)).await;
