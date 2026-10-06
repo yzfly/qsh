@@ -261,6 +261,21 @@ async fn pump_for(ch: &mut Channel, s: &mut Stream, time: Duration) {
     }
 }
 
+/// The output as a terminal shows it. A pty on macOS (XNU's line discipline) can put out a
+/// carriage return twice before a line feed: with ONLCR it queues the CR, and when the LF no
+/// longer fits in the full output queue, it writes the whole newline again later. These tests
+/// throttle their attachments, so the queue fills; a terminal shows "\r\r\n" as "\r\n", and the
+/// extra byte is the kernel's, not one qsh added.
+fn shown(bytes: &[u8]) -> String {
+    let mut text = String::from_utf8_lossy(bytes).into_owned();
+    if !cfg!(any(target_os = "linux", target_os = "android")) {
+        while text.contains("\r\r\n") {
+            text = text.replace("\r\r\n", "\r\n");
+        }
+    }
+    text
+}
+
 /// `seq FROM TO` as a terminal shows it.
 fn seq(from: u32, to: u32) -> String {
     (from..=to).map(|i| format!("{i}\r\n")).collect()
@@ -294,7 +309,7 @@ async fn a_failing_screen_model_costs_only_its_sessions_snapshots() {
         let mut s = Stream::default();
         pump(&mut ch, &mut s, Duration::from_secs(30), |s| s.shows(done)).await;
         assert_eq!((s.gaps, s.snapshots), (0, 0), "{done}: nothing skipped");
-        let text = String::from_utf8_lossy(&s.out);
+        let text = shown(&s.out);
         assert!(
             text.contains(&format!("{}{done}\r\n", seq(1, 8000))),
             "{done}: every byte"
@@ -423,10 +438,7 @@ async fn a_failing_encoder_sends_the_output_uncompressed() {
             .collect()
     };
     let expected = format!("{}ENCODER-FAULT-MARKER\r\n{}E-DONE\r\n", log(1, 6000), log(6001, 12000));
-    assert!(
-        String::from_utf8_lossy(&s.out).contains(&expected),
-        "every byte, in order"
-    );
+    assert!(shown(&s.out).contains(&expected), "every byte, in order");
     assert!(s.frames > 0, "the rest was compressed");
     let marker = b"ENCODER-FAULT-MARKER";
     assert!(
@@ -532,7 +544,7 @@ async fn a_failing_decoder_ends_with_compression_off_for_that_server() {
         .map(|i| format!("line {i} DECODER-FAULT-MARKER of a long and compressible build log\r\n"))
         .collect();
     assert!(
-        String::from_utf8_lossy(&running.seen).contains(&format!("{expected}D-DONE\r\n")),
+        shown(&running.seen).contains(&format!("{expected}D-DONE\r\n")),
         "every byte, in order"
     );
     let status = running.status.lock().unwrap().clone();

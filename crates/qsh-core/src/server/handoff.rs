@@ -809,7 +809,8 @@ pub fn decode(bytes: &[u8]) -> Result<State, StateError> {
 
 /// A test hook (unstable; builds with the cargo feature `test-hooks` only): the directories
 /// above this one are not checked by [`Exe::check`]. The tests' worlds live under `/tmp`,
-/// which every user can write.
+/// which every user can write. Its symbolic links are resolved like the program's (macOS:
+/// `/tmp` is `/private/tmp`), since the directories checked are those of the resolved path.
 pub(crate) const TEST_TRUSTED_DIR: &str = "QSH_TEST_TRUSTED_DIR";
 
 /// A program opened for an upgrade (m2.md 10.3 step 1, security.md 4.8). It is checked on its
@@ -882,7 +883,7 @@ impl Exe {
         }
         let trusted = std::env::var_os(TEST_TRUSTED_DIR)
             .filter(|_| cfg!(feature = "test-hooks"))
-            .map(PathBuf::from);
+            .map(|dir| std::fs::canonicalize(&dir).unwrap_or_else(|_| PathBuf::from(dir)));
         let private = crate::sys::private_group();
         for dir in self.real.ancestors().skip(1) {
             if trusted.as_deref().is_some_and(|t| t != dir && t.starts_with(dir)) {
@@ -1678,6 +1679,28 @@ mod tests {
             .unwrap()
             .success());
         assert!(check(&fifo).unwrap_err().contains("regular file"));
+        // The test hook's directory named through a symbolic link (macOS: /tmp is
+        // /private/tmp) is the one it resolves to; the directory above, which every user can
+        // write here, is not checked, and with the hook above it, it is
+        if cfg!(feature = "test-hooks") {
+            let shared = dir.join("shared");
+            let world = shared.join("world");
+            std::fs::create_dir_all(&world).unwrap();
+            std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
+            std::fs::set_permissions(&world, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let program = world.join("qsh-server");
+            std::fs::write(&program, b"#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::os::unix::fs::symlink(&shared, dir.join("alias")).unwrap();
+            let through_link = dir.join("alias/world");
+            std::env::set_var(TEST_TRUSTED_DIR, &through_link);
+            assert_eq!(
+                Exe::open(&through_link.join("qsh-server")).and_then(|e| e.check()),
+                Ok(())
+            );
+            let error = check(&program).unwrap_err();
+            assert!(error.contains("every user can write"), "{error}");
+        }
         std::env::remove_var(TEST_TRUSTED_DIR);
         let _ = std::fs::remove_dir_all(dir);
     }
