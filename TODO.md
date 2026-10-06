@@ -38,8 +38,8 @@
 - [x] WP-1 客户端：路径记忆、NAT 保活学习、备用端口、后台重探与切到更好的传输
 - [x] WP-4 服务端：备用端口、daemon 原地升级不丢会话、socket 缓冲、TLS 上的 BBR
 - [x] WP-5 混沌测试与对比基准（CI 手动触发；本地 `scripts/local-test.sh --chaos`）
-- [ ] WP-2 智能追帧（vt100 画面模型 + SNAPSHOT）与 zstd 压缩 → 0.4.0
-- [ ] WP-3 `doctor` / `tune`（按发行版）→ 0.5.0
+- [x] WP-2 智能追帧（vt100 画面模型 + SNAPSHOT）与 zstd 压缩（自写有界 zstd 解码器）
+- [x] WP-3 `doctor` / `tune`（18 项检查，13 个发行版样本，tune 可逐字节还原）
 - [x] 只用发行版自带 crate 构建：Fedora rawhide、Debian testing 通过（CI 必过项）；Debian unstable 卡在上游 synstructure 迁移，等 Rust 团队
 
 ## 2026-10-06 用户要求
@@ -50,3 +50,10 @@
 - [x] 0.3.0（未发布，main 47b3763）：管道会话流控死锁修复（大文件双向传输卡住）、UDP 被封后重新接回直接走 TLS
 - [ ] 观察：crossborder 下 UDP 中途被封 11.1 s 恢复，离 12 s 上限太近，WP-2 后再看能否更快发现死路
 - [ ] 待定：`qsh-server stop` 后已连接的客户端退出码是 1（ssh 断开是 255），发 0.5.0 前统一核对退出码表
+
+## 0.5.0 发布前加固（2026-10-06）
+
+- [ ] 对抗性审查第二轮：网络侧（自写 zstd 解码器、SNAPSHOT 白名单、pacing、handoff 解析）+ 本地/特权侧（原地升级 exec、tune 以 root 运行、install 下载校验、状态文件）
+- [ ] 第三方解析器 panic 隔离：release 改为 unwind + catch_unwind，画面模型或编解码出错只关掉这个会话的该功能，不拖垮 daemon
+- [ ] 规范按 WP-2 实际实现修正（EL 规则、最小 RTT、路径速率、输入触发不受滞后、alt 屏、ruzstd 事实、快照被拒后的安全回退）
+- [ ] 审查问题修完后：本地 `scripts/local-test.sh --chaos`（含 flood_interrupt、compression）、手动跑一轮完整 CI（macOS、长时间模糊测试、9 发行版、打包、混沌），全绿后公开仓库、发 0.5.0
