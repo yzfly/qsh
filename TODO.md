@@ -40,4 +40,4 @@
 - [ ] WP-5 混沌测试与对比基准（GitHub Actions 里 netns + netem）
 - [ ] WP-2 智能追帧（vt100 画面模型 + SNAPSHOT）与 zstd 压缩 → 0.4.0
 - [ ] WP-3 `doctor` / `tune`（按发行版）→ 0.5.0
-- [ ] 只用发行版自带 crate 构建（Debian unstable / Fedora rawhide）的排查
+- [x] 只用发行版自带 crate 构建：Fedora rawhide、Debian testing 通过（CI 必过项）；Debian unstable 卡在上游 synstructure 迁移，等 Rust 团队
