@@ -81,6 +81,9 @@ pub const LEARN_INTERVAL: Duration = Duration::from_secs(60);
 pub const CLIENT_MOVE_GRACE: Duration = Duration::from_secs(10);
 /// The weight of a new sample in the moving averages (handshake time, RTT, loss).
 pub const EWMA: f64 = 0.3;
+/// A path that loses this share of its packets or more (QUIC's measured loss, [`Entry::loss`])
+/// is lossy: a single handshake timeout there blocks nothing ([`Entry::blocked`]).
+pub const LOSSY_PATH: f64 = 0.15;
 
 const DAY: u64 = 86_400;
 /// How long a write waits for another process's lock before giving up (and trying later).
@@ -203,11 +206,20 @@ impl Entry {
     }
 
     /// True while `transport` is considered blocked here: it failed, and is not due to be
-    /// probed again before `retry`.
+    /// probed again before `retry`. On a path that loses [`LOSSY_PATH`] or more of its
+    /// packets, a single handshake timeout is not enough: there a handshake runs out of its
+    /// 8 s now and then by chance (on the terrible chaos profile, 600 ms and 20 % loss each
+    /// way, about one QUIC or TLS attempt in 10 to 20), and leaving the transport out would put
+    /// the next sessions on a worse one (m2.md 3.3). The second timeout in a row counts.
     pub fn blocked(&self, transport: Transport, now: u64) -> bool {
         self.transport(transport)
             .and_then(|r| r.fail.as_ref())
-            .is_some_and(|f| f.retry > now)
+            .is_some_and(|f| f.retry > now && !self.by_chance(f))
+    }
+
+    /// `f` is a single handshake timeout on a lossy path ([`Entry::blocked`]).
+    fn by_chance(&self, f: &Failure) -> bool {
+        f.n < 2 && f.kind() == Some(FailureKind::Timeout) && self.loss.is_some_and(|l| l >= LOSSY_PATH)
     }
 
     /// The transports that failed here and are due to be probed again at `now`.

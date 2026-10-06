@@ -21,7 +21,8 @@
 //!
 //! Environment: `QSH_CHAOS_DIR` (work directory, default /tmp/qsh-chaos), `QSH_CHAOS_PROFILES`
 //! (comma-separated subset of each scenario's profiles), `QSH_CHAOS_RUNS` (Ctrl-C runs per
-//! profile, default 5), `QSH_CHAOS_NAT_IDLE` (seconds, default 40), `QSH_CHAOS_WINDOW`
+//! profile, default 9), `QSH_CHAOS_ATTACHES` (attaches of `udp-blocked-memory`, default 7),
+//! `QSH_CHAOS_VERBOSE` (0: the clients without `-vv`), `QSH_CHAOS_NAT_IDLE` (seconds, default 40), `QSH_CHAOS_WINDOW`
 //! (throughput window, seconds, default 20), `QSH_CHAOS_QSH` / `QSH_CHAOS_SERVER` (binaries,
 //! default the ones cargo built), `QSH_CHAOS_NETNS` (the helper script). The benchmark also
 //! needs `QSH_BENCH=1`; see [`bench_ssh_mosh_qsh`]. `QSH_CHAOS_FORCE_PROFILES` (comma-separated)
@@ -221,15 +222,19 @@ fn quantile_check(values: &[f64], q: f64, bound: f64) -> (usize, f64, bool) {
 /// snapshot, a packet before each on its stream) get through at loss `p` each way are
 /// negative binomial (m2.md 6.4).
 fn recoveries(p: f64, q: f64) -> u32 {
-    const K: i32 = 4;
+    recoveries_k(p, q, 4)
+}
+
+/// [`recoveries`] with `k` exposed packets.
+fn recoveries_k(p: f64, q: f64, k: i32) -> u32 {
     let mut cdf = 0.0;
-    let mut coefficient = 1.0; // C(K + l − 1, l)
+    let mut coefficient = 1.0; // C(k + l − 1, l)
     for l in 0..32 {
-        cdf += coefficient * p.powi(l) * (1.0 - p).powi(K);
+        cdf += coefficient * p.powi(l) * (1.0 - p).powi(k);
         if cdf >= q {
             return l as u32;
         }
-        coefficient = coefficient * f64::from(K + l) / f64::from(l + 1);
+        coefficient = coefficient * f64::from(k + l) / f64::from(l + 1);
     }
     32
 }
@@ -604,9 +609,14 @@ impl Client {
         c
     }
 
-    /// qsh, writing its transcript to `transcript` when given.
+    /// qsh, writing its transcript to `transcript` when given. Its debug log (`-vv`, ssh's
+    /// too) goes to the command's stderr, the client's log file, unless `QSH_CHAOS_VERBOSE=0`:
+    /// what explains a failed run.
     fn qsh(&self, transcript: Option<&Path>, args: &[&str]) -> Command {
         let mut all = vec!["-F", self.ssh_config.as_str()];
+        if env_u64("QSH_CHAOS_VERBOSE", 1) > 0 {
+            all.push("-vv");
+        }
         all.extend_from_slice(args);
         let mut c = self.command(&self.qsh, &all);
         if let Some(t) = transcript {
@@ -754,14 +764,31 @@ struct Term {
 }
 
 impl Term {
-    /// `cmd` on a new 100x30 pseudo terminal; stderr goes to `log`.
+    /// `cmd` on a new 100x30 pseudo terminal; stderr goes to `log`, each line with the time
+    /// since the start (seconds, milliseconds), so that a slow step shows where it was.
     fn spawn(mut cmd: Command, log: &Path) -> Term {
         let (master, slave) = qsh_core::sys::openpty(100, 30).unwrap();
         let slave = File::from(slave);
         cmd.stdin(slave.try_clone().unwrap())
             .stdout(slave.try_clone().unwrap())
-            .stderr(File::create(log).unwrap());
-        let child = cmd.spawn().unwrap();
+            .stderr(Stdio::piped());
+        let started = Instant::now();
+        let mut child = cmd.spawn().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        File::create(log).unwrap();
+        // Appending: the state of a hung client goes to the same file (Term::dump_state)
+        let mut file = fs::OpenOptions::new().append(true).open(log).unwrap();
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            let mut lines = std::io::BufReader::new(stderr);
+            let mut line = Vec::new();
+            while lines.read_until(b'\n', &mut line).is_ok_and(|n| n > 0) {
+                let at = started.elapsed().as_secs_f64();
+                let _ = write!(file, "[{at:8.3}] ");
+                let _ = file.write_all(&line);
+                line.clear();
+            }
+        });
         drop(slave);
         let master = File::from(master);
         let mut reader = master.try_clone().unwrap();
@@ -887,6 +914,49 @@ impl Term {
 
     fn exit_code(&mut self, timeout: Duration) -> Option<i32> {
         wait_child(&mut self.child, timeout)
+    }
+
+    /// What explains a client that hangs, appended to `log`: whether it still runs, and where
+    /// each of its threads waits in the kernel (no debugger needed).
+    fn dump_state(&mut self, log: &Path, ns: &str) {
+        let mut text = String::from("\n--- chaos: client state\n");
+        match self.child.try_wait() {
+            Ok(Some(status)) => text.push_str(&format!("exited: {status}\n")),
+            _ => {
+                let pid = self.child.id();
+                text.push_str(&format!("pid {pid} running\n"));
+                if let Ok(tasks) = fs::read_dir(format!("/proc/{pid}/task")) {
+                    let mut tasks: Vec<_> = tasks.flatten().map(|t| t.path()).collect();
+                    tasks.sort();
+                    for task in tasks {
+                        let read = |name: &str| fs::read_to_string(task.join(name)).unwrap_or_default();
+                        text.push_str(&format!(
+                            "{} {} wchan={} syscall={}\n",
+                            task.file_name().unwrap_or_default().to_string_lossy(),
+                            read("comm").trim(),
+                            read("wchan").trim(),
+                            read("syscall").trim()
+                        ));
+                    }
+                }
+            }
+        }
+        // Its processes (ssh too) and their sockets: TCP's retransmission state shows a path
+        // in exponential back-off
+        if let Ok(out) = Command::new("ps")
+            .args(["-o", "pid,ppid,etimes,stat,wchan:20,args", "--ppid"])
+            .arg(self.child.id().to_string())
+            .output()
+        {
+            text.push_str(&String::from_utf8_lossy(&out.stdout));
+        }
+        if let Ok(out) = Command::new("ip").args(["netns", "exec", ns, "ss", "-tuinpe"]).output() {
+            text.push_str(&String::from_utf8_lossy(&out.stdout));
+        }
+        text.push_str(&format!("terminal: {:?}\n", self.text(0)));
+        if let Ok(mut f) = fs::OpenOptions::new().append(true).open(log) {
+            let _ = f.write_all(text.as_bytes());
+        }
     }
 
     /// End the client: `exit` to the shell, then kill.
@@ -1191,7 +1261,12 @@ fn flood_interrupt() {
         lab.check(
             "prompt_back_in_time",
             json!(format!("{} of {runs}", result.latencies.len())),
-            &format!("every run within {} s", timeout.as_secs()),
+            &format!(
+                "every run: the first prompt within {} s ({} s while ssh still logs in), the prompt back within {} s",
+                FIRST_PROMPT.as_secs(),
+                LOGIN_PATIENCE.as_secs(),
+                timeout.as_secs()
+            ),
             result.timeouts == 0 && result.latencies.len() as u64 == runs,
             (p.name != "crossborder").then_some("WP-2"),
         );
@@ -1204,6 +1279,14 @@ fn flood_interrupt() {
         );
         lab.measure("gap_bytes", json!(result.gap_bytes), "bytes");
         lab.measure("snapshots", json!(result.snapshots), "");
+        // The login over ssh before each run (TCP on the same path), and the runs whose login
+        // was still under way after 90 s
+        lab.measure(
+            "login_s",
+            json!(result.logins.iter().map(|x| round1(*x)).collect::<Vec<_>>()),
+            "s",
+        );
+        lab.measure("slow_logins", json!(result.slow_logins), "");
     }
     lab.finish();
 }
@@ -1212,9 +1295,26 @@ fn flood_interrupt() {
 struct CtrlC {
     latencies: Vec<f64>,
     timeouts: u64,
+    /// Seconds each run's login over ssh took (the bootstrap), when the client log says.
+    logins: Vec<f64>,
+    /// Runs whose login over ssh was still under way after [`FIRST_PROMPT`].
+    slow_logins: u64,
     unaccounted: u64,
     gap_bytes: u64,
     snapshots: usize,
+}
+
+/// How long a run waits for its first prompt ...
+const FIRST_PROMPT: Duration = Duration::from_secs(90);
+/// ... and, when it is still logging in over ssh by then, in all.
+const LOGIN_PATIENCE: Duration = Duration::from_secs(300);
+
+/// When ssh's login (the bootstrap) ended, in seconds since the client started: from the
+/// timestamped client log (`-vv`: ssh's "Exit status"), if there is one.
+fn login_seconds(log: &Path) -> Option<f64> {
+    let text = fs::read_to_string(log).ok()?;
+    let line = text.lines().find(|l| l.contains("debug1: Exit status"))?;
+    line.strip_prefix('[')?.split(']').next()?.trim().parse().ok()
 }
 
 /// `runs` times: start the measuring shell with `start(client, transcript)`, flood it for 3 s,
@@ -1224,8 +1324,32 @@ fn ctrl_c_runs(client: &Client, runs: u64, timeout: Duration, start: impl Fn(&Cl
     for i in 0..runs {
         let t = client.path(&format!("ctrl-c-{i}.jsonl"));
         let mut term = Term::spawn(start(client, &t), &client.log(&format!("ctrl-c-{i}.log")));
-        if term.wait_for(PROMPT, 0, secs(90)).is_none() {
-            eprintln!("chaos: run {i}: no prompt: {:?}", term.text(0));
+        let log = client.log(&format!("ctrl-c-{i}.log"));
+        let mut first = term.wait_for(PROMPT, 0, FIRST_PROMPT);
+        if first.is_none() && transcript(&t).is_empty() && !term.rx.lock().unwrap().eof {
+            // Still logging in over ssh: qsh's race has not started. On the terrible profile a
+            // TCP flow whose retransmissions and acknowledgements are lost a few times in a
+            // row backs off for minutes (RTO 3 s doubled five times: 100 s, seen with `ss`),
+            // as it would for `ssh host`; that is the login's time, not qsh's
+            eprintln!(
+                "chaos: run {i}: still logging in over ssh after {} s; waiting up to {} s",
+                FIRST_PROMPT.as_secs(),
+                LOGIN_PATIENCE.as_secs()
+            );
+            r.slow_logins += 1;
+            first = term.wait_for(PROMPT, 0, LOGIN_PATIENCE.saturating_sub(FIRST_PROMPT));
+        }
+        if let Some(s) = login_seconds(&log) {
+            r.logins.push(s);
+        }
+        if first.is_none() {
+            term.dump_state(&log, &client.ns);
+            eprintln!(
+                "chaos: run {i}: no prompt: {:?} (transcript {}, log {})",
+                term.text(0),
+                t.display(),
+                log.display()
+            );
             r.timeouts += 1;
             continue;
         }
@@ -1235,8 +1359,20 @@ fn ctrl_c_runs(client: &Client, runs: u64, timeout: Duration, start: impl Fn(&Cl
         let sent = SystemTime::now();
         term.send(b"\x03");
         match term.wait_for(PROMPT, pos, timeout) {
-            Some((_, at)) => r.latencies.push(ms_between(sent, at)),
-            None => r.timeouts += 1,
+            Some((_, at)) => {
+                let ms = ms_between(sent, at);
+                eprintln!("chaos: run {i}: prompt back in {ms:.0} ms (transcript {})", t.display());
+                r.latencies.push(ms);
+            }
+            None => {
+                term.dump_state(&log, &client.ns);
+                eprintln!(
+                    "chaos: run {i}: no prompt after Ctrl-C (transcript {}, log {})",
+                    t.display(),
+                    log.display()
+                );
+                r.timeouts += 1;
+            }
         }
         term.close();
         let c = coverage(&transcript(&t), "out");
@@ -1299,74 +1435,119 @@ fn udp_block() {
             continue;
         }
 
-        // The client is lost; `qsh attach` on the same network, UDP still blocked
+        // The client is lost; `qsh attach` on the same network, UDP still blocked: several
+        // times, each from a fresh process with the remembered plan (S1 is a statement about
+        // the attach time's distribution on a lossy path, not about one sample)
         lab.scenario = "udp-blocked-memory".into();
         drop(term);
         sleep(secs(1));
-        let t2 = client.path("t2.jsonl");
-        let started = Instant::now();
-        let mut term = Term::spawn(client.qsh(Some(&t2), &["attach", HOST]), &client.log("t2.log"));
-        let attached = wait_record(&t2, |r| r["ev"] == "connected", secs(60));
-        let attach_s = attached.as_ref().map(|(_, at)| (*at - started).as_secs_f64());
-        // S1: TLS starts at once, so attaching takes TLS's own exchanges: the TCP and TLS
-        // handshakes, the hello and the attach, 4 round trips (1.08 s here), plus the process
-        // start (1.12 - 1.16 s measured, debug build). At 6 % loss a lost packet among them
-        // costs TCP a retransmission timeout (1 s for a SYN, about 0.3 s later on): 1.47 -
-        // 2.25 s measured. That is the path, not a wait for another transport, so beyond 2 s
-        // the transcript must show it inside TLS's exchanges, and the attach must still come
-        // before the 3 s pipe stagger.
-        let records = transcript(&t2);
-        let at = |ev: &str, outcome: Option<&str>| {
-            records
-                .iter()
-                .find(|r| r["ev"] == ev && outcome.is_none_or(|o| r["outcome"] == o))
-                .and_then(|r| r["ms"].as_f64())
-        };
-        let (plan_ms, won_ms, connected_ms) = (at("plan", None), at("attempt", Some("won")), at("connected", None));
-        let handshake_hello = plan_ms.zip(won_ms).map(|(p, w)| w - p);
-        let attaching = won_ms.zip(connected_ms).map(|(w, c)| c - w);
+        let attaches = env_u64("QSH_CHAOS_ATTACHES", 7).max(1);
+        let mut times: Vec<f64> = Vec::new();
+        let mut breakdowns = Vec::new();
+        let mut firsts = Vec::new();
+        let mut transports = Vec::new();
+        let mut echoed = true;
+        for i in 0..attaches {
+            let t2 = client.path(&format!("t2-{i}.jsonl"));
+            let log = client.log(&format!("t2-{i}.log"));
+            let started = Instant::now();
+            let mut term = Term::spawn(client.qsh(Some(&t2), &["attach", HOST]), &log);
+            let attached = wait_record(&t2, |r| r["ev"] == "connected", secs(60));
+            let attach_s = attached.as_ref().map(|(_, at)| (*at - started).as_secs_f64());
+            let records = transcript(&t2);
+            let at = |ev: &str, outcome: Option<&str>| {
+                records
+                    .iter()
+                    .find(|r| r["ev"] == ev && outcome.is_none_or(|o| r["outcome"] == o))
+                    .and_then(|r| r["ms"].as_f64())
+            };
+            let (plan_ms, won_ms, connected_ms) = (at("plan", None), at("attempt", Some("won")), at("connected", None));
+            breakdowns.push(json!({
+                "race_start": plan_ms,
+                "handshake_hello": plan_ms.zip(won_ms).map(|(p, w)| w - p),
+                "attach": won_ms.zip(connected_ms).map(|(w, c)| c - w),
+            }));
+            // The race's plan: what starts at 0 ms
+            let first = records.iter().find(|r| r["ev"] == "plan").and_then(|p| {
+                p["attempts"]
+                    .as_array()?
+                    .iter()
+                    .min_by_key(|a| a["delay_ms"].as_u64().unwrap_or(u64::MAX))
+                    .map(|a| {
+                        format!(
+                            "{}@{}ms",
+                            a["transport"].as_str().unwrap_or("?").to_lowercase(),
+                            a["delay_ms"]
+                        )
+                    })
+            });
+            firsts.push(first);
+            transports.push(coverage(&records, "out").connected);
+            match attach_s {
+                Some(s) => {
+                    eprintln!("chaos: attach {i}: {s:.3} s (transcript {})", t2.display());
+                    times.push(s);
+                }
+                None => eprintln!(
+                    "chaos: attach {i}: not attached within 60 s (transcript {}, log {})",
+                    t2.display(),
+                    log.display()
+                ),
+            }
+            if i + 1 == attaches && attach_s.is_some() {
+                let pos = term.pos();
+                term.send(b"ping2\r");
+                echoed = term.wait_for("ping2", pos, secs(60)).is_some();
+            }
+            // Lost again: the next attach starts from what this process remembered
+            drop(term);
+            sleep(secs(1));
+        }
+        lab.measure("attach_breakdown_ms", json!(breakdowns), "");
         lab.measure(
-            "attach_breakdown_ms",
-            json!({"race_start": plan_ms, "handshake_hello": handshake_hello, "attach": attaching}),
-            "",
-        );
-        let retransmitted = handshake_hello.is_some_and(|ms| ms > 3.0 * p.rtt_ms + 250.0)
-            || attaching.is_some_and(|ms| ms > p.rtt_ms + 250.0);
-        lab.check(
             "attach_s",
-            json!(attach_s.map(|s| (s * 1000.0).round() / 1000.0)),
-            "<= 2 (S1), < 3 with a TCP retransmission in TLS's exchanges",
-            attach_s.is_some_and(|s| s <= 2.0 || retransmitted && s < 3.0),
+            json!(times.iter().map(|s| (s * 1000.0).round() / 1000.0).collect::<Vec<_>>()),
+            "s",
+        );
+        lab.measure("transports", json!(transports), "");
+        // S1 (m2.md 12.2): TLS starts at once, so attaching takes TLS's own exchanges, the TCP
+        // and TLS handshakes, the hello and the attach (4 round trips, 1.08 s here), plus the
+        // process start: 1.10 - 1.16 s without a loss. At 6 % loss about k = 8 packets on that
+        // critical path are exposed: P(no loss) = 0.61, and the 95th percentile pays r95 = 2
+        // TCP recoveries of at most a second each (the retransmission timeout of a SYN; about
+        // 0.3 s for a later segment). So the median within S1's 2 s, the 95th percentile within
+        // 2 s + 2 x 1 s; both as one-sided binomial tests on the runs, like S3. An attach that
+        // waits for another transport instead (the 8 s QUIC timeout, the 3 s pipe stagger and
+        // ssh's own handshakes) is far beyond either; that TLS starts at 0 ms is checked hard,
+        // per run.
+        let r95 = recoveries_k(p.loss, 0.95, 8);
+        let (bound50, bound95) = (2.0, 2.0 + f64::from(r95));
+        let n = times.len();
+        let (over50, pv50, ok50) = quantile_check(&times, 0.5, bound50);
+        let (over95, pv95, ok95) = quantile_check(&times, 0.95, bound95);
+        let all = n as u64 == attaches;
+        lab.check(
+            "attach_p50_s",
+            json!({"p50": quantile(&times, 0.5).map(|s| (s * 1000.0).round() / 1000.0), "over": over50, "of": n, "p_value": (pv50 * 1000.0).round() / 1000.0}),
+            &format!("<= {bound50:.0} (S1; binomial test, alpha {CHECK_ALPHA})"),
+            ok50 && all,
             None,
         );
-        let c = coverage(&transcript(&t2), "out");
-        lab.measure("attempts", json!(c.attempts), "");
-        lab.measure("transports", json!(c.connected), "");
-        // The race's plan: what starts at 0 ms
-        let plan = transcript(&t2).into_iter().find(|r| r["ev"] == "plan");
-        let first = plan.as_ref().and_then(|p| {
-            p["attempts"]
-                .as_array()?
-                .iter()
-                .min_by_key(|a| a["delay_ms"].as_u64().unwrap_or(u64::MAX))
-                .map(|a| {
-                    format!(
-                        "{}@{}ms",
-                        a["transport"].as_str().unwrap_or("?").to_lowercase(),
-                        a["delay_ms"]
-                    )
-                })
-        });
+        lab.check(
+            "attach_p95_s",
+            json!({"p95": quantile(&times, 0.95).map(|s| (s * 1000.0).round() / 1000.0), "over": over95, "of": n, "p_value": (pv95 * 1000.0).round() / 1000.0}),
+            &format!("<= {bound95:.0} (S1 + {r95} TCP recoveries of 1 s; binomial test, alpha {CHECK_ALPHA})"),
+            ok95 && all,
+            None,
+        );
+        let planned_ok = firsts.iter().all(|f| f.as_deref() == Some("tls@0ms"));
         lab.check(
             "planned_first",
-            json!(first),
-            "tls@0ms (QUIC known to fail here)",
-            first.as_deref() == Some("tls@0ms"),
+            json!(firsts),
+            "tls@0ms in every run (QUIC known to fail here)",
+            planned_ok,
             None,
         );
-        let pos = term.pos();
-        term.send(b"ping2\r");
-        let echoed = term.wait_for("ping2", pos, secs(60)).is_some();
         lab.check("echo_after_attach", json!(echoed), "true", echoed, None);
     }
     lab.finish();
@@ -2043,4 +2224,12 @@ fn quantile_checks_and_recoveries() {
     // k = 4: none for the median up to 15.9 % loss, at 20 % one for the p50 and three for the p95
     assert_eq!((recoveries(0.06, 0.5), recoveries(0.15, 0.5)), (0, 0));
     assert_eq!((recoveries(0.20, 0.5), recoveries(0.20, 0.95)), (1, 3));
+    // S1's TLS attach, k = 8 at 6 %: two recoveries for the p95
+    assert_eq!((recoveries_k(0.06, 0.5, 8), recoveries_k(0.06, 0.95, 8)), (0, 2));
+    // Seven attaches: at most 1 over a p95 bound, at most 6 over a p50 bound
+    let seven = |over: usize| -> Vec<f64> { (0..7).map(|i| if i < over { 2.0 } else { 0.0 }).collect() };
+    assert!(quantile_check(&seven(1), 0.95, 1.0).2);
+    assert!(!quantile_check(&seven(2), 0.95, 1.0).2);
+    assert!(quantile_check(&seven(6), 0.5, 1.0).2);
+    assert!(!quantile_check(&seven(7), 0.5, 1.0).2);
 }

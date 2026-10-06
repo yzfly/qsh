@@ -55,6 +55,10 @@ use crate::transport::{RecvStream, SendStream, Target};
 /// [`Conn::suspect_after`] (2 s on most paths), the connection is suspected and the transports
 /// are raced in the background (m2.md 3.8); this is the fallback when nothing else answers.
 const INPUT_ANSWER_WITHIN: Duration = Duration::from_secs(8);
+/// How long an ATTACH may wait for its answer in all while the connection shows that its path
+/// works (anything received since the ATTACH was sent); the server takes the first ATTACH of a
+/// connection up to its `AUTH_TIMEOUT` (10 s) after the hello (protocol.md 6.6, 12.1).
+const ATTACH_PATIENCE: Duration = Duration::from_secs(10);
 /// Unacknowledged input for this long: PING, so the control stream answers even if the
 /// terminal stream is held up.
 const INPUT_PING_AFTER: Duration = Duration::from_secs(1);
@@ -590,6 +594,17 @@ impl Session {
                     // Attach once more; then give up on the session (section 11.2)
                 }
                 End::Fatal(e) => return Err(e),
+                End::Gone(_) if state.hangup => {
+                    // The session ended by the hang-up the user asked for (`~.`): its EXIT was
+                    // lost with a connection, or the program outlived the HANGUP's grace
+                    // (SESSION_ENDED). The status is what the hang-up does: SIGHUP
+                    log::debug(format_args!("the session ended after the hang-up"));
+                    state.gone = true;
+                    return Ok(Outcome::Exited(ExitStatus::Signaled {
+                        signal: "HUP".into(),
+                        core_dumped: false,
+                    }));
+                }
                 End::Gone(e) => {
                     state.gone = true;
                     return Err(e);
@@ -628,6 +643,8 @@ impl Session {
 
     /// Attach on `conn` and run the terminal channel until it ends.
     async fn attach(&self, conn: &Arc<Conn>, state: &mut State, terminal: &mut Terminal) -> Result<End, ClientError> {
+        log::debug(format_args!("attaching over {}", conn.transport()));
+        let asked = Instant::now();
         let (_, mut send, recv) = match conn.connection.open().await {
             Ok(s) => s,
             Err(e) => return Ok(End::Lost(e.to_string())),
@@ -670,30 +687,62 @@ impl Session {
             flags,
             error_received: state.pipe.then_some(error_received),
         };
+        let mark = conn.mark();
         if let Err(e) = write_message(&mut send, &attach).await {
             return Ok(End::Lost(e.to_string()));
         }
         conn.sent();
-        let answer = tokio::select! {
-            answer = tokio::time::timeout(ATTACH_TIMEOUT, read_message(&mut recv, MAX_TERMINAL)) => answer,
-            Ok(()) = moved.changed(), if !conn.abandoned() => {
-                // The pool moved the sessions to another connection meanwhile (m2.md 3.8):
-                // abandon this ATTACH first, so that only one is ever outstanding (7.2)
-                send.reset(ErrorCode::CANCELLED);
-                return Ok(End::Moved);
+        // No answer within ATTACH_TIMEOUT: abandoned (protocol.md 12.1), unless something
+        // arrived on the connection since the ATTACH was sent (over QUIC any datagram, the
+        // acknowledgement of the ATTACH among them): the path works, only slowly (at 20 % loss
+        // each way an exchange that loses packets twice takes more than 5 s), and a new
+        // connection over the same path would not answer sooner. Then up to ATTACH_PATIENCE
+        let mut deadline = asked + ATTACH_TIMEOUT;
+        let mut patient = false;
+        let answer = {
+            let read = read_message(&mut recv, MAX_TERMINAL);
+            tokio::pin!(read);
+            loop {
+                tokio::select! {
+                    answer = &mut read => break Some(answer),
+                    _ = tokio::time::sleep_until(deadline) => {
+                        if !patient && conn.heard_since(&mark) {
+                            patient = true;
+                            deadline = asked + ATTACH_PATIENCE;
+                            log::debug(format_args!(
+                                "no answer to ATTACH over {} yet, but the path answers; waiting",
+                                conn.transport()
+                            ));
+                            continue;
+                        }
+                        break None;
+                    }
+                    Ok(()) = moved.changed(), if !conn.abandoned() && !state.hangup => {
+                        // The pool moved the sessions to another connection meanwhile (m2.md
+                        // 3.8): abandon this ATTACH first, so that only one is ever outstanding
+                        // (7.2)
+                        send.reset(ErrorCode::CANCELLED);
+                        return Ok(End::Moved);
+                    }
+                }
             }
         };
         let reply = match answer {
-            Ok(Ok(Some(m))) => m,
-            Ok(Ok(None)) => return Ok(End::Lost("the server closed the channel".into())),
-            Ok(Err(e)) => return Ok(End::Lost(e.to_string())),
-            Err(_) => {
+            Some(Ok(Some(m))) => m,
+            Some(Ok(None)) => return Ok(End::Lost("the server closed the channel".into())),
+            Some(Err(e)) => return Ok(End::Lost(e.to_string())),
+            None => {
                 // Abandon it (section 7.2), and the connection with it
                 send.reset(ErrorCode::CANCELLED);
                 return Ok(End::Lost("no answer to ATTACH".into()));
             }
         };
         conn.received();
+        log::debug(format_args!(
+            "ATTACH answered over {} in {} ms",
+            conn.transport(),
+            asked.elapsed().as_millis()
+        ));
         let (input_received, output_start, error_start, next_key) = match reply {
             Message::Attached {
                 input_received,
@@ -927,7 +976,9 @@ impl Session {
         let mut input_pinged = false;
         // While it waits: when the connection is suspected unless something arrives since the
         // mark (m2.md 3.8)
-        let mut quiet = had_pending.then(|| (conn.mark(), Instant::now() + conn.suspect_after()));
+        // Not once the session hung up: it is ending by the user's choice, and a race could
+        // only move it and lose the EXIT in flight
+        let mut quiet = (had_pending && !state.hangup).then(|| (conn.mark(), Instant::now() + conn.suspect_after()));
         // The pool moved the sessions off this connection (3.8)
         let mut moved = conn.moved();
         if conn.abandoned() {
@@ -1213,7 +1264,9 @@ impl Session {
                                 self.status.lock().unwrap().bytes_out += data.len() as u64;
                                 if unanswered.is_none() {
                                     unanswered = Some(Instant::now());
-                                    quiet = Some((conn.mark(), Instant::now() + conn.suspect_after()));
+                                    if !hangup_sent {
+                                        quiet = Some((conn.mark(), Instant::now() + conn.suspect_after()));
+                                    }
                                 }
                             }
                             outbox.push(m);
@@ -1235,6 +1288,10 @@ impl Session {
                     Some(Input::Detach) => return Ok(detach(&mut send, &mut outbox, &mut rx).await),
                     Some(Input::Hangup) => {
                         state.hangup = true;
+                        // No suspicion, no move from here on: the EXIT (or ERROR) that answers
+                        // the HANGUP comes on this attachment, and the server removes the
+                        // session as it sends it (protocol.md 7.11)
+                        quiet = None;
                         if !hangup_sent {
                             hangup_sent = true;
                             outbox.push(&Message::Hangup);
@@ -1255,7 +1312,7 @@ impl Session {
                 // Typed input unanswered and nothing received since the mark: suspected, the
                 // transports race in the background (m2.md 3.8); then, or when something did
                 // arrive, the same again from now while the input waits
-                _ = tokio::time::sleep_until(quiet.map_or_else(Instant::now, |q| q.1)), if quiet.is_some() => {
+                _ = tokio::time::sleep_until(quiet.map_or_else(Instant::now, |q| q.1)), if quiet.is_some() && !hangup_sent => {
                     if let Some((mark, _)) = quiet.take() {
                         if !conn.heard_since(&mark) {
                             conn.suspect(mark);
@@ -1264,8 +1321,9 @@ impl Session {
                     }
                 }
                 // Another connection answered first: leave at once; the input not acknowledged
-                // here is resent after the next ATTACHED, from where the server says (7.3)
-                Ok(()) = moved.changed() => if conn.abandoned() {
+                // here is resent after the next ATTACHED, from where the server says (7.3). Not
+                // after a HANGUP: its answer comes here (the dead path rules still apply)
+                Ok(()) = moved.changed() => if conn.abandoned() && !hangup_sent {
                     return Ok(End::Moved);
                 },
                 // ACKs on time (7.5): 50 ms matter on an attachment that accepts snapshots

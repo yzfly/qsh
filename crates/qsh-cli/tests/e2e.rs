@@ -613,12 +613,15 @@ fn attach_without_saved_credentials_asks_the_host() {
     tty.wait_for("typed", Duration::from_secs(20));
     assert_eq!(world.bootstraps(), bootstraps);
     tty.send(b"\r~.");
-    assert_eq!(tty.exit_code(Duration::from_secs(10)), 129);
+    let code = tty.exit_code(Duration::from_secs(10));
+    assert_eq!(code, 129, "{:?}", tty.text());
     // One detached session left, not saved here: taken without a question
     let mut tty = Tty::spawn(world.qsh(&["attach", "srv"]));
     tty.wait_for("alpha", Duration::from_secs(20));
     tty.send(b"\r~.");
-    assert_eq!(tty.exit_code(Duration::from_secs(10)), 129);
+    let code = tty.exit_code(Duration::from_secs(10));
+    // What qsh said, when it did not end with the program's status
+    assert_eq!(code, 129, "{:?}", tty.text());
     let (code, _, err) = world.run(&["attach", "srv"]);
     assert_eq!(code, 255);
     assert!(err.contains("no sessions on srv"), "{err}");

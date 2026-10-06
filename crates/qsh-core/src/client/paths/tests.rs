@@ -320,6 +320,34 @@ fn failures_back_off_and_success_clears_them() {
     assert!(!e.blocked(Transport::Tls, NOW));
 }
 
+/// On a lossy path (measured loss 15 % or more) one handshake timeout is chance, not a block:
+/// the transport stays in the race until it times out a second time in a row. Below that, and
+/// for the other kinds, the first failure counts as before (S1 at 6 % loss).
+#[test]
+fn on_a_lossy_path_one_timeout_blocks_nothing() {
+    let skipped = |e: &Entry| plan(Some(e), &target(&[]), &RaceConfig::default(), NOW).skipped;
+    for (loss, kind, blocks) in [
+        (Some(0.25), FailureKind::Timeout, false),
+        (Some(0.06), FailureKind::Timeout, true),
+        (None, FailureKind::Timeout, true),
+        (Some(0.25), FailureKind::Hello, true),
+        (Some(0.25), FailureKind::Reset, true),
+    ] {
+        let mut e = entry(&[(Transport::Quic, ok(TODAY, Some(60443), Some(1400)))]);
+        e.loss = loss;
+        e.failed(Transport::Tls, kind, NOW);
+        assert_eq!(e.blocked(Transport::Tls, NOW), blocks, "{loss:?} {kind}");
+        assert_eq!(skipped(&e).contains(&Transport::Tls), blocks, "{loss:?} {kind}");
+    }
+    let mut e = entry(&[(Transport::Quic, ok(TODAY, Some(60443), Some(1400)))]);
+    e.loss = Some(0.25);
+    e.failed(Transport::Tls, FailureKind::Timeout, NOW);
+    assert!(e.blocked_now(NOW).is_empty());
+    e.failed(Transport::Tls, FailureKind::Timeout, NOW);
+    assert!(e.blocked(Transport::Tls, NOW), "the second timeout in a row");
+    assert_eq!(skipped(&e), [Transport::Tls]);
+}
+
 #[test]
 fn without_memory_the_plan_is_the_configuration_with_extra_ports() {
     let t = target(&[(443, true, true), (61443, true, false)]);

@@ -453,7 +453,7 @@ fn report(config: &ClientConfig, ended: Ended) -> i32 {
         }
         Ok(Outcome::Abandoned) => {
             say(&format!(
-                "{destination} cannot be reached; the session keeps running there"
+                "{destination} cannot be reached; the session may still be running there (qsh kill ends it)"
             ));
             client::EXIT_ERROR
         }

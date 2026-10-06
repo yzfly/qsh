@@ -7,7 +7,7 @@ use std::net::IpAddr;
 
 use super::*;
 use crate::proto::message::{MAX_CONTROL, MAX_HELLO};
-use crate::proto::{self, read_message, write_message, Message};
+use crate::proto::{self, read_message, write_message, ExitStatus, Message};
 use crate::transport::{Connecting, Connection};
 use tokio::io::BufReader;
 
@@ -102,6 +102,9 @@ async fn a_network_change_probes_connections_and_wakes_waiting_sessions() {
 enum Behaviour {
     /// The handshake completes after this long; the far end does the hello and answers PINGs.
     Connect(Duration),
+    /// As `Connect` after the first, but the SERVER_HELLO comes the second later (a lossy
+    /// path: the hello exchange waits for probe timeouts).
+    SlowHello(Duration, Duration),
     /// The handshake fails after this long.
     Fail(Duration, io::ErrorKind),
 }
@@ -133,11 +136,27 @@ enum Mode {
 
 struct Link {
     mode: tokio::sync::watch::Sender<Mode>,
+    /// The server-to-client direction alone (both directions: `mode`).
+    down: tokio::sync::watch::Sender<Mode>,
 }
 
 impl Link {
     fn set(&self, mode: Mode) {
         self.mode.send_replace(mode);
+    }
+
+    fn set_down(&self, mode: Mode) {
+        self.down.send_replace(mode);
+    }
+
+    /// Whether a message from the server gets through, once it may.
+    async fn pass_down(&self) -> bool {
+        if !self.pass().await {
+            return false;
+        }
+        let mut rx = self.down.subscribe();
+        let mode = *rx.wait_for(|m| *m != Mode::Hold).await.unwrap();
+        mode == Mode::Live
     }
 
     /// Whether a message gets through, once it may.
@@ -162,6 +181,10 @@ struct FakeSession {
     attaches: Vec<usize>,
     /// What went wrong (bad proofs, input at the wrong offset).
     errors: Vec<String>,
+    /// The next ATTACH is answered this much later (a lossy path).
+    attach_delay: Option<Duration>,
+    /// Ended by a HANGUP: removed at once (protocol.md 7.11), its id unknown from then on.
+    removed: bool,
 }
 
 impl Fake {
@@ -214,6 +237,10 @@ impl Connector for FakeConnector {
                 .get(&(attempt.transport, attempt.port))
                 .copied()
                 .unwrap_or(Behaviour::Fail(Duration::from_secs(8), io::ErrorKind::TimedOut));
+            let (behaviour, hello_after) = match behaviour {
+                Behaviour::SlowHello(after, hello_after) => (Behaviour::Connect(after), hello_after),
+                other => (other, Duration::ZERO),
+            };
             match behaviour {
                 Behaviour::Connect(after) => {
                     tokio::time::sleep(after).await;
@@ -222,6 +249,7 @@ impl Connector for FakeConnector {
                     fake.servers.lock().unwrap().push(tx);
                     let link = Arc::new(Link {
                         mode: tokio::sync::watch::channel(Mode::Live).0,
+                        down: tokio::sync::watch::channel(Mode::Live).0,
                     });
                     let index = {
                         let mut links = fake.links.lock().unwrap();
@@ -229,9 +257,10 @@ impl Connector for FakeConnector {
                         links.len() - 1
                     };
                     let session = fake.session.lock().unwrap().clone().map(|s| (s, index));
-                    tokio::spawn(far_end(server, rx, link, session));
+                    tokio::spawn(far_end(server, rx, link, session, hello_after));
                     Ok(client.pretend(attempt.transport))
                 }
+                Behaviour::SlowHello(..) => unreachable!("mapped to Connect"),
                 Behaviour::Fail(after, kind) => {
                     tokio::time::sleep(after).await;
                     Err(io::Error::new(kind, "fake failure"))
@@ -241,13 +270,14 @@ impl Connector for FakeConnector {
     }
 }
 
-/// The far end of a fake connection: the hello, PONGs, whatever the test pushes, and the
-/// terminal channels of `session`, all through `link`.
+/// The far end of a fake connection: the hello (`hello_after` late), PONGs, whatever the test
+/// pushes, and the terminal channels of `session`, all through `link`.
 async fn far_end(
     conn: Connection,
     mut push: mpsc::UnboundedReceiver<Message>,
     link: Arc<Link>,
     session: Option<(Arc<Mutex<FakeSession>>, usize)>,
+    hello_after: Duration,
 ) {
     let conn = Arc::new(conn);
     let Some((_, mut send, recv)) = conn.accept().await else {
@@ -257,6 +287,7 @@ async fn far_end(
     if !matches!(read_message(&mut recv, MAX_HELLO).await, Ok(Some(_))) {
         return;
     }
+    tokio::time::sleep(hello_after).await;
     let (tx, mut out) = mpsc::unbounded_channel::<Message>();
     let hello = Message::ServerHello {
         version: u64::from(proto::VERSION),
@@ -278,7 +309,7 @@ async fn far_end(
         tokio::spawn(async move {
             while let Some(m) = out.recv().await {
                 // The hello always gets through: the tests change paths after it
-                if !matches!(m, Message::ServerHello { .. }) && !link.pass().await {
+                if !matches!(m, Message::ServerHello { .. }) && !link.pass_down().await {
                     continue;
                 }
                 if write_message(&mut send, &m).await.is_err() {
@@ -340,7 +371,7 @@ async fn channel(
         let link = link.clone();
         AbortOnDrop(tokio::spawn(async move {
             while let Some(m) = out.recv().await {
-                if link.pass().await && write_message(&mut send, &m).await.is_err() {
+                if link.pass_down().await && write_message(&mut send, &m).await.is_err() {
                     return;
                 }
             }
@@ -358,6 +389,10 @@ async fn channel(
     if !link.pass().await {
         return;
     }
+    let delay = session.lock().unwrap().attach_delay.take();
+    if let Some(delay) = delay {
+        tokio::time::sleep(delay).await;
+    }
     let mine = {
         let mut s = session.lock().unwrap();
         s.attaches.push(index);
@@ -365,41 +400,54 @@ async fn channel(
             s.errors.push("another session".into());
             return;
         }
-        let cb = crypto::pipe_binding(&[0; 32], &id);
-        let matched = match s.pending.take() {
-            Some(pending) if pending.verify(&cb, &proof) => {
-                s.key = pending.clone();
-                pending
-            }
-            _ if s.key.verify(&cb, &proof) => s.key.clone(),
-            _ => {
-                s.errors.push("bad proof".into());
-                return;
-            }
-        };
-        s.generation += 1;
-        let next = crypto::SessionKey::generate();
-        s.pending = Some(next.clone());
-        let start = if output_received == LATEST {
-            s.output.len() as u64
-        } else {
-            output_received
-        };
-        let _ = tx.send(Message::Attached {
-            input_received: s.input.len() as u64,
-            output_start: start,
-            next_key: next,
-            server_proof: matched.server_proof(&cb),
-            error_start: None,
-        });
-        if (start as usize) < s.output.len() {
-            let _ = tx.send(Message::Output {
-                offset: start,
-                data: s.output[start as usize..].to_vec(),
+        if s.removed {
+            let _ = tx.send(Message::Error {
+                code: ErrorCode::SESSION_UNKNOWN,
+                message: String::new(),
             });
+            0
+        } else {
+            let cb = crypto::pipe_binding(&[0; 32], &id);
+            let matched = match s.pending.take() {
+                Some(pending) if pending.verify(&cb, &proof) => {
+                    s.key = pending.clone();
+                    pending
+                }
+                _ if s.key.verify(&cb, &proof) => s.key.clone(),
+                _ => {
+                    s.errors.push("bad proof".into());
+                    return;
+                }
+            };
+            s.generation += 1;
+            let next = crypto::SessionKey::generate();
+            s.pending = Some(next.clone());
+            let start = if output_received == LATEST {
+                s.output.len() as u64
+            } else {
+                output_received
+            };
+            let _ = tx.send(Message::Attached {
+                input_received: s.input.len() as u64,
+                output_start: start,
+                next_key: next,
+                server_proof: matched.server_proof(&cb),
+                error_start: None,
+            });
+            if (start as usize) < s.output.len() {
+                let _ = tx.send(Message::Output {
+                    offset: start,
+                    data: s.output[start as usize..].to_vec(),
+                });
+            }
+            s.generation
         }
-        s.generation
     };
+    if mine == 0 {
+        // Unknown: the ERROR goes out (the writer runs until the stream ends), nothing more
+        while let Ok(Some(_)) = read_message(&mut recv, MAX_TERMINAL).await {}
+        return;
+    }
     while let Ok(Some(m)) = read_message(&mut recv, MAX_TERMINAL).await {
         if !link.pass().await {
             continue;
@@ -429,6 +477,18 @@ async fn channel(
                 if let Some(pending) = s.pending.take() {
                     s.key = pending;
                 }
+            }
+            Message::Hangup => {
+                // The program dies of SIGHUP; EXIT, and the session is removed at once (7.11)
+                s.removed = true;
+                let _ = tx.send(Message::Exit {
+                    output_end: s.output.len() as u64,
+                    status: ExitStatus::Signaled {
+                        signal: "HUP".into(),
+                        core_dumped: false,
+                    },
+                    error_end: None,
+                });
             }
             _ => {}
         }
@@ -834,6 +894,67 @@ async fn a_late_better_transport_takes_the_sessions_over() {
     assert_eq!(fake.log()[0], (Transport::Quic, 60443, 0));
 }
 
+/// The terrible chaos profile (600 ms, 20 % loss each way): QUIC's handshake completes, but
+/// its hello exchange loses packets twice and the SERVER_HELLO comes 6 s later, past the 5 s
+/// a hello may take. TLS, connected meanwhile, is not held up by QUIC's hello: it wins at once.
+/// QUIC's hello is recorded as failed at 5 s but kept, and when it answers, QUIC (the better
+/// transport: TLS collapses at that loss) takes the sessions over and is remembered.
+#[tokio::test(start_paused = true)]
+async fn a_slow_hello_neither_holds_up_the_race_nor_is_thrown_away() {
+    let fake = Fake::new();
+    fake.set(Transport::Quic, 60443, Behaviour::SlowHello(MS(300), S(6)));
+    fake.set(Transport::Tls, 60443, Behaviour::Connect(MS(700)));
+    let pool = pool(&fake, &network(NET));
+    let config = ClientConfig::new("box");
+    let started = Instant::now();
+    let conn = pool.get(&target(&[]), &config).await.unwrap();
+    assert_eq!(conn.transport(), Transport::Tls);
+    // TLS started at 400 ms, connected 700 ms later, and its hello took no time
+    assert_eq!(started.elapsed(), MS(1100));
+    // A session attached on it
+    let session = conn.clone();
+    tokio::time::sleep(S(5)).await;
+    assert!(!session.retiring(), "QUIC's hello has not answered yet");
+    tokio::time::sleep(S(2)).await;
+    assert!(session.retiring(), "the sessions leave TLS for QUIC");
+    let moved = pool.get(&target(&[]), &config).await.unwrap();
+    assert_eq!(moved.transport(), Transport::Quic);
+    let e = entry(&pool, NET);
+    assert!(!e.blocked(Transport::Quic, paths::now()), "{e:?}");
+    assert_eq!(e.last(), Some(Transport::Quic));
+}
+
+/// A slow hello is the only way in (TLS blocked): kept past the 5 s, it wins the race when it
+/// answers, instead of the race failing and starting over after a back-off.
+#[tokio::test(start_paused = true)]
+async fn a_slow_hello_still_wins_when_nothing_else_answers() {
+    let fake = Fake::new();
+    fake.set(Transport::Quic, 60443, Behaviour::SlowHello(MS(300), S(6)));
+    let pool = pool(&fake, &network(NET));
+    let started = Instant::now();
+    let conn = pool.get(&target(&[]), &ClientConfig::new("box")).await.unwrap();
+    assert_eq!(conn.transport(), Transport::Quic);
+    assert_eq!(started.elapsed(), MS(6300));
+    let e = entry(&pool, NET);
+    assert!(!e.blocked(Transport::Quic, paths::now()), "{e:?}");
+    assert_eq!(e.last(), Some(Transport::Quic));
+}
+
+/// A hello that never answers is given up 10 s after it started, and the race goes on
+/// without it (here: nothing else works, the race fails).
+#[tokio::test(start_paused = true)]
+async fn a_hello_that_never_answers_is_given_up() {
+    let fake = Fake::new();
+    fake.set(Transport::Quic, 60443, Behaviour::SlowHello(MS(300), S(3600)));
+    fake.set(Transport::Ssh, 0, Behaviour::Fail(S(1), io::ErrorKind::NotFound));
+    let pool = pool(&fake, &network(NET));
+    let started = Instant::now();
+    let e = pool.get(&target(&[]), &ClientConfig::new("box")).await.unwrap_err();
+    assert!(!e.errors.is_empty());
+    // TLS's attempt times out at 8.4 s; the hello is given up at 10.3 s
+    assert_eq!(started.elapsed(), MS(10300));
+}
+
 /// The chaos scenario `port-fallback` on a lossy 270 ms path (m2.md 5.3): UDP to the primary
 /// port is dropped, the extra port 61443 is open. The first race finds QUIC on 61443 and
 /// remembers it; the next one starts there at once, but a lost QUIC packet lets TLS on the
@@ -968,6 +1089,8 @@ struct Typing {
     events: mpsc::UnboundedReceiver<crate::client::Event>,
     seen: Vec<u8>,
     server: Arc<Mutex<FakeSession>>,
+    /// How the session ended.
+    ended: Option<tokio::sync::oneshot::Receiver<Result<crate::client::Outcome, crate::client::ClientError>>>,
     _task: AbortOnDrop,
 }
 
@@ -984,6 +1107,8 @@ impl Typing {
             generation: 0,
             attaches: Vec::new(),
             errors: Vec::new(),
+            attach_delay: None,
+            removed: false,
         }));
         *fake.session.lock().unwrap() = Some(server.clone());
         let t = target(&[]);
@@ -1012,8 +1137,9 @@ impl Typing {
             events: Some(events_tx),
         };
         let session = crate::client::Session::with_pool(ClientConfig::new("box"), pool.clone());
+        let (done, ended) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
-            let _ = session.attach_saved(saved, terminal).await;
+            let _ = done.send(session.attach_saved(saved, terminal).await);
         });
         Typing {
             input,
@@ -1021,8 +1147,23 @@ impl Typing {
             events,
             seen: Vec::new(),
             server,
+            ended: Some(ended),
             _task: AbortOnDrop(task),
         }
+    }
+
+    /// `~.`: end the session (HANGUP).
+    async fn hang_up(&self) {
+        self.input.send(crate::client::Input::Hangup).await.unwrap();
+    }
+
+    /// How the session ended, waiting at most `within`.
+    async fn ended(&mut self, within: Duration) -> Result<crate::client::Outcome, crate::client::ClientError> {
+        let ended = self.ended.take().expect("asked once");
+        tokio::time::timeout(within, ended)
+            .await
+            .expect("the session ended in time")
+            .expect("the session task ran")
     }
 
     /// The transport of the next attach.
@@ -1052,6 +1193,102 @@ impl Typing {
         }
         Instant::now()
     }
+}
+
+/// At 20 % loss each way an attach exchange that loses packets twice takes more than 5 s. An
+/// ATTACH without an answer after 5 s is abandoned, with its connection, only when nothing at
+/// all arrived on the connection since it was sent; while the path answers (here a PING from
+/// the server; over QUIC any datagram, the ATTACH's acknowledgement among them) the session
+/// waits up to 10 s, instead of reconnecting over the same path.
+#[tokio::test(start_paused = true)]
+async fn a_slow_attach_over_a_path_that_answers_is_not_abandoned() {
+    for answers in [true, false] {
+        let fake = Fake::new();
+        fake.set(Transport::Quic, 60443, Behaviour::Connect(MS(10)));
+        let pool = pool(&fake, &network(NET));
+        let started = Instant::now();
+        let mut s = Typing::start(&fake, &pool);
+        // The first ATTACH is answered 7 s after it arrived
+        s.server.lock().unwrap().attach_delay = Some(S(7));
+        if answers {
+            tokio::time::sleep(S(1)).await;
+            fake.push(Message::Ping { data: 1 });
+        }
+        assert_eq!(s.connected().await, Transport::Quic);
+        let took = started.elapsed();
+        let connections = fake.links.lock().unwrap().len();
+        if answers {
+            assert_eq!((took, connections), (MS(7010), 1), "waited on the same connection");
+        } else {
+            assert!(took > S(5) && took < S(7), "abandoned at 5 s: {took:?}");
+            assert_eq!(connections, 2, "a new connection");
+        }
+        s.type_("one").await;
+        s.shows("one").await;
+    }
+}
+
+/// `~.` on a path that stalls (here: nothing from the server for 4 s after the HANGUP, which
+/// the server got: the program died of SIGHUP and the session is removed at once, protocol.md
+/// 7.11). A session that hung up is ending by the user's choice: its typed input is no reason
+/// to suspect the path and race the transports, which would move it and lose the EXIT in
+/// flight. It waits for the EXIT, and ends with the program's status (129 for the command line).
+#[tokio::test(start_paused = true)]
+async fn a_stall_after_hanging_up_starts_no_race_and_the_exit_status_comes() {
+    let fake = Fake::new();
+    fake.set(Transport::Quic, 60443, Behaviour::Connect(MS(10)));
+    fake.set(Transport::Tls, 60443, Behaviour::Connect(MS(540)));
+    let pool = pool(&fake, &network(NET));
+    let mut s = Typing::start(&fake, &pool);
+    assert_eq!(s.connected().await, Transport::Quic);
+    s.type_("one").await;
+    s.shows("one").await;
+    fake.links.lock().unwrap()[0].set_down(Mode::Hold);
+    fake.restart_log();
+    // `\r~.`
+    s.type_("\r").await;
+    s.hang_up().await;
+    tokio::time::sleep(S(4)).await;
+    assert!(fake.log().is_empty(), "no race: {:?}", fake.log());
+    fake.links.lock().unwrap()[0].set_down(Mode::Live);
+    let outcome = s.ended(S(5)).await.expect("ended");
+    let crate::client::Outcome::Exited(status) = outcome else {
+        panic!("{outcome:?}");
+    };
+    assert_eq!(crate::client::exit_code(&status), 129);
+    assert_eq!(s.server.lock().unwrap().attaches, [0], "never moved");
+}
+
+/// The EXIT of a hang-up is lost with its connection (the server got the HANGUP, removed the
+/// session, and its answer never came): the session attaches again, as after any lost
+/// connection, and the server no longer knows it. That is the end the user asked for: the
+/// session ended by the hang-up, 129 for the command line, not an error.
+#[tokio::test(start_paused = true)]
+async fn a_session_unknown_after_hanging_up_is_the_hang_up() {
+    let fake = Fake::new();
+    fake.set(Transport::Quic, 60443, Behaviour::Connect(MS(10)));
+    let pool = pool(&fake, &network(NET));
+    let mut s = Typing::start(&fake, &pool);
+    assert_eq!(s.connected().await, Transport::Quic);
+    s.type_("one").await;
+    s.shows("one").await;
+    tokio::time::sleep(S(1)).await;
+    // From the server, nothing gets through any more on this connection
+    fake.links.lock().unwrap()[0].set_down(Mode::Dead);
+    fake.restart_log();
+    s.type_("\r").await;
+    s.hang_up().await;
+    // No race at the suspicion (2 s); the dead path rule (8 s) ends the connection
+    tokio::time::sleep(S(7)).await;
+    assert!(fake.log().is_empty(), "no race: {:?}", fake.log());
+    let outcome = s.ended(S(30)).await.expect("ended");
+    let crate::client::Outcome::Exited(status) = outcome else {
+        panic!("{outcome:?}");
+    };
+    assert_eq!(crate::client::exit_code(&status), 129);
+    let server = s.server.lock().unwrap();
+    assert!(server.removed);
+    assert_eq!(server.attaches, [0, 1], "attached again, on a new connection");
 }
 
 /// m2.md 3.8, S4 at the unit level: a session over QUIC whose path goes silent (UDP blocked)

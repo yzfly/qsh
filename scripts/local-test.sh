@@ -40,8 +40,13 @@
 #   -v, --verbose           stream every command's output, not only failures
 #   -h, --help
 #
+# The chaos test's own knobs pass through from the environment: QSH_CHAOS_RUNS (runs per profile
+# of flood_interrupt), QSH_CHAOS_ATTACHES (attaches of udp_block's S1 check), QSH_CHAOS_NAT_IDLE,
+# QSH_CHAOS_WINDOW, QSH_CHAOS_VERBOSE (0: no client debug logs).
+#
 # The summary table at the end has one row per check (PASS, FAIL, WARN, SKIP); the exit status is
-# 1 when any check failed. Logs go to target/local-test/<date>/.
+# 1 when any check failed. Logs go to target/local-test/<date>/; the chaos clients' logs and
+# transcripts, sshd's and the daemon's logs to its chaos/logs/.
 set -uo pipefail
 
 QSHL_REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)

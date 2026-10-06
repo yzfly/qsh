@@ -55,7 +55,7 @@ use crate::proto::ErrorCode;
 use crate::transport::quic::{self, QuicClient};
 use crate::transport::{
     Attempt, Connection, Connector, Direct, FailureKind, Plan, Race, RaceConfig, RaceError, RaceEvent, Target,
-    Transport,
+    Transport, Won,
 };
 
 /// After a network change, a connection that answers nothing for this long is dead.
@@ -507,23 +507,34 @@ impl Pool {
         }
     }
 
-    /// Run one race and keep the first connection whose hello succeeds within 5 s
-    /// (protocol.md 12.1); record what each attempt showed. When `abort` says so (a suspected
-    /// connection answered after all, m2.md 3.8), the race is dropped with its attempts, and
-    /// nothing is recorded: the error is empty then.
+    /// Run one race and keep the first connection whose hello succeeds (protocol.md 12.1);
+    /// record what each attempt showed. The hellos run concurrently, each on its connection as
+    /// it comes out of the race: one slowed down by losses (at 20 % loss and 600 ms a lost
+    /// packet of the hello exchange waits for a probe timeout, doubled for each further loss)
+    /// does not hold up a connection that came out after it. A hello without an answer within
+    /// 5 s is recorded as failed, but kept until [`HELLO_PATIENCE`]: it may still win, or, when
+    /// another transport won meanwhile, answer late and take the sessions over if it is the
+    /// better transport (m2.md 3.6). When `abort` says so (a suspected connection answered
+    /// after all, m2.md 3.8), the race is dropped with its attempts and hellos, and nothing is
+    /// recorded: the error is empty then.
     async fn race(&self, planned: &Planned, ctx: &Ctx, abort: Option<&Abort>) -> Result<Arc<Conn>, RaceError> {
         let mut plan = planned.plan.clone();
         plan.quic = quic::Options::with_keepalive(ctx.keepalive);
         record_plan(&plan, planned, ctx.keepalive);
         let mut race = Race::with_connector(&ctx.target, &plan, self.connector.clone());
         let mut failures: Vec<(Transport, FailureKind)> = Vec::new();
-        loop {
-            let Some(event) = unless(abort, race.next_event()).await else {
+        let mut hellos: Vec<Hello> = Vec::new();
+        let mut exhausted = false;
+        while !(exhausted && hellos.is_empty()) {
+            let Some(step) = unless(abort, next_step(&mut race, exhausted, &mut hellos)).await else {
                 return Err(RaceError::default());
             };
-            let Some(event) = event else { break };
-            let won = match event {
-                RaceEvent::Failed { attempt, error } => {
+            let (hello, result) = match step {
+                Step::Event(None) => {
+                    exhausted = true;
+                    continue;
+                }
+                Step::Event(Some(RaceEvent::Failed { attempt, error })) => {
                     let kind = FailureKind::of(&error);
                     log::debug(format_args!(
                         "{} port {} failed ({kind}): {error}",
@@ -533,21 +544,52 @@ impl Pool {
                     failures.push((attempt.transport, kind));
                     continue;
                 }
-                RaceEvent::Connected(won) => *won,
+                Step::Event(Some(RaceEvent::Connected(won))) => {
+                    hellos.push(Hello::start(*won, ctx.offer));
+                    continue;
+                }
+                Step::Due(i) if hellos[i].late => {
+                    // Not even within its patience: given up (it was recorded at 5 s)
+                    let hello = hellos.swap_remove(i);
+                    log::debug(format_args!(
+                        "{} port {}: no SERVER_HELLO within {} s; given up",
+                        hello.attempt.transport,
+                        hello.attempt.port,
+                        HELLO_PATIENCE.as_secs()
+                    ));
+                    continue;
+                }
+                Step::Due(i) => {
+                    let hello = &mut hellos[i];
+                    let attempt = hello.attempt;
+                    let kind = hello.answers.hello_timeout();
+                    log::debug(format_args!(
+                        "{} port {}: no SERVER_HELLO within {} s ({kind}); waiting a while longer",
+                        attempt.transport,
+                        attempt.port,
+                        ATTACH_TIMEOUT.as_secs()
+                    ));
+                    record_attempt(attempt, kind.as_str());
+                    failures.push((attempt.transport, kind));
+                    race.failed(
+                        attempt.transport,
+                        io::Error::new(io::ErrorKind::TimedOut, "no SERVER_HELLO"),
+                    );
+                    hello.late = true;
+                    hello.deadline = hello.started + HELLO_PATIENCE;
+                    continue;
+                }
+                Step::Done(i, result) => (hellos.swap_remove(i), result),
             };
-            let (attempt, handshake) = (won.attempt, won.handshake);
-            let answers = Answers::of(&won.connection);
-            let hello = tokio::time::timeout(ATTACH_TIMEOUT, Conn::hello_offering(won.connection, ctx.offer));
-            let Some(hello) = unless(abort, hello).await else {
-                return Err(RaceError::default());
-            };
-            match hello {
-                Ok(Ok(conn)) if abort.is_some_and(|abort| abort()) => {
+            let attempt = hello.attempt;
+            match result {
+                Ok(conn) if abort.is_some_and(|abort| abort()) => {
                     // The suspected connection answered first after all
                     tokio::spawn(async move { goodbye(&conn, "").await });
                     return Err(RaceError::default());
                 }
-                Ok(Ok(conn)) => {
+                Ok(conn) => {
+                    let handshake = hello.handshake;
                     log::debug(format_args!(
                         "connected over {} port {} in {} ms",
                         attempt.transport,
@@ -559,7 +601,8 @@ impl Pool {
                     // for an answer: on this network they lost to a slower handshake. That
                     // is a timeout here, recorded now rather than when their own timeout
                     // fires (8 s, by which time a client may be gone); an answer that comes
-                    // later still clears it (`conclude`).
+                    // later still clears it (`conclude`). Not those whose hello is under way:
+                    // they answered.
                     let unanswered: Vec<Transport> = race
                         .running()
                         .into_iter()
@@ -577,9 +620,15 @@ impl Pool {
                     conn.handshake_took(handshake);
                     *conn.attempts.lock().unwrap() = attempts(ctx, planned, attempt.transport, race.errors());
                     self.conclude(race, ctx, &conn, unanswered);
+                    self.linger(hellos, ctx, &conn);
                     return Ok(conn);
                 }
-                Ok(Err(e)) => {
+                Err(_) if hello.late => {}
+                Err(e) => {
+                    log::debug(format_args!(
+                        "{} port {}: the hello failed: {e}",
+                        attempt.transport, attempt.port
+                    ));
                     // A connection ended or reset during the hello: a middlebox, as far as
                     // the network is concerned; anything else (the server refused) is not
                     let kind = match FailureKind::of(&e) {
@@ -589,15 +638,6 @@ impl Pool {
                     record_attempt(attempt, kind.as_str());
                     failures.push((attempt.transport, kind));
                     race.failed(attempt.transport, e);
-                }
-                Err(_) => {
-                    let kind = answers.hello_timeout();
-                    record_attempt(attempt, kind.as_str());
-                    failures.push((attempt.transport, kind));
-                    race.failed(
-                        attempt.transport,
-                        io::Error::new(io::ErrorKind::TimedOut, "no SERVER_HELLO"),
-                    );
                 }
             }
         }
@@ -616,6 +656,24 @@ impl Pool {
             });
         }
         Err(race.take_errors())
+    }
+
+    /// The race was won by `winner` while `hellos` were still under way: those of a better
+    /// transport go on in the background and take the sessions over if they answer in time
+    /// ([`Pool::late`]); the others are recorded as working and closed, as a late success is
+    /// (`conclude`).
+    fn linger(&self, hellos: Vec<Hello>, ctx: &Ctx, winner: &Arc<Conn>) {
+        let Some(pool) = self.me.upgrade() else { return };
+        for hello in hellos {
+            let attempt = hello.attempt;
+            if rank(attempt.transport) > rank(winner.transport()) {
+                tokio::spawn(pool.clone().late(hello, ctx.clone(), Arc::downgrade(winner)));
+            } else if !hello.late {
+                record_attempt(attempt, "ok");
+                let unix = paths::now();
+                ctx.update(|e| e.succeeded(attempt.transport, attempt.port, hello.handshake, unix));
+            }
+        }
     }
 
     /// `attempt` won: record it, and the failures of other transports in this race and in
@@ -680,7 +738,16 @@ impl Pool {
                     let unix = paths::now();
                     ctx.update(|e| e.succeeded(t, attempt.port, handshake, unix));
                     if rank(t) > rank(winner) {
-                        tokio::spawn(pool.late(connection, attempt, handshake, ctx.clone(), old.clone()));
+                        let mut hello = Hello::start(
+                            Won {
+                                connection,
+                                attempt,
+                                handshake,
+                            },
+                            ctx.offer,
+                        );
+                        hello.recorded = true;
+                        tokio::spawn(pool.late(hello, ctx.clone(), old.clone()));
                     } else {
                         connection.close(ErrorCode::NO_ERROR, "");
                     }
@@ -696,24 +763,33 @@ impl Pool {
         });
     }
 
-    /// `connection` of `attempt`, a better transport than that of `old`, came out of a race
-    /// after `old` won it: say hello on it and move the sessions over ([`Pool::adopt`]).
-    async fn late(
-        self: Arc<Pool>,
-        connection: Connection,
-        attempt: Attempt,
-        handshake: Duration,
-        ctx: Ctx,
-        old: Weak<Conn>,
-    ) {
-        let conn = match tokio::time::timeout(ATTACH_TIMEOUT, Conn::hello_offering(connection, ctx.offer)).await {
+    /// `hello`, on a connection of a better transport than that of `old`, is still under way
+    /// after `old` won the race: when it answers in time, move the sessions over
+    /// ([`Pool::adopt`]).
+    async fn late(self: Arc<Pool>, hello: Hello, ctx: Ctx, old: Weak<Conn>) {
+        let (attempt, handshake) = (hello.attempt, hello.handshake);
+        // Recorded as `ok` already, unless it came out of the race still saying hello, or was
+        // recorded as a failed hello at 5 s and answered after all
+        let record = !hello.recorded || hello.late;
+        let conn = match tokio::time::timeout_at(hello.started + HELLO_PATIENCE, hello.future).await {
             Ok(Ok(conn)) => conn,
             Ok(Err(e)) => {
                 log::debug(format_args!("{} port {}, late: {e}", attempt.transport, attempt.port));
                 return;
             }
-            Err(_) => return,
+            Err(_) => {
+                log::debug(format_args!(
+                    "{} port {}, late: no SERVER_HELLO within {} s",
+                    attempt.transport,
+                    attempt.port,
+                    HELLO_PATIENCE.as_secs()
+                ));
+                return;
+            }
         };
+        if record {
+            record_attempt(attempt, "ok");
+        }
         if self.generation() != ctx.generation {
             goodbye(&conn, "").await;
             return;
@@ -952,6 +1028,79 @@ impl Pool {
             conn.rescue_over(None);
             outcome("gone", None);
         }
+    }
+}
+
+/// How long a hello may take in all, from its start, before its connection is given up: a
+/// hello that got no answer within [`ATTACH_TIMEOUT`] is recorded as failed but kept this long
+/// (the server takes a CLIENT_HELLO up to 10 s after accepting the connection, protocol.md 6.6).
+const HELLO_PATIENCE: Duration = Duration::from_secs(10);
+
+/// A hello in progress on a connection that came out of a race.
+struct Hello {
+    attempt: Attempt,
+    handshake: Duration,
+    answers: Answers,
+    started: Instant,
+    /// When it is due: [`ATTACH_TIMEOUT`] after it started, then [`HELLO_PATIENCE`].
+    deadline: Instant,
+    /// No answer within [`ATTACH_TIMEOUT`]: recorded as a failed hello already.
+    late: bool,
+    /// The attempt's success is recorded already (`ok`, by [`Pool::conclude`]).
+    recorded: bool,
+    future: std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<Arc<Conn>>> + Send>>,
+}
+
+impl Hello {
+    fn start(won: Won, offer: super::conn::Offer) -> Hello {
+        let started = Instant::now();
+        Hello {
+            attempt: won.attempt,
+            handshake: won.handshake,
+            answers: Answers::of(&won.connection),
+            started,
+            deadline: started + ATTACH_TIMEOUT,
+            late: false,
+            recorded: false,
+            future: Box::pin(Conn::hello_offering(won.connection, offer)),
+        }
+    }
+}
+
+/// What happened next in a race.
+enum Step {
+    /// The race itself: an attempt failed or connected; None when no attempt is left.
+    Event(Option<RaceEvent>),
+    /// The hello at this index ended.
+    Done(usize, io::Result<Arc<Conn>>),
+    /// The hello at this index is due ([`Hello::deadline`]).
+    Due(usize),
+}
+
+/// The next step of `race` with `hellos` under way (cancel safe: nothing is lost when the
+/// returned future is dropped before it is ready).
+async fn next_step(race: &mut Race, exhausted: bool, hellos: &mut [Hello]) -> Step {
+    let due = hellos
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, h)| h.deadline)
+        .map(|(i, h)| (i, h.deadline));
+    let any = !hellos.is_empty();
+    let done = std::future::poll_fn(|cx| {
+        for (i, hello) in hellos.iter_mut().enumerate() {
+            if let std::task::Poll::Ready(result) = hello.future.as_mut().poll(cx) {
+                return std::task::Poll::Ready((i, result));
+            }
+        }
+        std::task::Poll::Pending
+    });
+    tokio::select! {
+        biased;
+        (i, result) = done, if any => Step::Done(i, result),
+        _ = tokio::time::sleep_until(due.map_or_else(Instant::now, |d| d.1)), if due.is_some() => {
+            Step::Due(due.map_or(0, |d| d.0))
+        }
+        event = race.next_event(), if !exhausted => Step::Event(event),
     }
 }
 

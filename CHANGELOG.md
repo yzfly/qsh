@@ -78,6 +78,17 @@ milestones and were not released; their changes are listed here.
 - On a very lossy path a slow QUIC hello was recorded as a blocking middlebox, so later
   connections stayed on TLS (which stalls badly under loss): a hello timeout now counts as
   blocked only when the server's packets stop arriving.
+- On a very lossy path a third of the QUIC hellos took longer than 5 s: the connection race
+  waited for them before looking at TLS, then threw QUIC away and kept the session on TLS for
+  good. The race now says hello on every connection at once, and a slow QUIC hello that
+  answers after TLS won still takes the session over. An attach that takes longer than 5 s
+  over a path that visibly works is no longer abandoned for a reconnect over the same path,
+  and on a path losing 15 % or more one timed-out handshake no longer marks the transport as
+  blocked.
+- `~.` on a path that stalled could end with an error (exit 255) instead of the program's
+  status: the stall made qsh race the other transports and move the session, losing the exit
+  status that was on its way. A session that hung up now stays on its connection, and when it
+  finds the session gone after a reconnect it exits with 129, as the hang-up does.
 - Compression starts with the first output instead of after the first rate sample.
 - When the path dies mid-session (UDP blocked, a NAT that drops the flow), typing gets an answer
   over another transport within about 4.5 s at 270 ms RTT instead of 11 s: unanswered input

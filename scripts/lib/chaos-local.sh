@@ -93,6 +93,13 @@ qshl_chaos_env() {
     QSHL_CHAOS_ENV=(env -i "PATH=$QSHL_SYS_PATH" LANG=C.UTF-8 QSH_CHAOS=1 QSH_CHAOS_LOCAL=1
         "QSH_CHAOS_NS_PREFIX=$QSHL_CHAOS_PREFIX" "QSH_CHAOS_USER=$(id -un)"
         "QSH_CHAOS_DIR=$QSHL_CHAOS_DIR" "QSH_CHAOS_NETNS=$QSHL_REPO/tests/chaos/netns.sh")
+    # The test's own knobs, when set (env -i drops everything else)
+    local knob
+    for knob in QSH_CHAOS_RUNS QSH_CHAOS_ATTACHES QSH_CHAOS_NAT_IDLE QSH_CHAOS_WINDOW QSH_CHAOS_VERBOSE; do
+        if [ -n "${!knob:-}" ]; then
+            QSHL_CHAOS_ENV+=("$knob=${!knob}")
+        fi
+    done
     # Below a directory others can write (local-test.sh): the daemons' upgrade test hook
     if [ -n "${QSHL_TRUSTED_DIR:-}" ]; then
         QSHL_CHAOS_ENV+=("QSH_CHAOS_TRUSTED_DIR=$QSHL_CHAOS_DIR")
@@ -265,6 +272,11 @@ qshl_chaos() {
         fi
     done
     cat "$QSHL_CHAOS_DIR"/results-*.jsonl >"$QSHL_LOG_DIR/chaos-results.jsonl" 2>/dev/null || true
+    # What explains a failed run, kept with the rig's logs: the clients' logs and transcripts of
+    # every run, sshd's log, the daemon's log (the run's directory is removed)
+    sudo -n "${QSHL_CHAOS_ENV[@]}" "$QSHL_REPO/tests/chaos/collect-logs.sh" "$QSHL_LOG_DIR/chaos" \
+        >/dev/null 2>&1 || true
+    sudo -n chown -R "$(id -u):$(id -g)" "$QSHL_LOG_DIR/chaos" 2>/dev/null || true
     python3 -I "$QSHL_REPO/tests/chaos/report.py" "$QSHL_LOG_DIR/chaos-results.jsonl" \
         >"$QSHL_LOG_DIR/chaos-report.md" 2>/dev/null || true
     qshl_chaos_cleanup

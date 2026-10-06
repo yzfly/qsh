@@ -1393,6 +1393,17 @@ HANGUP Payload {
   7.4) it takes effect only when the program reads, and `qsh kill` over ssh is the way to end
   such a session at once.
 
+  A client that sent HANGUP waits for its answer on that attachment: it SHOULD NOT treat
+  unanswered input as a reason to suspect the path from then on, nor move the session to another
+  connection (section 12; the dead path rules still apply), because the server removes the
+  session as it sends the EXIT or ERROR, and an attachment elsewhere would find it gone. When
+  the client nevertheless attaches again (its connection was lost) and gets SESSION_UNKNOWN or
+  SESSION_ENDED, the session ended by the hang-up; it repeats HANGUP on that attachment
+  otherwise (the server may not have received it). A command-line client then exits with
+  129 (128 + SIGHUP), the status the hang-up gives the program, rather than with an error. A
+  client that cannot reach the server again cannot tell whether the HANGUP arrived; it says so
+  and exits with 255.
+
 **Hanging up a session** is what HANGUP, bootstrap op `kill`, `DETACHED_TTL` and daemon shutdown
 (section 7.13) do. The session's program runs as the leader of its own process group and
 session (`setsid`); on a tty session the pseudo-terminal is its controlling terminal. The
@@ -2291,20 +2302,27 @@ Link) learned on phones. Values are RECOMMENDED defaults.
 
 ### 12.1 Racing transports
 
-The client starts the transports' handshakes with staggered delays and takes the connections
-in the order in which their handshakes complete (the TLS handshake for QUIC and TLS, the
-preface for the pipe). On the first one it sends CLIENT_HELLO and waits up to 5 s for
-SERVER_HELLO. If SERVER_HELLO arrives and is acceptable, **the race ends**: that connection is
-used, and the client drops every other connection and attempt. If the hello fails or times out,
-the client closes that connection and moves to the next one to complete its handshake, with
-its own 5 s. Connections that complete while the client is waiting are kept as standby without
-sending anything on them. (A standby connection that stays unused for 10 s is closed by the
-server's `HELLO_TIMEOUT`; the client simply drops it.) The race fails when every transport has
+The client starts the transports' handshakes with staggered delays and sends CLIENT_HELLO on
+each connection as soon as its handshake completes (the TLS handshake for QUIC and TLS, the
+preface for the pipe). The hellos run concurrently: one slowed down by losses (on a lossy, long
+path a lost packet of the hello exchange waits for a retransmission timeout, doubled for each
+further loss) does not hold up a connection that completed after it. The first connection whose
+SERVER_HELLO arrives and is acceptable **ends the race**: that connection is used, and the
+client drops the other attempts. A hello that fails ends that connection's part in the race. A
+hello without SERVER_HELLO within 5 s counts as failed (for path memory, below), but the client
+MAY keep waiting for it up to 10 s from its start: it may still end the race, and when a worse
+transport (below) won meanwhile, a hello that answers late MAY take the sessions over like a
+better transport found by a background probe. Hellos still under way on transports no better
+than the winner's are dropped when the race ends. The race fails when every transport has
 failed or timed out.
 
 The client then sends its ATTACHes on the winning connection only. An ATTACH that gets neither
 ATTACHED nor ERROR within 5 s is abandoned (its stream reset with CANCELLED, section 7.2); the
-client then treats the connection as failed and reconnects (section 12.2), racing again. The
+client then treats the connection as failed and reconnects (section 12.2), racing again. When
+something arrived on the connection since the ATTACH was sent (over QUIC any datagram, the
+acknowledgement of the ATTACH among them), the path works and is only slow: the client MAY
+then wait up to 10 s in all (the server's `AUTH_TIMEOUT` bounds the first ATTACH of a
+connection), since a new connection over the same path would not answer sooner. The
 race thus decides only which path answers; authentication is never raced, which keeps the rule
 of one outstanding ATTACH per session (section 7.2) trivially true.
 
