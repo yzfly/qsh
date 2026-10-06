@@ -363,15 +363,20 @@ pub async fn run(mut config: ClientConfig, start: Start, options: TerminalOption
 #[cfg(feature = "self-install")]
 async fn offer_install(config: &ClientConfig) -> bool {
     let destination = config.ssh.destination.clone();
-    let question = format!("qsh-server is not installed on {destination}. Install it to ~/.local/bin there? [Y/n] ");
+    // No by default: the question follows a report of the server's ("no qsh-server here"),
+    // and what was typed before it (a command meant for the session) must not answer it
+    // (review L5)
+    let question = format!("qsh-server is not installed on {destination}. Install it to ~/.local/bin there? [y/N] ");
     let answer = tokio::task::spawn_blocking(move || {
+        let stdin = std::io::stdin();
+        sys::discard_input(&stdin);
         eprint!("qsh: {question}");
         let mut line = String::new();
-        std::io::stdin().read_line(&mut line).map(|_| line)
+        stdin.read_line(&mut line).map(|_| line)
     })
     .await;
     let yes = match answer {
-        Ok(Ok(line)) => matches!(line.trim().to_ascii_lowercase().as_str(), "" | "y" | "yes"),
+        Ok(Ok(line)) => install_answer_is_yes(&line),
         _ => false,
     };
     if !yes {
@@ -399,6 +404,11 @@ async fn offer_install(config: &ClientConfig) -> bool {
 #[cfg(not(feature = "self-install"))]
 async fn offer_install(_config: &ClientConfig) -> bool {
     false
+}
+
+/// The answer to the install question: yes only when it says so; an empty line is no.
+pub fn install_answer_is_yes(line: &str) -> bool {
+    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
 /// The command that installs qsh-server on the host, for people to run.
@@ -542,7 +552,7 @@ async fn attempt(config: ClientConfig, start: Start, options: &TerminalOptions) 
                 }
                 Some(Event::Disconnected(why)) => {
                     if verbose {
-                        say(&format!("connection lost: {why}"));
+                        say(&format!("connection lost: {}", qsh_core::text::sanitize(&why, 512)));
                     }
                     match outage.as_mut() {
                         Some((_, last)) => *last = why,
@@ -638,6 +648,17 @@ fn spawn_resize(tx: mpsc::Sender<Input>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review L5: installing software on a host is never the default answer.
+    #[test]
+    fn the_install_question_defaults_to_no() {
+        for yes in ["y", "Y", "yes", " YES \n"] {
+            assert!(install_answer_is_yes(yes), "{yes:?}");
+        }
+        for no in ["", "\n", "n", "no", "ls -la\n", "yy"] {
+            assert!(!install_answer_is_yes(no), "{no:?}");
+        }
+    }
     use qsh_core::transport::Transport;
 
     #[test]

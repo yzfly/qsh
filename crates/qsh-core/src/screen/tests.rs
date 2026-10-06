@@ -503,3 +503,380 @@ fn the_test_hook_model_fails_on_its_marker() {
     assert!(other.usable() && before.usable());
     assert!(other.snapshot(None).is_some());
 }
+
+/// Output for the filter's differential test: everything `terminal_output` writes, and what
+/// the filter rewrites or swallows: counts beyond the screen, sequences too long to hold,
+/// controls inside sequences, strings of every kind and terminator, and sequences cut by others.
+fn hostile_output(rng: &mut Rng, cols: u16, rows: u16, len: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    while out.len() < len {
+        match rng.below(12) {
+            0..=3 => {
+                let n = 1 + rng.below(40) as usize;
+                out.extend(terminal_output(rng, n));
+            }
+            4 | 5 => {
+                let n = [0, 1, 2, cols - 1, cols, cols + 1, rows - 1, rows, rows + 3, 300][rng.below(10) as usize];
+                let f = b"@LMPSTX"[rng.below(7) as usize] as char;
+                let tail = ["", ";7", ":3", ";;9"][rng.below(4) as usize];
+                out.extend_from_slice(format!("\x1b[{n}{tail}{f}").as_bytes());
+                if rng.below(2) == 0 {
+                    out.extend_from_slice(
+                        format!(
+                            "\x1b[{};{}H",
+                            rng.below(u64::from(rows) + 2),
+                            rng.below(u64::from(cols) + 2)
+                        )
+                        .as_bytes(),
+                    );
+                }
+            }
+            6 => {
+                // Too long to hold: leading zeros, many parameters, sub-parameters
+                let body = match rng.below(4) {
+                    0 => format!("{}{}", "0".repeat(70 + rng.below(40) as usize), rng.below(400)),
+                    1 => ";1".repeat(10 + rng.below(40) as usize),
+                    2 => format!(
+                        "38:2::{}:{}:{};{}",
+                        rng.below(256),
+                        rng.below(256),
+                        rng.below(256),
+                        "4;".repeat(30)
+                    ),
+                    _ => format!("?{}", "1049;25;".repeat(1 + rng.below(12) as usize)),
+                };
+                let f = b"m@LHhlJKrT"[rng.below(10) as usize] as char;
+                out.extend_from_slice(format!("\x1b[{body}{f}").as_bytes());
+            }
+            7 => {
+                // Controls inside sequences, intermediates, ignored forms
+                let s = [
+                    "\x1b[1\n;2H",
+                    "\x1b[\r3\x08@",
+                    "\x1b\n7",
+                    "\x1b\x07[2J",
+                    "\x1b[?1\n049h",
+                    "\x1b[1?2h",
+                    "\x1b[1 q",
+                    "\x1b[ 5q",
+                    "\x1b[!p",
+                    "\x1b[2!p",
+                    "\x1b[1$x",
+                    "\x1b[>1;2c",
+                    "\x1b(0",
+                    "\x1b #8",
+                    "\x1b\x1b[31m",
+                    "\x1b[1\x1b[32m",
+                    "\x1b[5\x18A",
+                    "\x1b[\x7f3D",
+                    "\x1b[\u{e9}2C",
+                    "\x1b(\x1b[33m",
+                    "\x1b(\x1b]0;x\x07B",
+                    "\u{e4}\x1b[m",
+                    "\x1b\x7f\u{e9}c",
+                ];
+                out.extend_from_slice(rng.pick(&s).as_bytes());
+                if rng.below(8) == 0 {
+                    // A character cut by a string
+                    out.extend_from_slice(b"\xc3\x1b]0;t\x07z");
+                }
+            }
+            8 | 9 => {
+                // Strings
+                let open = [
+                    "\x1b]0;",
+                    "\x1b]2;",
+                    "\x1b]52;c;",
+                    "\x1b]",
+                    "\x1bP1$r",
+                    "\x1bP",
+                    "\x1b_",
+                    "\x1b^",
+                    "\x1bX",
+                    "\x1b\n]1;",
+                ];
+                out.extend_from_slice(rng.pick(&open).as_bytes());
+                for _ in 0..rng.below(200) {
+                    out.push([b'a', b';', 0x9c, 0x9b, 0xc3, b'\n', 0x07, 0x7f, b'[', b'1'][rng.below(10) as usize]);
+                }
+                let close = ["\x07", "\x1b\\", "\x18", "\x1a", "\u{9c}", "", "\x1b[1m"];
+                out.extend_from_slice(rng.pick(&close).as_bytes());
+            }
+            _ => out.extend_from_slice(
+                rng.pick(&[
+                    "\r\n",
+                    "abc",
+                    "中",
+                    "\x1b[?1049h",
+                    "\x1b[?1049l",
+                    "\x1b[3;5r",
+                    "\x1b7",
+                    "\x1b8",
+                ])
+                .as_bytes(),
+            ),
+        }
+    }
+    out
+}
+
+/// What a `vt100` screen shows and keeps: every cell (scrollback too), the cursor, the pen, the
+/// modes; and the same after leaving the alternate screen, restoring the saved cursor, and
+/// scrolling (which shows the scroll region).
+fn vt100_state(screen: &vt100::Screen) -> Vec<String> {
+    let (rows, cols) = screen.size();
+    let mut state = Vec::new();
+    for probe in ["", "\x1b8", "\x1b[?1049l\x1b[?47l", "\x1b[999B\n\n\n\n\n\n\n\nz"] {
+        let mut p = vt100::Parser::new(rows, cols, SNAPSHOT_TAIL_LINES);
+        *p.screen_mut() = screen.clone();
+        p.process(probe.as_bytes());
+        let s = p.screen_mut();
+        s.set_scrollback(usize::MAX);
+        let back = s.scrollback();
+        for k in (0..=back).rev() {
+            s.set_scrollback(k);
+            for r in 0..rows {
+                let cells: Vec<_> = (0..cols).map(|c| format!("{:?}", s.cell(r, c))).collect();
+                state.push(format!("{probe:?} {k} {r} {} {}", s.row_wrapped(r), cells.join("")));
+            }
+        }
+        s.set_scrollback(0);
+        state.push(format!(
+            "{probe:?} {:?} {} {:?}",
+            s.cursor_position(),
+            s.alternate_screen(),
+            String::from_utf8_lossy(&s.state_formatted())
+        ));
+    }
+    state
+}
+
+/// The scanner's output has exactly the effect of the program's output on `vt100` (scan.rs):
+/// strings swallowed, sequences held back across chunks, counts clamped, long sequences in
+/// canonical form; whatever the chunks.
+#[test]
+fn the_filter_changes_nothing_vt100_shows() {
+    let mut rng = Rng(77);
+    for case in 0..300 * soak() {
+        let cols = 2 + rng.below(30) as u16;
+        let rows = 2 + rng.below(12) as u16;
+        let len = 1 + rng.below(3000) as usize;
+        let mut data = hostile_output(&mut rng, cols, rows, len);
+        // Whatever is unfinished at the end: ended
+        data.push(0x18);
+        let mut raw = vt100::Parser::new(rows, cols, SNAPSHOT_TAIL_LINES);
+        raw.process(&data);
+        let mut scanner = super::scan::Scanner::new(cols, rows);
+        let mut scanned = super::scan::Scanned::default();
+        let mut filtered = Vec::new();
+        let mut at = 0;
+        while at < data.len() {
+            let n = (rng.below(80) as usize + 1).min(data.len() - at);
+            scanner.scan(&data[at..at + n], &mut scanned);
+            filtered.extend_from_slice(&scanned.bytes);
+            at += n;
+        }
+        assert_eq!(scanner.held(), 0, "case {case}");
+        let mut fed = vt100::Parser::new(rows, cols, SNAPSHOT_TAIL_LINES);
+        fed.process(&filtered);
+        let (a, b) = (vt100_state(raw.screen()), vt100_state(fed.screen()));
+        if a != b {
+            let i = a.iter().zip(&b).position(|(x, y)| x != y).unwrap_or(0);
+            panic!(
+                "case {case} ({cols}x{rows}): {:?}\n  vs {:?}\ninput {:?}\nfiltered {:?}",
+                a.get(i),
+                b.get(i),
+                String::from_utf8_lossy(&data),
+                String::from_utf8_lossy(&filtered)
+            );
+        }
+    }
+}
+
+/// H1: an unterminated string (OSC, DCS, APC) of any length costs the model nothing: `vt100`,
+/// whose parser keeps an OSC without limit, never sees it, and the title is the scanner's.
+#[test]
+fn an_unterminated_string_costs_the_model_nothing() {
+    let chunk = vec![b'y'; 16384];
+    for (open, total) in [("\x1b]0;", 64usize << 20), ("\x1bP1q", 16 << 20), ("\x1b_", 16 << 20)] {
+        let mut live = Live::new("t", 80, 24);
+        live.feed(0, b"$ ");
+        let mut offset = 2;
+        live.feed(offset, open.as_bytes());
+        offset += open.len() as u64;
+        let mut fed = 0;
+        while fed < total {
+            live.feed(offset, &chunk);
+            offset += chunk.len() as u64;
+            fed += chunk.len();
+        }
+        live.feed(offset, b"\x07\x1b\\done");
+        assert!(live.usable(), "{open:?}");
+        let bytes = live.model.as_ref().unwrap().vt100_bytes();
+        assert!(bytes < 1024, "{open:?}: vt100 got {bytes} bytes");
+        let capture = live.model.as_mut().unwrap().capture(0);
+        assert!(snapshot::plain(&capture.normal).contains("$ done"), "{open:?}");
+        if open.starts_with("\x1b]") {
+            assert_eq!(capture.title.len(), 4096 - 2);
+        }
+    }
+}
+
+/// H2: a count far beyond the screen costs what one the size of the screen does (it is
+/// clamped, exactly), and a flood of them exhausts the model's budget at once: 64 KiB of them
+/// take far less than 50 ms at the largest size, where `vt100` alone took 1.45 s per sequence.
+/// (ECH costs a line's worth of cells per sequence, like a line feed: ordinary work.)
+#[test]
+fn counts_beyond_the_screen_are_cheap() {
+    for seq in [
+        "\x1b[65535@",
+        "\x1b[65535L",
+        "\x1b[65535T",
+        "\x1b[65535P",
+        "\x1b[65535M",
+        "\x1b[65535S",
+    ] {
+        // One: clamped, the model stays
+        let mut live = Live::new("one", 1024, 256);
+        live.feed(0, b"hello\r\n");
+        let start = std::time::Instant::now();
+        live.feed(7, seq.as_bytes());
+        let one = start.elapsed();
+        assert!(live.usable(), "{seq:?}");
+        assert!(one < std::time::Duration::from_millis(250), "{seq:?}: {one:?}");
+        // A flood: the model is dropped before it does the work
+        let flood = seq.repeat(65536 / seq.len());
+        let mut live = Live::new("flood", 1024, 256);
+        live.feed(0, b"hello\r\n");
+        let start = std::time::Instant::now();
+        let mut offset = 7;
+        for chunk in flood.as_bytes().chunks(16384) {
+            live.feed(offset, chunk);
+            offset += chunk.len() as u64;
+        }
+        let all = start.elapsed();
+        assert!(all < std::time::Duration::from_millis(50), "{seq:?}: {all:?}");
+        assert!(!live.usable(), "{seq:?}");
+    }
+}
+
+/// The budget lets legitimate output through: a full-screen program repainting the largest
+/// screen, `clear`, an editor scrolling a region; at the pace of a program, `clear` with a
+/// little output in a loop for a minute. Clearing the largest screen over and over with nothing
+/// else exhausts it.
+#[test]
+fn the_work_budget_spares_programs() {
+    let mut live = Live::new("t", 1024, 256);
+    let mut offset = 0;
+    let mut feed = |live: &mut Live, bytes: &[u8]| {
+        live.feed(offset, bytes);
+        offset += bytes.len() as u64;
+    };
+    feed(&mut live, b"\x1b[?1049h");
+    for i in 0..10 {
+        let mut screen = format!("\x1b[H\x1b[2J\x1b[1;30r\x1b[30H\x1b[3S\x1b[5;1H\x1b[2L\x1b[4@\x1b[1P frame {i}\r\n");
+        for row in 0..40 {
+            screen.push_str(&format!(
+                "\x1b[{};1H\x1b[1;3{}mline {row} of frame {i}\x1b[K",
+                row + 2,
+                row % 8
+            ));
+        }
+        feed(&mut live, screen.as_bytes());
+    }
+    feed(&mut live, b"\x1b[?1049l");
+    for i in 0..10 {
+        feed(&mut live, format!("\x1b[H\x1b[2J\x1b[3J$ ls\r\nfile{i}\r\n").as_bytes());
+    }
+    assert!(live.usable());
+
+    // `watch -n 0.05` on the largest screen for a minute, on a simulated clock
+    let clear = format!("\x1b[H\x1b[2J\x1b[3J{}", "Every 0.1s: date\r\n".repeat(3));
+    let mut scanner = super::scan::Scanner::new(1024, 256);
+    let mut scanned = super::scan::Scanned::default();
+    scanner.scan(clear.as_bytes(), &mut scanned);
+    let start = std::time::Instant::now();
+    let mut budget = super::model::Budget::new(start);
+    for i in 0..1200 {
+        let now = start + std::time::Duration::from_millis(50 * i);
+        assert!(budget.spend(now, clear.len(), scanned.cost), "after {i}");
+    }
+    // The same, as fast as it can be written: refused within the first second
+    let mut budget = super::model::Budget::new(start);
+    let refused = (0..20_000).position(|i| {
+        !budget.spend(
+            start + std::time::Duration::from_micros(50 * i),
+            clear.len(),
+            scanned.cost,
+        )
+    });
+    assert!(refused.is_some_and(|i| i < 20_000), "{refused:?}");
+
+    let mut live = Live::new("t", 1024, 256);
+    live.feed(0, &b"\x1b[2J".repeat(4096));
+    assert!(!live.usable());
+}
+
+/// A sequence held back at the end of a chunk is applied whole in the next, also across a
+/// resize that rebuilds the model; a snapshot meanwhile is taken before it, so that the client
+/// gets the whole sequence after it.
+#[test]
+fn a_sequence_split_across_chunks_is_held_back() {
+    let mut live = Live::new("t", 20, 5);
+    live.feed(0, b"ab\x1b[3");
+    assert_eq!(live.snapshot(None).unwrap().offset, 2);
+    live.resize(10, 5);
+    live.feed(5, b"1mX\x1b]0;tit");
+    assert_eq!(live.snapshot(None).unwrap().offset, 8);
+    live.feed(15, b"le\x07");
+    let snapshot = live.snapshot(None).unwrap();
+    assert_eq!(snapshot.offset, 18);
+    let capture = live.model.as_mut().unwrap().capture(0);
+    assert_eq!(capture.title, "title");
+    let x = &capture.normal.lines[0].cells[2];
+    assert_eq!((x.text.as_str(), x.pen.fg), ("X", snapshot::Color::Index(1)));
+}
+
+/// A screen whose snapshot would exceed `MAX_SNAPSHOT` by its text and colors alone is
+/// recognised before it is captured and encoded (which took 0.35 s at the caps, for nothing).
+#[test]
+fn an_oversize_snapshot_is_recognised_before_encoding() {
+    let (cols, rows) = (512u16, 256u16);
+    let mut live = Live::new("t", cols, rows);
+    let mut fill = Vec::new();
+    for row in 0..rows {
+        fill.extend_from_slice(format!("\x1b[{};1H", row + 1).as_bytes());
+        for col in 0..cols {
+            fill.extend_from_slice(format!("\x1b[38;5;{}m", (row + col) % 200).as_bytes());
+            fill.extend_from_slice("e\u{301}\u{302}\u{303}".as_bytes());
+        }
+    }
+    live.feed(0, &fill);
+    assert!(live.usable());
+    assert!(live.model.as_mut().unwrap().least_size() > MAX_SNAPSHOT);
+    let start = std::time::Instant::now();
+    assert!(live.snapshot(None).is_none());
+    assert!(live.snapshot_from(0, true).is_err());
+    let took = start.elapsed();
+    assert!(took < std::time::Duration::from_secs(1), "{took:?}");
+    assert!(live.usable());
+}
+
+/// The estimate never exceeds the encoding: a snapshot it refuses would have been too large.
+#[test]
+fn the_size_estimate_is_a_lower_bound() {
+    let mut rng = Rng(91);
+    for _ in 0..200 * soak() {
+        let cols = 2 + rng.below(60) as u16;
+        let rows = 2 + rng.below(20) as u16;
+        let mut model = Vt100Model::new(cols, rows);
+        let len = rng.below(4000) as usize;
+        let data = terminal_output(&mut rng, len);
+        feed_chunked(&mut model, &mut rng, &data);
+        let least = model.least_size();
+        let capture = model.capture(SNAPSHOT_TAIL_LINES);
+        for skip in [false, true] {
+            assert!(least <= encode(&capture, skip).len(), "{least}");
+        }
+    }
+}

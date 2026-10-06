@@ -111,25 +111,13 @@ _qsh__server() {
             return 0
             ;;
         qsh__subcmd__server__subcmd__daemon)
-            opts="-v -h --foreground --ports --on-demand --resume --state-fd --key-fd --fallback-exe-fd --fell-back --help"
+            opts="-v -h --foreground --ports --on-demand --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
             case "${prev}" in
                 --ports)
-                    COMPREPLY=($(compgen -f "${cur}"))
-                    return 0
-                    ;;
-                --state-fd)
-                    COMPREPLY=($(compgen -f "${cur}"))
-                    return 0
-                    ;;
-                --key-fd)
-                    COMPREPLY=($(compgen -f "${cur}"))
-                    return 0
-                    ;;
-                --fallback-exe-fd)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -141,7 +129,7 @@ _qsh__server() {
             return 0
             ;;
         qsh__subcmd__server__subcmd__doctor)
-            opts="-v -h --json --probe --ports --root --help"
+            opts="-v -h --json --probe --ports --root --commands --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -152,6 +140,10 @@ _qsh__server() {
                     return 0
                     ;;
                 --root)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --commands)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -377,7 +369,7 @@ _qsh__server() {
             return 0
             ;;
         qsh__subcmd__server__subcmd__tune)
-            opts="-y -v -h --apply --revert --yes --bbr-default --allow-low-ports --linger --ports --root --help"
+            opts="-y -v -h --apply --revert --yes --bbr-default --allow-low-ports --linger --ports --root --commands --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -392,6 +384,10 @@ _qsh__server() {
                     return 0
                     ;;
                 --root)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --commands)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;

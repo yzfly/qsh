@@ -24,7 +24,7 @@ use qsh_core::config::Catchup;
 use qsh_core::crypto::{Fingerprint, SessionKey};
 use qsh_core::fault::test_hooks::{panic_on, Hook};
 use qsh_core::proto::bootstrap::{parse_reply, Credentials, Op, Reply};
-use qsh_core::proto::message::{ATTACH_ACCEPT_SNAPSHOT, ATTACH_FRESH, LATEST, MAX_HELLO, MAX_TERMINAL};
+use qsh_core::proto::message::{ATTACH_ACCEPT_SNAPSHOT, ATTACH_FRESH, LATEST, MAX_CONTROL, MAX_HELLO, MAX_TERMINAL};
 use qsh_core::proto::zstd::MAX_ZSTD_CONTENT;
 use qsh_core::proto::{read_message, write_message, Message, WindowSize};
 use qsh_core::server::{Daemon, DaemonLauncher, ServerConfig};
@@ -333,6 +333,63 @@ async fn a_failing_screen_model_costs_only_its_sessions_snapshots() {
     let mut s = Stream::default();
     pump(&mut ch, &mut s, Duration::from_secs(10), |s| s.shows("C-OK")).await;
     assert!(!d.task.is_finished());
+}
+
+/// A screen model busy with output (here: stalled for 3 s by the test hook, as one could be
+/// with output that is expensive to emulate) holds up neither the daemon nor its own
+/// attachment: its reader thread does not hold the output buffer while it feeds the model, and
+/// the attachments reach the model on blocking threads. On a runtime of one worker, a RESIZE
+/// meanwhile (which resizes the model) and a PING are answered at once; before, the RESIZE
+/// waited for the buffer on the only worker, and the PONG with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn a_busy_screen_model_holds_up_nothing_else() {
+    panic_on(Hook::Stall, b"STALL-MODEL-MARKER");
+    let d = TestDaemon::start("stall").await;
+    let c = d
+        .tty("read x; printf '%s%s\\n' STALL-MODEL- MARKER; read y; echo got-$y; exec sleep 600")
+        .await;
+    let mut client = hello(&c, &["snapshot"]).await;
+    let (mut ch, _) = attach(&client, &c, 0, ATTACH_FRESH | ATTACH_ACCEPT_SNAPSHOT).await;
+    let input = |offset: u64, data: &[u8]| Message::Input {
+        offset,
+        data: data.to_vec(),
+    };
+    let start = Instant::now();
+    write_message(&mut ch.send, &input(0, b"go\n")).await.unwrap();
+    let mut s = Stream::default();
+    // The model is stalled from when the marker arrives: well within this (the test's own
+    // tasks run on the one worker too, so the time is measured from before the stall)
+    pump_for(&mut ch, &mut s, Duration::from_millis(500)).await;
+    write_message(&mut ch.send, &Message::Resize(WindowSize::new(100, 30)))
+        .await
+        .unwrap();
+    write_message(&mut client._ctl_send, &Message::Ping { data: 7 })
+        .await
+        .unwrap();
+    let pong = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match read_message(&mut client._ctl_recv, MAX_CONTROL).await {
+                Ok(Some(Message::Pong { data })) => return data,
+                Ok(Some(_)) => {}
+                other => panic!("the control stream ended: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("a PONG");
+    let took = start.elapsed();
+    assert_eq!(pong, 7);
+    assert!(
+        took < Duration::from_millis(2000),
+        "the PONG came {took:?} after the input"
+    );
+    // The session goes on, the model too once it is done
+    pump(&mut ch, &mut s, Duration::from_secs(10), |s| {
+        s.shows("STALL-MODEL-MARKER")
+    })
+    .await;
+    write_message(&mut ch.send, &input(3, b"yes\n")).await.unwrap();
+    pump(&mut ch, &mut s, Duration::from_secs(10), |s| s.shows("got-yes")).await;
 }
 
 /// A panic of the zstd encoder sends that output uncompressed; the rest of the output is

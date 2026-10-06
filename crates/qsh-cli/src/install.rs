@@ -8,10 +8,13 @@
 //!    - the `qsh-server` next to this `qsh`, when it is of the same version and this build's
 //!      target is the host's (the static musl builds of a release run on every Linux of their
 //!      architecture; macOS builds on macOS of theirs). Nothing is downloaded;
-//!    - the release archive for the target, downloaded **here** and checked against the
-//!      release's `SHA256SUMS`; the host needs no network access;
-//!    - as a last resort, the release's install script, run **on the host** (it downloads and
-//!      checks the same archive there).
+//!    - the release archive for the target, downloaded **here** (https only, redirects too)
+//!      and checked against the release's `SHA256SUMS`, whose minisign signature
+//!      (`SHA256SUMS.minisig`) is checked first against the release key compiled in
+//!      ([`RELEASE_KEY`]); the host needs no network access;
+//!    - as a last resort, when nothing could be downloaded here, the release's install script,
+//!      downloaded over https **on the host** to a file and run there with
+//!      `--require-signature` (it downloads and checks the same archive and signature there).
 //! 3. Copy it over ssh (its stdin into a temporary file next to the destination), check that it
 //!    runs (`qsh-server --version` on the host) and only then rename it into place, so a binary
 //!    that does not run never replaces one that does.
@@ -20,7 +23,8 @@
 //! an HTTP client with TLS and a trust store, and gzip and tar decoders, would add a large
 //! dependency tree to a program whose runtime otherwise never touches the network, for a
 //! convenience that every system with a release download already has the tools for. The
-//! checksum is computed here (`ring`, through `qsh_core::crypto::sha256`).
+//! checksum is computed here (`ring`, through `qsh_core::crypto::sha256`), and the signature
+//! checked here too ([`qsh_core::minisign`]).
 
 use std::fs;
 use std::io::{self, Read as _};
@@ -34,6 +38,49 @@ use qsh_core::transport::ssh::SshCommand;
 /// Where releases are published; `QSH_DOWNLOAD_URL` overrides it (mirrors, tests), as for
 /// install.sh.
 pub const RELEASES: &str = "https://github.com/yzfly/qsh/releases";
+
+/// The public key of the qsh release key, which signs every release's `SHA256SUMS` (minisign
+/// format, key id 247743DF6C75BDD8; also in docs/security.md and scripts/install.sh). Anyone
+/// can check a download with it: `minisign -Vm SHA256SUMS -P <this key>`.
+pub const RELEASE_KEY: &str = "RWTYvXVs30N3JIE/A5TMPWUWD9ktnPZqQ6lSzYJahI7u5lpiPBCKWHlf";
+
+/// The key releases are checked against: [`RELEASE_KEY`], or in builds with the cargo
+/// feature `test-hooks` (never a release), `QSH_TEST_RELEASE_KEY` when set.
+fn release_key() -> Result<qsh_core::minisign::PublicKey, String> {
+    let text = std::env::var("QSH_TEST_RELEASE_KEY")
+        .ok()
+        .filter(|_| cfg!(feature = "test-hooks"))
+        .unwrap_or_else(|| RELEASE_KEY.to_string());
+    qsh_core::minisign::PublicKey::parse(&text).map_err(|e| format!("the release key: {e}"))
+}
+
+/// The trusted comment the release workflow signs with `SHA256SUMS` of `version`.
+pub fn signed_comment(version: &str) -> String {
+    format!("qsh {version} SHA256SUMS")
+}
+
+/// Check `minisig` as the release key's signature of `sums`, a `SHA256SUMS` of `version`.
+pub fn check_signature(sums: &[u8], minisig: &str, version: &str) -> Result<(), String> {
+    check_signature_with(&release_key()?, sums, minisig, version)
+}
+
+/// [`check_signature`] with `key`.
+pub fn check_signature_with(
+    key: &qsh_core::minisign::PublicKey,
+    sums: &[u8],
+    minisig: &str,
+    version: &str,
+) -> Result<(), String> {
+    let comment = qsh_core::minisign::verify(key, sums, minisig)
+        .map_err(|e| format!("SHA256SUMS of {version} is not signed by the qsh release key ({e}); not installing"))?;
+    if comment != signed_comment(version) {
+        return Err(format!(
+            "SHA256SUMS was signed for {:?}, not for qsh {version}; not installing",
+            qsh_core::text::sanitize(&comment, 80)
+        ));
+    }
+    Ok(())
+}
 
 /// This qsh's version, the one installed.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -276,18 +323,37 @@ impl Drop for TempDir {
     }
 }
 
-/// Download `url` to `dest` with curl, else wget. Only https:// (and file://, for mirrors on
-/// disk and tests) is accepted.
-fn fetch(url: &str, dest: &Path) -> Result<(), String> {
-    let proto = if url.starts_with("https://") {
-        "=https"
+/// The scheme of a download URL qsh accepts: https, or file (mirrors on disk, tests).
+fn allowed_scheme(url: &str) -> Option<&'static str> {
+    if url.starts_with("https://") {
+        Some("=https")
     } else if url.starts_with("file://") {
-        "=file"
+        Some("=file")
     } else {
+        None
+    }
+}
+
+/// Download `url` to `dest` with curl, else wget. Only https:// (and file://, for mirrors on
+/// disk and tests) is accepted, for the URL and for every redirect: curl is told so
+/// (`--proto`, `--proto-redir`); wget cannot be, so the redirects it followed are read from its
+/// headers and a download that went through plain http is refused.
+fn fetch(url: &str, dest: &Path) -> Result<(), String> {
+    let Some(proto) = allowed_scheme(url) else {
         return Err(format!("{url}: only https:// and file:// downloads are allowed"));
     };
     let curl = Command::new("curl")
-        .args(["--proto", proto, "--tlsv1.2", "-fsSL", "--retry", "3", "-o"])
+        .args([
+            "--proto",
+            proto,
+            "--proto-redir",
+            "=https",
+            "--tlsv1.2",
+            "-fsSL",
+            "--retry",
+            "3",
+            "-o",
+        ])
         .arg(dest)
         .arg(url)
         .stdin(Stdio::null())
@@ -306,21 +372,40 @@ fn fetch(url: &str, dest: &Path) -> Result<(), String> {
     if proto != "=https" {
         return Err("curl is needed to download from a file:// URL".into());
     }
+    // -S: the server's headers on stderr, where every redirect's Location shows
     let wget = Command::new("wget")
-        .args(["-q", "--https-only", "-O"])
+        .args(["-nv", "-S", "--https-only", "--max-redirect=10", "-O"])
         .arg(dest)
         .arg(url)
         .stdin(Stdio::null())
-        .status();
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output();
     match wget {
-        Ok(s) if s.success() => Ok(()),
-        Ok(s) => Err(format!(
+        Ok(out) if out.status.success() => {
+            if redirected_to_http(&String::from_utf8_lossy(&out.stderr)) {
+                let _ = fs::remove_file(dest);
+                return Err(format!("downloading {url} was redirected to plain http; not used"));
+            }
+            Ok(())
+        }
+        Ok(out) => Err(format!(
             "downloading {url} failed (wget exit status {})",
-            s.code().unwrap_or(-1)
+            out.status.code().unwrap_or(-1)
         )),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Err("neither curl nor wget is installed here".into()),
         Err(e) => Err(format!("cannot run wget: {e}")),
     }
+}
+
+/// True when wget's headers (`-S`) show a redirect to anything but https.
+pub fn redirected_to_http(headers: &str) -> bool {
+    headers.lines().any(|line| {
+        let line = line.trim().to_ascii_lowercase();
+        line.strip_prefix("location:")
+            .map(str::trim)
+            .is_some_and(|to| to.contains("://") && !to.starts_with("https://"))
+    })
 }
 
 /// The SHA-256 that `sums` (a SHA256SUMS file) lists for `name`.
@@ -335,7 +420,8 @@ pub fn listed_sha256(sums: &str, name: &str) -> Option<String> {
 }
 
 /// Why getting a binary failed: the download did not happen (another way may work), or it
-/// happened and is not to be trusted (stop).
+/// happened and is not to be trusted, or must not be tried (stop: never fall back to the
+/// host's own download then).
 #[derive(Debug)]
 pub enum DownloadError {
     /// Could not download; the host may manage on its own.
@@ -353,12 +439,28 @@ fn download(
     progress: &mut dyn FnMut(&str),
 ) -> Result<PathBuf, DownloadError> {
     let archive = options.archive_name(target);
+    // A plain http URL is not "unavailable": the host must not fetch it either (review L1)
+    if allowed_scheme(&options.releases).is_none() {
+        return Err(DownloadError::Rejected(format!(
+            "{}: only https:// and file:// downloads are allowed",
+            options.releases
+        )));
+    }
     progress(&format!("downloading {archive}"));
     let sums_path = dir.join("SHA256SUMS");
     fetch(&options.release_url("SHA256SUMS"), &sums_path).map_err(DownloadError::Unavailable)?;
+    // The checksums count only once their signature checks out
+    let sig_path = dir.join("SHA256SUMS.minisig");
+    fetch(&options.release_url("SHA256SUMS.minisig"), &sig_path)
+        .map_err(|e| DownloadError::Rejected(format!("{e}: the release's signature is missing; not installing")))?;
+    let sums_bytes = fs::read(&sums_path).map_err(|e| DownloadError::Rejected(format!("SHA256SUMS: {e}")))?;
+    let minisig =
+        fs::read_to_string(&sig_path).map_err(|e| DownloadError::Rejected(format!("SHA256SUMS.minisig: {e}")))?;
+    check_signature(&sums_bytes, &minisig, &options.version).map_err(DownloadError::Rejected)?;
+    progress("SHA256SUMS: signed by the qsh release key");
     let archive_path = dir.join(&archive);
-    fetch(&options.release_url(&archive), &archive_path).map_err(DownloadError::Unavailable)?;
-    let sums = fs::read_to_string(&sums_path).map_err(|e| DownloadError::Rejected(format!("SHA256SUMS: {e}")))?;
+    fetch(&options.release_url(&archive), &archive_path).map_err(DownloadError::Rejected)?;
+    let sums = String::from_utf8(sums_bytes).map_err(|e| DownloadError::Rejected(format!("SHA256SUMS: {e}")))?;
     let expected = listed_sha256(&sums, &archive)
         .ok_or_else(|| DownloadError::Rejected(format!("SHA256SUMS of {} lists no {archive}", options.version)))?;
     let mut bytes = Vec::new();
@@ -399,7 +501,10 @@ fn download(
     Ok(binary)
 }
 
-/// Step 2, last resort: the release's install script, run on the host.
+/// Step 2, last resort: the release's install script, run on the host. Downloaded over https
+/// only (redirects included: curl is told, wget's redirects are checked) into a file, never
+/// piped into a shell, and run with `--require-signature`, so that it installs nothing whose
+/// signature it could not check.
 fn remote_script(ssh: &SshCommand, options: &Options) -> Result<String, String> {
     let safe = |s: &str| {
         !s.is_empty()
@@ -409,14 +514,11 @@ fn remote_script(ssh: &SshCommand, options: &Options) -> Result<String, String> 
     if !safe(&options.releases) || !safe(&options.version) {
         return Err("the download URL or version has characters that cannot go into a remote command".into());
     }
+    if !options.releases.starts_with("https://") {
+        return Err(format!("{}: the host downloads only over https://", options.releases));
+    }
     let url = options.release_url("install.sh");
-    let command = format!(
-        "sh -c 'u=\"{url}\"; if command -v curl >/dev/null 2>&1; then curl -fsSL \"$u\"; else wget -qO- \"$u\"; fi | \
-QSH_DOWNLOAD_URL=\"{releases}\" sh -s -- --server-only --version {version} --prefix \"$HOME/.local\" && \
-echo && echo QSH-INSTALLED && exec \"$HOME/.local/bin/qsh-server\" --version'",
-        releases = options.releases,
-        version = options.version,
-    );
+    let command = remote_script_command(&url, &options.releases, &options.version);
     let out = ssh
         .one_off(&command, !options.interactive)
         .stdin(Stdio::null())
@@ -430,6 +532,19 @@ echo && echo QSH-INSTALLED && exec \"$HOME/.local/bin/qsh-server\" --version'",
     after_mark(&text, INSTALLED_MARK)
         .and_then(|lines| lines.into_iter().find(|l| !l.is_empty()).map(str::to_string))
         .ok_or_else(|| format!("the install script on {} did not install qsh-server", ssh.destination))
+}
+
+/// The remote command of the last-resort install on the host: a single-quoted `sh -c` program for any login
+/// shell (no `!`, backslash, newline or inner single quote; protocol.md 10.2).
+pub fn remote_script_command(url: &str, releases: &str, version: &str) -> String {
+    format!(
+        "sh -c 'u=\"{url}\"; t=$(mktemp) || exit 1; h=$(mktemp) || exit 1; \
+if command -v curl >/dev/null 2>&1; then curl --proto =https --proto-redir =https --tlsv1.2 -fsSL -o \"$t\" \"$u\"; s=$?; \
+else wget -nv -S --https-only --max-redirect=10 -O \"$t\" \"$u\" 2>\"$h\"; s=$?; \
+if [ $s = 0 ] && grep -i \"location:\" \"$h\" | grep -iv \"location: *https://\" | grep -q \"://\"; then echo \"qsh: the download was redirected to plain http\" >&2; s=1; fi; fi; \
+if [ $s = 0 ]; then QSH_DOWNLOAD_URL=\"{releases}\" sh \"$t\" --server-only --require-signature --version {version} --prefix \"$HOME/.local\"; s=$?; fi; \
+rm -f \"$t\" \"$h\"; [ $s = 0 ] || exit $s; echo; echo QSH-INSTALLED; exec \"$HOME/.local/bin/qsh-server\" --version'"
+    )
 }
 
 /// Install qsh-server on the host. `progress` gets one line per step. Returns what the
@@ -515,6 +630,69 @@ pub fn install(ssh: &SshCommand, options: &Options, progress: &mut dyn FnMut(&st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review L1: the compiled-in release key parses, and SHA256SUMS counts only with a
+    /// signature by it, for this very version.
+    #[test]
+    fn sha256sums_need_the_release_signature_of_their_version() {
+        let key = qsh_core::minisign::PublicKey::parse(RELEASE_KEY).unwrap();
+        assert_eq!(key.id_hex(), "247743DF6C75BDD8");
+        let seed = [3u8; 32];
+        let test_key = qsh_core::minisign::public_key(&seed, *b"testtest").unwrap();
+        let sums = b"00  qsh-0.5.0-x86_64-unknown-linux-musl.tar.gz\n";
+        let sig = qsh_core::minisign::sign(&seed, test_key.id, sums, &signed_comment("0.5.0")).unwrap();
+        assert_eq!(check_signature_with(&test_key, sums, &sig, "0.5.0"), Ok(()));
+        // Another version's signed list: refused (no rollback to an older release's files)
+        assert!(check_signature_with(&test_key, sums, &sig, "0.5.1")
+            .unwrap_err()
+            .contains("not for qsh 0.5.1"));
+        assert!(check_signature_with(&test_key, b"11  x\n", &sig, "0.5.0").is_err());
+        // Not the release key
+        assert!(check_signature_with(&key, sums, &sig, "0.5.0")
+            .unwrap_err()
+            .contains("not signed"));
+    }
+
+    /// Review L1: wget cannot be told to refuse a redirect to http; its headers are read.
+    #[test]
+    fn redirects_to_plain_http_are_seen() {
+        let https = "  HTTP/1.1 302 Found\n  Location: https://objects.example/x\n  HTTP/1.1 200 OK\n";
+        assert!(!redirected_to_http(https));
+        assert!(redirected_to_http(
+            "  HTTP/1.1 302 Found\n  Location: http://evil.example/x\n"
+        ));
+        assert!(redirected_to_http("  location:   HTTP://evil.example/x\n"));
+        assert!(redirected_to_http("  Location: ftp://x/y\n"));
+        // A relative redirect stays on the https origin
+        assert!(!redirected_to_http("  Location: /releases/x\n"));
+    }
+
+    /// Review L1: the host's fallback downloads to a file over https only and runs the script
+    /// with --require-signature; the command is one a login shell passes on intact.
+    #[test]
+    fn the_remote_fallback_command_is_safe_shell() {
+        let c = remote_script_command(
+            "https://github.com/yzfly/qsh/releases/download/v0.5.0/install.sh",
+            "https://github.com/yzfly/qsh/releases",
+            "0.5.0",
+        );
+        assert!(c.starts_with("sh -c '") && c.ends_with('\''), "{c}");
+        let inner = &c[7..c.len() - 1];
+        for bad in ['\'', '\\', '!', '\n'] {
+            assert!(!inner.contains(bad), "{bad:?} in {inner}");
+        }
+        for part in [
+            "--proto =https --proto-redir =https",
+            "--require-signature",
+            "--https-only",
+            "mktemp",
+        ] {
+            assert!(inner.contains(part), "{part}: {inner}");
+        }
+        assert!(!inner.contains("| sh") && !inner.contains("|sh"), "{inner}");
+        let syntax = Command::new("sh").args(["-n", "-c", inner]).status().unwrap();
+        assert!(syntax.success(), "{inner}");
+    }
 
     #[test]
     fn targets_as_install_sh_names_them() {

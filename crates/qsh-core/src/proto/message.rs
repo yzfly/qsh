@@ -820,6 +820,8 @@ impl Message {
             HANGUP => Message::Hangup,
             OUTPUT_ZSTD => {
                 let offset = f.u64()?;
+                // At least one byte of content follows `offset` (7.12): it must not be 2^64 − 1
+                offset.checked_add(1).ok_or(DecodeError("offset overflows"))?;
                 Message::OutputZstd {
                     offset,
                     frame: f.p.to_vec(),

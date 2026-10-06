@@ -50,6 +50,14 @@ fn restarting() -> Value {
     json!({ "restarting": true })
 }
 
+/// A requester waited [`RESTART_WAIT`] and the daemon still restarts.
+fn still_restarting() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!("the daemon is still restarting in place after {RESTART_WAIT:?}"),
+    )
+}
+
 /// True for the answer `{"restarting":true}`.
 fn is_restarting(line: &[u8]) -> bool {
     serde_json::from_slice::<Value>(line).is_ok_and(|v| v["restarting"] == true)
@@ -531,8 +539,11 @@ where
             break (reader, w);
         }
         // The daemon restarts in place: ask its next image (protocol.md 10.6)
-        if !is_restarting(&answer) || Instant::now() >= deadline {
+        if !is_restarting(&answer) {
             return Err(io::Error::other("the daemon refused the pipe"));
+        }
+        if Instant::now() >= deadline {
+            return Err(still_restarting());
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
@@ -582,8 +593,13 @@ async fn exchange(paths: &Paths, launcher: Option<&DaemonLauncher>, message: &Va
             read_line(&mut BufReader::new(r), 1 << 20).await
         })
         .await?;
-        if !is_restarting(&line) || Instant::now() >= deadline {
+        if !is_restarting(&line) {
             return Ok(Some(line));
+        }
+        // Never the answer to a request: a daemon still restarting after all that time is an
+        // error, not a reply (review H1)
+        if Instant::now() >= deadline {
+            return Err(still_restarting());
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

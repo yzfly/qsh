@@ -288,6 +288,12 @@ fn firewall_steps(sys: &dyn System, host: &HostInfo, opts: &Options, plan: &mut 
             }
             "firewalld" => {
                 let zone = finding.zone.clone().unwrap_or_else(|| "public".into());
+                if !valid_zone(&zone) {
+                    plan.notes.push(format!(
+                        "firewalld: the zone {zone:?} is not a plain name; tune leaves it alone"
+                    ));
+                    continue;
+                }
                 let add = firewall::firewalld_add_args(sys, &opts.ports);
                 let remove: Vec<String> = add.iter().map(|a| a.replacen("--add-", "--remove-", 1)).collect();
                 let base = argv(&["firewall-cmd", "--permanent"]);
@@ -436,6 +442,10 @@ pub struct FileRecord {
     pub path: String,
     /// Its content before (None: it did not exist).
     pub before: Option<String>,
+    /// Its permission bits before, put back with the content (None: it did not exist).
+    pub mode: Option<u32>,
+    /// Its owner and group before (None: it did not exist).
+    pub owner: Option<(u32, u32)>,
     /// SHA-256 of what it contained afterwards (None: it did not exist afterwards).
     pub sha256: Option<String>,
 }
@@ -500,29 +510,154 @@ pub struct Record {
 }
 
 impl Record {
-    /// Read the record; None when there is none, an error when it is unusable.
+    /// Read the record; None when there is none, an error when it is unusable. The record says
+    /// what `--revert` runs and writes as root, so it is used only when it and its directory
+    /// can only have been written by root (or by this user, under a stand-in root), and when
+    /// every change in it is one tune itself makes ([`Record::validate`], review H3).
     pub fn load(sys: &dyn System) -> Result<Option<Record>, String> {
-        let Some(text) = sys.read(RECORD) else {
+        let Some(meta) = sys.meta(RECORD) else {
             return Ok(None);
+        };
+        let euid = sys.euid();
+        for (path, m) in [(parent(RECORD), sys.meta(parent(RECORD))), (RECORD, Some(meta))] {
+            let Some(m) = m else {
+                return Err(format!("{path}: cannot be examined"));
+            };
+            let why = if m.symlink {
+                Some("is a symbolic link")
+            } else if m.uid != 0 && m.uid != euid {
+                Some("belongs to another user")
+            } else if m.mode & 0o022 != 0 {
+                Some("is writable by group or others")
+            } else {
+                None
+            };
+            if let Some(why) = why {
+                return Err(format!("{path} {why}: refusing to use the record"));
+            }
+        }
+        let Some(text) = sys.read(RECORD) else {
+            return Err(format!("{RECORD}: cannot be read"));
         };
         let value: Value = serde_json::from_str(&text).map_err(|e| format!("{RECORD}: {e}"))?;
         if value["qsh_tune"].as_u64() != Some(super::SCHEMA) {
             return Err(format!("{RECORD}: unknown format {}", value["qsh_tune"]));
         }
-        Record::from_json(&value)
-            .map(Some)
-            .ok_or_else(|| format!("{RECORD}: not a record qsh-server tune can read"))
+        let record =
+            Record::from_json(&value).ok_or_else(|| format!("{RECORD}: not a record qsh-server tune can read"))?;
+        record
+            .validate()
+            .map_err(|e| format!("{RECORD}: {e}; qsh-server tune did not write this, refusing to use it"))?;
+        Ok(Some(record))
+    }
+
+    /// Check that every change is one tune makes: only its own files (the sysctl and
+    /// modules-load.d files, the ufw and firewalld files its firewall commands change) and the
+    /// directories above them, only the sysctls it sets with values of their kind, only
+    /// `tcp_bbr`, and only the commands of ufw, firewall-cmd and loginctl in exactly the forms
+    /// it runs them, with arguments of the kinds it uses (review H3: the record decides what a
+    /// revert runs as root).
+    pub fn validate(&self) -> Result<(), String> {
+        for d in &self.created_dirs {
+            if !is_ancestor(d, RECORD) {
+                return Err(format!("a directory {d:?} that tune does not create"));
+            }
+        }
+        for change in &self.changes {
+            match change {
+                Change::File {
+                    fixes,
+                    file,
+                    created_dirs,
+                } => {
+                    if file.path != SYSCTL_FILE && file.path != MODULES_FILE {
+                        return Err(format!("a file {:?} that tune does not write", file.path));
+                    }
+                    check_file_record(file)?;
+                    if let Some(d) = created_dirs.iter().find(|d| !is_ancestor(d, &file.path)) {
+                        return Err(format!("a directory {d:?} that tune does not create"));
+                    }
+                    if let Some(f) = fixes.iter().find(|f| !FIXES.contains(&f.as_str())) {
+                        return Err(format!("an unknown fix {f:?}"));
+                    }
+                }
+                Change::Sysctl {
+                    fix,
+                    key,
+                    before,
+                    after,
+                    ..
+                } => {
+                    if !FIXES.contains(&fix.as_str()) {
+                        return Err(format!("an unknown fix {fix:?}"));
+                    }
+                    if !SYSCTLS.contains(&key.as_str()) {
+                        return Err(format!("a sysctl {key:?} that tune does not set"));
+                    }
+                    if !sysctl_value(before) || !sysctl_value(after) {
+                        return Err(format!("a value of {key} that is not a sysctl value"));
+                    }
+                }
+                Change::Module { name, .. } => {
+                    if name != "tcp_bbr" {
+                        return Err(format!("a module {name:?} that tune does not load"));
+                    }
+                }
+                Change::Commands {
+                    fix,
+                    run,
+                    undo,
+                    files,
+                    reload,
+                } => {
+                    let all = run.iter().chain(undo).chain(reload);
+                    let tool = run.first().and_then(|r| r.first()).map(String::as_str);
+                    let ok = match (fix.as_str(), tool) {
+                        ("firewall", Some("ufw")) => {
+                            all.clone().all(|c| ufw_command(c))
+                                && files.iter().map(|f| f.path.as_str()).eq(UFW_FILES)
+                                && reload.as_deref() == Some(&argv(&["ufw", "reload"])[..])
+                        }
+                        ("firewall", Some("firewall-cmd")) => {
+                            let zone = run[0].get(2).and_then(|z| z.strip_prefix("--zone=")).unwrap_or("");
+                            valid_zone(zone)
+                                && all.clone().all(|c| firewalld_command(c, zone))
+                                && files.iter().map(|f| f.path.clone()).eq(firewalld_files(zone))
+                                && reload.as_deref() == Some(&argv(&["firewall-cmd", "--reload"])[..])
+                        }
+                        ("linger", Some("loginctl")) => {
+                            let user = run[0].get(2).map(String::as_str).unwrap_or("");
+                            valid_user(user)
+                                && run.as_slice() == [argv(&["loginctl", "enable-linger", user])]
+                                && undo.as_slice() == [argv(&["loginctl", "disable-linger", user])]
+                                && files.is_empty()
+                                && reload.is_none()
+                        }
+                        _ => false,
+                    };
+                    if !ok {
+                        return Err(format!("{fix} commands that tune does not run"));
+                    }
+                    for f in files {
+                        check_file_record(f)?;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn save(&mut self, sys: &dyn System) -> Result<(), String> {
+        // Private: the record holds copies of firewall configuration files (/etc/ufw/user.rules
+        // is 0640), so the directory is 0700 and the record 0600 (review M2)
         if self.created_dirs.is_empty() {
-            self.created_dirs = make_dirs(sys, parent(RECORD)).map_err(|e| format!("{RECORD}: {e}"))?;
+            self.created_dirs = make_dirs(sys, parent(RECORD), 0o700).map_err(|e| format!("{RECORD}: {e}"))?;
         } else {
-            make_dirs(sys, parent(RECORD)).map_err(|e| format!("{RECORD}: {e}"))?;
+            make_dirs(sys, parent(RECORD), 0o700).map_err(|e| format!("{RECORD}: {e}"))?;
         }
         let mut text = serde_json::to_string_pretty(&self.to_json()).map_err(|e| e.to_string())?;
         text.push('\n');
-        sys.write(RECORD, text.as_bytes(), 0o644)
+        sys.write(RECORD, text.as_bytes(), 0o600, None)
             .map_err(|e| format!("{RECORD}: {e}"))
     }
 
@@ -585,6 +720,132 @@ impl Record {
     }
 }
 
+/// The fixes tune makes.
+const FIXES: [&str; 6] = [
+    "udp-buffers",
+    "tcp-bbr",
+    "bbr-default",
+    "firewall",
+    "low-ports",
+    "linger",
+];
+
+/// The sysctls tune sets.
+const SYSCTLS: [&str; 6] = [
+    "net.core.rmem_max",
+    "net.core.wmem_max",
+    "net.ipv4.tcp_allowed_congestion_control",
+    "net.core.default_qdisc",
+    "net.ipv4.tcp_congestion_control",
+    "net.ipv4.ip_unprivileged_port_start",
+];
+
+/// The files ufw's commands change.
+const UFW_FILES: [&str; 2] = ["/etc/ufw/user.rules", "/etc/ufw/user6.rules"];
+
+/// The files firewalld's commands change for `zone`.
+fn firewalld_files(zone: &str) -> [String; 2] {
+    [
+        format!("/etc/firewalld/zones/{zone}.xml"),
+        format!("/etc/firewalld/zones/{zone}.xml.old"),
+    ]
+}
+
+/// True when `dir` is a directory above `path` (not `/`).
+fn is_ancestor(dir: &str, path: &str) -> bool {
+    dir != "/"
+        && path.len() > dir.len()
+        && path.starts_with(dir)
+        && path.as_bytes()[dir.len()] == b'/'
+        && !dir.ends_with('/')
+}
+
+/// A value tune reads from or writes to a sysctl: numbers or names, separated by spaces.
+fn sysctl_value(v: &str) -> bool {
+    v.len() <= 256
+        && v.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b' ' || b == b'-')
+}
+
+/// A firewalld zone name as tune uses it.
+fn valid_zone(z: &str) -> bool {
+    !z.is_empty()
+        && z.len() <= 64
+        && !z.starts_with(['-', '.'])
+        && z.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// A login name as loginctl gets it from tune (SUDO_USER).
+fn valid_user(u: &str) -> bool {
+    !u.is_empty()
+        && u.len() <= 64
+        && !u.starts_with('-')
+        && u.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-$".contains(&b))
+}
+
+/// A port or port range of ufw, with or without a protocol (`60443`, `60443:60542/udp`), or
+/// the application profile `qsh`.
+fn ufw_rule(r: &str) -> bool {
+    if r == "qsh" {
+        return true;
+    }
+    let (ports, proto) = match r.split_once('/') {
+        Some((p, proto)) => (p, Some(proto)),
+        None => (r, None),
+    };
+    let number = |p: &str| !p.is_empty() && p.len() <= 5 && p.bytes().all(|b| b.is_ascii_digit());
+    let ports_ok = match ports.split_once(':') {
+        Some((a, b)) => number(a) && number(b),
+        None => number(ports),
+    };
+    ports_ok && matches!(proto, None | Some("udp") | Some("tcp"))
+}
+
+/// `ufw allow RULE comment qsh`, `ufw delete allow RULE` or `ufw reload`.
+fn ufw_command(c: &[String]) -> bool {
+    let c: Vec<&str> = c.iter().map(String::as_str).collect();
+    match c.as_slice() {
+        ["ufw", "allow", rule, "comment", "qsh"] => ufw_rule(rule),
+        ["ufw", "delete", "allow", rule] => ufw_rule(rule),
+        ["ufw", "reload"] => true,
+        _ => false,
+    }
+}
+
+/// `firewall-cmd --permanent --zone=ZONE (--add-…|--remove-…)…` or `firewall-cmd --reload`.
+fn firewalld_command(c: &[String], zone: &str) -> bool {
+    let c: Vec<&str> = c.iter().map(String::as_str).collect();
+    match c.as_slice() {
+        ["firewall-cmd", "--reload"] => true,
+        ["firewall-cmd", "--permanent", z, args @ ..] if *z == format!("--zone={zone}") && !args.is_empty() => {
+            args.iter().all(|a| {
+                let Some(rest) = a.strip_prefix("--add-").or_else(|| a.strip_prefix("--remove-")) else {
+                    return false;
+                };
+                rest == "service=qsh"
+                    || rest.strip_prefix("port=").is_some_and(|p| {
+                        let (ports, proto) = p.split_once('/').unwrap_or((p, ""));
+                        let number = |p: &str| !p.is_empty() && p.len() <= 5 && p.bytes().all(|b| b.is_ascii_digit());
+                        let ports_ok = match ports.split_once('-') {
+                            Some((a, b)) => number(a) && number(b),
+                            None => number(ports),
+                        };
+                        ports_ok && (proto == "udp" || proto == "tcp")
+                    })
+            })
+        }
+        _ => false,
+    }
+}
+
+/// A recorded file's mode and owner are plain.
+fn check_file_record(f: &FileRecord) -> Result<(), String> {
+    if f.mode.is_some_and(|m| m & !0o777 != 0) {
+        return Err(format!("a mode of {} that tune does not restore", f.path));
+    }
+    Ok(())
+}
+
 fn strings(v: &Value) -> Option<Vec<String>> {
     v.as_array()?.iter().map(|x| x.as_str().map(String::from)).collect()
 }
@@ -603,13 +864,33 @@ fn opt_string(v: &Value) -> Option<Option<String>> {
 
 impl FileRecord {
     fn to_json(&self) -> Value {
-        json!({ "path": self.path, "before": self.before, "sha256": self.sha256 })
+        json!({
+            "path": self.path,
+            "before": self.before,
+            "mode": self.mode,
+            "uid": self.owner.map(|o| o.0),
+            "gid": self.owner.map(|o| o.1),
+            "sha256": self.sha256,
+        })
     }
 
     fn from_json(v: &Value) -> Option<FileRecord> {
+        let number = |k: &str| -> Option<Option<u32>> {
+            match &v[k] {
+                Value::Null => Some(None),
+                n => Some(Some(u32::try_from(n.as_u64()?).ok()?)),
+            }
+        };
+        let owner = match (number("uid")?, number("gid")?) {
+            (Some(u), Some(g)) => Some((u, g)),
+            (None, None) => None,
+            _ => return None,
+        };
         Some(FileRecord {
             path: v["path"].as_str()?.to_string(),
             before: opt_string(&v["before"])?,
+            mode: number("mode")?,
+            owner,
             sha256: opt_string(&v["sha256"])?,
         })
     }
@@ -725,8 +1006,9 @@ fn parent(path: &str) -> &str {
     }
 }
 
-/// Create `dir` and its missing parents; the ones created, outermost first.
-fn make_dirs(sys: &dyn System, dir: &str) -> std::io::Result<Vec<String>> {
+/// Create `dir` and its missing parents (`mode` for `dir`, 0755 above it); the ones
+/// created, outermost first.
+fn make_dirs(sys: &dyn System, dir: &str, mode: u32) -> std::io::Result<Vec<String>> {
     let mut missing = Vec::new();
     let mut d = dir;
     while d != "/" && !sys.exists(d) {
@@ -735,7 +1017,7 @@ fn make_dirs(sys: &dyn System, dir: &str) -> std::io::Result<Vec<String>> {
     }
     missing.reverse();
     for m in &missing {
-        sys.mkdir(m)?;
+        sys.mkdir(m, if m == dir { mode } else { 0o755 })?;
     }
     Ok(missing)
 }
@@ -746,9 +1028,12 @@ fn sha256_hex(text: &str) -> String {
 
 fn snapshot(sys: &dyn System, path: &str) -> FileRecord {
     let before = sys.read(path);
+    let meta = before.as_ref().and_then(|_| sys.meta(path));
     FileRecord {
         path: path.into(),
         sha256: before.as_deref().map(sha256_hex),
+        mode: meta.map(|m| m.mode & 0o777),
+        owner: meta.map(|m| (m.uid, m.gid)),
         before,
     }
 }
@@ -796,18 +1081,19 @@ fn apply_steps(sys: &dyn System, plan: &Plan, record: &mut Record, log: &mut dyn
                 before,
                 after,
             } => {
-                if sys.read(path) != *before {
+                let was = snapshot(sys, path);
+                if was.before != *before {
                     return Err(format!("{path} changed while tune was running; nothing written"));
                 }
-                let created = make_dirs(sys, parent(path)).map_err(|e| format!("{path}: {e}"))?;
-                sys.write(path, after.as_bytes(), 0o644)
+                let created = make_dirs(sys, parent(path), 0o755).map_err(|e| format!("{path}: {e}"))?;
+                // An existing file keeps its mode and owner
+                sys.write(path, after.as_bytes(), was.mode.unwrap_or(0o644), was.owner)
                     .map_err(|e| format!("{path}: {e}"))?;
                 record.add(Change::File {
                     fixes: fixes.iter().map(|f| f.to_string()).collect(),
                     file: FileRecord {
-                        path: path.clone(),
-                        before: before.clone(),
                         sha256: Some(sha256_hex(after)),
+                        ..was
                     },
                     created_dirs: created,
                 });
@@ -919,8 +1205,10 @@ fn restore(sys: &dyn System, file: &FileRecord) -> Result<bool, String> {
     if now.as_deref().map(sha256_hex) != file.sha256 {
         return Ok(false);
     }
+    // With its mode and owner: the record is only read when root or this user wrote it, and
+    // only with plain modes (Record::validate)
     match &file.before {
-        Some(content) => sys.write(&file.path, content.as_bytes(), 0o644),
+        Some(content) => sys.write(&file.path, content.as_bytes(), file.mode.unwrap_or(0o644), file.owner),
         None if now.is_some() => sys.remove(&file.path),
         None => Ok(()),
     }

@@ -34,7 +34,7 @@ use crate::proto::message::{
 };
 use crate::proto::zstd::MAX_ZSTD_CONTENT;
 use crate::proto::{caps, read_message, ErrorCode, ExitStatus, FramingError, Message, IMPLEMENTATION, VERSION};
-use crate::screen::Live;
+use crate::screen::{Live, Snapshot, Unavailable};
 use crate::transport::{tls, Connection, RecvStream, SendStream, Transport};
 
 /// The round trip time assumed before one is measured.
@@ -59,6 +59,11 @@ const HANGUP_WAIT: Duration = Duration::from_secs(2);
 const HANGUP_MESSAGES: usize = 64;
 /// Messages from the client handled in a row before the attachment sends again.
 const MESSAGES_PER_TURN: usize = 256;
+/// PONGs waiting to be written on a connection, at most: beyond, a PING is not answered (a
+/// peer that keeps sending PINGs without reading the answers cannot grow the queue).
+const PENDING_PONGS: usize = 16;
+/// How long the final ACK after DETACH may take to write.
+const DETACH_ACK: Duration = Duration::from_secs(2);
 
 /// Open connections, for GOAWAY and the close on shutdown.
 #[derive(Debug, Default)]
@@ -215,6 +220,8 @@ struct Conn {
     min_rtt: Mutex<MinRtt>,
     /// When the last PING went out (mux transports).
     pinged: Mutex<Option<Instant>>,
+    /// PONGs queued for the control stream writer, not written yet.
+    pongs: AtomicUsize,
 }
 
 impl Conn {
@@ -369,6 +376,7 @@ async fn serve_connection(shared: Arc<Shared>, connection: Connection, ticket: O
         zstd,
         min_rtt: Mutex::new(MinRtt::new()),
         pinged: Mutex::new(None),
+        pongs: AtomicUsize::new(0),
     });
     log::debug(format_args!("{transport} connection from {remote:?}"));
 
@@ -408,8 +416,12 @@ async fn control_writer(conn: Arc<Conn>, mut send: SendStream, mut rx: mpsc::Unb
     while let Some(command) = rx.recv().await {
         let (code, why, last) = match command {
             Control::Send(m) => {
+                let pong = matches!(m, Message::Pong { .. });
                 if write(&mut send, &[m]).await.is_err() {
                     break;
+                }
+                if pong {
+                    conn.pongs.fetch_sub(1, Ordering::SeqCst);
                 }
                 continue;
             }
@@ -448,7 +460,12 @@ async fn control_reader(conn: Arc<Conn>, mut recv: BufReader<RecvStream>) {
         }
         match message {
             Message::Ping { data } => {
-                let _ = conn.control.send(Control::Send(Message::Pong { data }));
+                // Answered unless too many answers wait to be written already
+                if conn.pongs.fetch_add(1, Ordering::SeqCst) < PENDING_PONGS {
+                    let _ = conn.control.send(Control::Send(Message::Pong { data }));
+                } else {
+                    conn.pongs.fetch_sub(1, Ordering::SeqCst);
+                }
             }
             Message::Pong { data } => conn.pong(data),
             Message::GoAway { .. } | Message::Unknown { .. } => {}
@@ -729,12 +746,11 @@ struct Out {
     sent: u64,
     /// The highest acknowledgement accepted on this attachment.
     last_ack: u64,
-    /// The `To` of the latest OUTPUT_GAP or the `Offset` of the latest SNAPSHOT: skipped bytes
-    /// are not in flight.
-    gap_to: u64,
-    /// Skipped ranges not yet passed by `last_ack`: not delivery, for the rate samples.
+    /// Skipped ranges (OUTPUT_GAP, SNAPSHOT) not yet passed by `last_ack`: neither in flight
+    /// nor delivery (7.6).
     skipped: VecDeque<(u64, u64)>,
-    /// The last snapshot's data, in flight until an ACK reaches its offset: (offset, bytes).
+    /// The snapshot in flight until an ACK reaches its offset: (offset, bytes). There is at
+    /// most one (m2.md 6.4).
     snapshot: Option<(u64, u64)>,
     /// The delivery rate `T`.
     rate: Rate,
@@ -751,7 +767,6 @@ impl Out {
             stream,
             sent: start,
             last_ack: start,
-            gap_to: start,
             skipped: VecDeque::new(),
             snapshot: None,
             rate: Rate::new(initial_rate),
@@ -764,7 +779,17 @@ impl Out {
     /// encoder (contained, [`crate::fault`]) is logged, the data goes uncompressed, and after
     /// [`ENCODER_FAULTS`] of them the attachment compresses no more.
     fn compress(&mut self, session: &PtySession, data: &[u8]) -> Option<Vec<u8>> {
-        match codec::compress(data) {
+        let frame = codec::compress(data);
+        self.compressed(session, frame)
+    }
+
+    /// The result of [`codec::compress`] for this attachment ([`Out::compress`]).
+    fn compressed(
+        &mut self,
+        session: &PtySession,
+        frame: Result<Option<Vec<u8>>, crate::fault::Fault>,
+    ) -> Option<Vec<u8>> {
+        match frame {
             Ok(frame) => frame,
             Err(fault) => {
                 self.encoder_faults += 1;
@@ -786,11 +811,30 @@ impl Out {
         }
     }
 
-    /// Output in flight (7.6): sent and neither acknowledged nor skipped, and the data of a
+    /// Skipped offsets after `last_ack` (all of them up to `sent`).
+    fn skipped_unacked(&self) -> u64 {
+        self.skipped
+            .iter()
+            .map(|&(from, to)| to.saturating_sub(from.max(self.last_ack)))
+            .sum()
+    }
+
+    /// The snapshot in flight: sent, and no ACK has reached its offset yet.
+    fn snapshot_in_flight(&self) -> bool {
+        self.snapshot.is_some_and(|s| self.last_ack < s.0)
+    }
+
+    /// Output in flight (7.6): sent and neither acknowledged nor skipped,
+    /// `(sent_end − last_ack) − Σ(skipped ∩ (last_ack, sent_end])`, and the data of the
     /// snapshot not acknowledged yet.
     fn in_flight(&self) -> u64 {
-        let snapshot = self.snapshot.filter(|s| self.last_ack < s.0).map_or(0, |s| s.1);
-        self.sent - self.last_ack.max(self.gap_to) + snapshot
+        let snapshot = self.snapshot.filter(|_| self.snapshot_in_flight()).map_or(0, |s| s.1);
+        self.sent - self.last_ack - self.skipped_unacked() + snapshot
+    }
+
+    /// `U` (protocol.md 7.8.5): output up to `end` neither acknowledged nor skipped.
+    fn unacked(&self, end: u64) -> u64 {
+        end - self.last_ack - self.skipped_unacked()
     }
 
     /// Output from where this stream is up to `to` is skipped (OUTPUT_GAP or SNAPSHOT).
@@ -799,12 +843,12 @@ impl Out {
             self.skipped.push_back((self.sent, to));
         }
         self.sent = self.sent.max(to);
-        self.gap_to = to;
     }
 
     /// An acknowledgement of this stream (7.5): beyond what was sent is a SEQUENCE_ERROR, below
-    /// the last one is stale and ignored. A new one is a delivery-rate sample (6.3).
-    fn ack(&mut self, session: &PtySession, received: u64) -> Result<(), ErrorCode> {
+    /// the last one is stale and ignored. A new one is a delivery-rate sample (6.3), on a path
+    /// of minimum round trip time `rtt`.
+    fn ack(&mut self, session: &PtySession, received: u64, rtt: Duration) -> Result<(), ErrorCode> {
         if received > self.sent {
             return Err(ErrorCode::SEQUENCE_ERROR);
         }
@@ -818,7 +862,7 @@ impl Out {
             }
             self.skipped.retain(|r| r.1 > received);
             let waiting = self.end(session) > self.sent;
-            self.rate.ack(Instant::now(), delivered, waiting);
+            self.rate.ack(Instant::now(), delivered, waiting, rtt);
             self.last_ack = received;
             if self.snapshot.is_some_and(|s| received >= s.0) {
                 self.snapshot = None;
@@ -896,7 +940,9 @@ fn lock_model(model: &Mutex<Live>) -> std::sync::MutexGuard<'_, Live> {
     })
 }
 
-/// Feeds a session's model with its output, under the output buffer's lock.
+/// Feeds a session's model with its output, on the reader thread right after the output
+/// entered the buffer (not under the buffer's lock: the model's work never holds up the
+/// attachments, which lock the buffer all the time).
 struct ModelSink(Arc<Mutex<Live>>);
 
 impl OutputSink for ModelSink {
@@ -945,55 +991,114 @@ pub(crate) fn install_model(shared: &Shared, session: &PtySession) {
     session.set_output_sink(Some(Box::new(ModelSink(live))));
 }
 
-/// The model of a session, if it has one.
+/// The model of a session, if it has one. It may have lost its model ([`Live::usable`]):
+/// every snapshot of it then falls back as protocol.md 7.8.7 says.
 fn model_of(session: &PtySession) -> Option<Arc<Mutex<Live>>> {
     MODELS.lock().unwrap().get(&session.id).and_then(Weak::upgrade)
 }
 
-/// Resize a tty session's terminal, and its model at the same point of its output.
-fn resize_session(session: &PtySession, cols: u16, rows: u16) {
+/// Run `f` on a session's model on a blocking thread, never on a tokio worker: the reader
+/// thread holds the model's lock while it feeds it, as long as its work budget allows
+/// (`screen/model.rs`), and capturing and encoding a large screen takes a while too.
+async fn on_model<T: Send + 'static>(
+    model: &Arc<Mutex<Live>>,
+    f: impl FnOnce(&mut Live) -> T + Send + 'static,
+) -> Option<T> {
+    let model = model.clone();
+    tokio::task::spawn_blocking(move || f(&mut lock_model(&model)))
+        .await
+        .ok()
+}
+
+/// Resize a tty session's terminal, and its model at the same point of its output (the
+/// buffer's end now: the program's output after the SIGWINCH comes after it).
+async fn resize_session(session: &PtySession, cols: u16, rows: u16) {
     if cols == 0 || rows == 0 {
         return;
     }
-    if let Some(model) = model_of(session) {
-        let _buffer = session.output.lock().unwrap();
-        lock_model(&model).resize(cols, rows);
-    }
+    let at = session.output.lock().unwrap().end();
     session.resize(cols, rows);
+    if let Some(model) = model_of(session) {
+        on_model(&model, move |live| live.resize_at(at, cols, rows)).await;
+    }
 }
 
 /// Where an attachment with snapshots starts streaming (m2.md 6.5): None to stream from
 /// `start`; otherwise the cut, where the newest `budget` of the output begins (just after a
 /// line end, if there is one in the next 4 KiB), or the end while the alternate screen is
 /// active; a resync snapshot follows.
-fn attach_cut(session: &PtySession, model: &Mutex<Live>, start: u64, rate: f64) -> Option<u64> {
-    let buffer = session.output.lock().unwrap();
-    let (base, end) = (buffer.base(), buffer.end());
-    let budget = ((pacing::CATCHUP_AFTER.as_secs_f64() * rate) as u64).max(pacing::CATCHUP_MIN);
-    if start >= base && end - start <= budget {
-        return None;
-    }
-    let mut cut = base.max(end.saturating_sub(budget));
-    let (at, ahead) = buffer.read_from(cut, 4096);
-    if let Some(i) = ahead.iter().position(|&b| b == b'\n') {
-        cut = at + i as u64 + 1;
-    }
-    if lock_model(model).alternate() {
+async fn attach_cut(session: &PtySession, model: &Arc<Mutex<Live>>, start: u64, rate: f64) -> Option<u64> {
+    let (mut cut, end) = {
+        let buffer = session.output.lock().unwrap();
+        let (base, end) = (buffer.base(), buffer.end());
+        let budget = ((pacing::CATCHUP_AFTER.as_secs_f64() * rate) as u64).max(pacing::CATCHUP_MIN);
+        if start >= base && end - start <= budget {
+            return None;
+        }
+        let mut cut = base.max(end.saturating_sub(budget));
+        let (at, ahead) = buffer.read_from(cut, 4096);
+        if let Some(i) = ahead.iter().position(|&b| b == b'\n') {
+            cut = at + i as u64 + 1;
+        }
+        (cut, end)
+    };
+    if on_model(model, |live| live.alternate()).await.unwrap_or(false) {
         cut = end;
     }
     Some(cut.max(start))
 }
 
+/// A snapshot and its parts as messages carry them: (data, flags, a fault of the encoder).
+type Parts = Vec<(Vec<u8>, u8, Option<crate::fault::Fault>)>;
+
+/// Take a snapshot of `model` at or after `from` and compress its parts when `compress`, on a
+/// blocking thread (the model's lock is held for the snapshot only).
+async fn take_snapshot(
+    model: &Arc<Mutex<Live>>,
+    from: u64,
+    skip: bool,
+    compress: bool,
+) -> Result<(Snapshot, Parts), Unavailable> {
+    let model = model.clone();
+    let taken = tokio::task::spawn_blocking(move || {
+        let snapshot = lock_model(&model).snapshot_from(from, skip)?;
+        let compress = compress && snapshot.data.len() >= SNAPSHOT_COMPRESS_MIN;
+        let count = snapshot.data.chunks(SNAPSHOT_PART).count();
+        let parts = snapshot
+            .data
+            .chunks(SNAPSHOT_PART)
+            .enumerate()
+            .map(|(i, part)| {
+                let flags = if i + 1 == count { SNAPSHOT_FINAL } else { 0 };
+                if !compress {
+                    return (part.to_vec(), flags, None);
+                }
+                match codec::compress(part) {
+                    Ok(Some(frame)) if frame.len() * 10 <= part.len() * 9 => (frame, flags | SNAPSHOT_ZSTD, None),
+                    Ok(_) => (part.to_vec(), flags, None),
+                    Err(fault) => (part.to_vec(), flags, Some(fault)),
+                }
+            })
+            .collect();
+        Ok((snapshot, parts))
+    });
+    taken.await.unwrap_or(Err(Unavailable::Never))
+}
+
 /// Put a snapshot of `model` into `batch` (7.8): a skip snapshot replaces the output not sent
-/// yet; a resync snapshot (not `skip`) first sends it, so that it skips nothing. Parts of
-/// 32 KiB, compressed when `zstd` (7.8.3). The output buffer is locked before the model (the
-/// order of the reader thread), so the model stands exactly at the buffer's end. Returns
-/// whether the program should redraw as well. Without a usable snapshot (no model any more,
-/// beyond the size limit, or the model's end before what was sent): a skip falls back to
-/// OUTPUT_GAP and a redraw (7.7), a resync to a redraw (protocol.md 7.8.7).
-fn send_snapshot(
+/// yet; a resync snapshot (not `skip`) first sends it, so that it skips nothing (or, if that
+/// output fell out of the buffer meanwhile, replaces it). Parts of 32 KiB, compressed when
+/// `zstd` (7.8.3). Returns whether the program should redraw as well.
+///
+/// The model may be a chunk behind the buffer (the reader thread feeds it after appending):
+/// a snapshot is taken at the model's end, at or after what was sent; while the model has not
+/// caught up with that, nothing happens now (the reader wakes the attachment when it has).
+/// Without a snapshot (no model any more, beyond the size limit, or the model stands before
+/// what was sent, in the middle of a sequence) a skip falls back to OUTPUT_GAP and a redraw
+/// (7.7), a resync to a redraw (protocol.md 7.8.7); a skip with nothing to skip, to nothing.
+async fn send_snapshot(
     session: &PtySession,
-    model: &Mutex<Live>,
+    model: &Arc<Mutex<Live>>,
     out: &mut Out,
     catchup: &mut Catchup,
     zstd: bool,
@@ -1001,53 +1106,45 @@ fn send_snapshot(
     batch: &mut Vec<Message>,
 ) -> bool {
     let now = Instant::now();
-    let buffer = session.output.lock().unwrap();
-    let snapshot = lock_model(model).snapshot(skip.then_some(out.sent));
-    let Some(snapshot) = snapshot.filter(|s| s.offset >= out.sent) else {
-        let end = buffer.end();
-        drop(buffer);
-        if skip && end > out.sent {
-            batch.push(Message::OutputGap {
-                from: out.sent,
-                to: end,
-            });
-            out.skip(end);
-            catchup.taken(now, end);
-            return true;
+    let compress = zstd && out.encoder_faults < ENCODER_FAULTS;
+    let (snapshot, parts) = match take_snapshot(model, out.sent, skip, compress).await {
+        Ok(taken) => taken,
+        Err(Unavailable::Behind) => return false,
+        Err(Unavailable::Never) => {
+            let end = out.end(session);
+            if skip && end > out.sent {
+                batch.push(Message::OutputGap {
+                    from: out.sent,
+                    to: end,
+                });
+                out.skip(end);
+                catchup.taken(now, end);
+                return true;
+            }
+            catchup.failed(end);
+            // The repaint the resync was for (after a gap, an attach at LATEST, a redraw request)
+            return !skip;
         }
-        catchup.abandon();
-        // The repaint the resync was for (after a gap, an attach at LATEST, a redraw request)
-        return !skip;
     };
     if !skip {
         let want = (snapshot.offset - out.sent) as usize;
-        let (at, bytes) = buffer.read_from(out.sent, want);
-        if at != out.sent || bytes.len() != want {
-            catchup.abandon();
-            return false;
-        }
-        drop(buffer);
-        let mut offset = at;
-        for chunk in bytes.chunks(PREFERRED_DATA) {
-            batch.push(Message::Output {
-                offset,
-                data: chunk.to_vec(),
-            });
-            offset += chunk.len() as u64;
-        }
-        out.sent = snapshot.offset;
-    } else {
-        drop(buffer);
-    }
-    let parts: Vec<&[u8]> = snapshot.data.chunks(SNAPSHOT_PART).collect();
-    for (i, part) in parts.iter().enumerate() {
-        let mut flags = if i + 1 == parts.len() { SNAPSHOT_FINAL } else { 0 };
-        let mut data = part.to_vec();
-        if zstd && snapshot.data.len() >= SNAPSHOT_COMPRESS_MIN && out.encoder_faults < ENCODER_FAULTS {
-            if let Some(frame) = out.compress(session, part).filter(|f| f.len() * 10 <= part.len() * 9) {
-                data = frame;
-                flags |= SNAPSHOT_ZSTD;
+        let (at, bytes) = session.output.lock().unwrap().read_from(out.sent, want);
+        // Unless it fell out of the buffer meanwhile: the snapshot then skips it
+        if at == out.sent && bytes.len() == want {
+            let mut offset = at;
+            for chunk in bytes.chunks(PREFERRED_DATA) {
+                batch.push(Message::Output {
+                    offset,
+                    data: chunk.to_vec(),
+                });
+                offset += chunk.len() as u64;
             }
+            out.sent = snapshot.offset;
+        }
+    }
+    for (data, flags, fault) in parts {
+        if let Some(fault) = fault {
+            out.compressed(session, Err(fault));
         }
         batch.push(Message::Snapshot {
             offset: snapshot.offset,
@@ -1186,7 +1283,7 @@ async fn terminal(
     }
     let pipe = session.pipe;
     if !pipe {
-        resize_session(session, size.cols, size.rows);
+        resize_session(session, size.cols, size.rows).await;
     }
     session.ack(Stream::Output, start);
     let initial_rate = conn.initial_rate();
@@ -1198,19 +1295,24 @@ async fn terminal(
     conn.ping();
     // Smart catch-up (7.8): with a model, snapshots instead of a backlog the path cannot carry.
     // A session whose model failed (protocol.md 7.8.7) or is beyond the caps keeps the
-    // triggers, with OUTPUT_GAP and a redraw where a snapshot would have been sent
+    // triggers, with OUTPUT_GAP and a redraw where a snapshot would have been sent; its attach
+    // is one without snapshots (7.3), since no resync snapshot can follow
     let model = snapshots.then(|| model_of(session)).flatten();
+    let usable = match model.as_ref() {
+        Some(model) => on_model(model, |live| live.usable()).await.unwrap_or(false),
+        None => false,
+    };
     let quic = conn.connection.transport() == Transport::Quic;
     let mut catchup = model
         .as_ref()
         .map(|_| Catchup::new(Instant::now(), outs[0].end(session), quic));
     let mut batch = Vec::new();
     match (catchup.as_mut(), model.as_ref()) {
-        (Some(catchup), Some(model)) => {
+        (Some(catchup), Some(model)) if usable => {
             // An attach replays what the path carries in about two seconds, then repaints the
             // screen exactly (m2.md 6.5); after LATEST the screen is repainted too, instead of
             // making the program redraw
-            if let Some(cut) = attach_cut(session, model, start, initial_rate) {
+            if let Some(cut) = attach_cut(session, model, start, initial_rate).await {
                 if cut > start {
                     batch.push(Message::OutputGap { from: start, to: cut });
                     outs[0].skip(cut);
@@ -1287,8 +1389,10 @@ async fn terminal(
             acked_input = next_input;
         }
         let mut redraw = false;
-        // Until when output waits: for the program's reaction to input (the output stream
-        // only), or for the test link
+        // Output waits (the output stream only): for the program's reaction to input, until
+        // `hold`, or for the acknowledgement of the snapshot in flight (no deadline); and for
+        // the test link, until `wait`
+        let mut held_output = false;
         let mut hold: Option<Instant> = None;
         let mut wait: Option<Instant> = None;
         if !exit_sent {
@@ -1296,20 +1400,33 @@ async fn terminal(
                 let out = &mut outs[0];
                 let end = out.end(session);
                 catchup.output(now, end);
-                let unacked = end - out.last_ack.max(out.gap_to);
-                let step = catchup.step(now, unacked, out.last_ack, out.rate.rate(now), out.rate.sampled(now));
+                let busy = out.snapshot_in_flight();
+                let stream = pacing::Stream {
+                    unacked: out.unacked(end),
+                    unsent: end - out.sent,
+                    last_ack: out.last_ack,
+                    end,
+                    rate: out.rate.rate(now),
+                    sampled: out.rate.sampled(now),
+                    busy,
+                };
+                let step = catchup.step(now, &stream);
                 // A snapshot waits for the test link like output
                 let link = throttle.as_mut().and_then(|t| t.wait(now));
                 let before = batch.len();
                 match step {
-                    Step::Hold(until) => hold = Some(until),
+                    Step::Hold(until) => {
+                        held_output = true;
+                        hold = until;
+                    }
                     Step::Snapshot | Step::Send if link.is_some() => wait = link,
                     Step::Snapshot => {
-                        redraw |= send_snapshot(session, model, out, catchup, conn.zstd, true, &mut batch)
+                        redraw |= send_snapshot(session, model, out, catchup, conn.zstd, true, &mut batch).await
                     }
-                    // Caught up after an attach: the resync snapshot
-                    Step::Send if catchup.resync && end - out.sent <= PREFERRED_DATA as u64 => {
-                        redraw |= send_snapshot(session, model, out, catchup, conn.zstd, false, &mut batch)
+                    // Caught up after an attach or a gap: the resync snapshot, once no other
+                    // is in flight
+                    Step::Send if catchup.resync && !busy && end - out.sent <= PREFERRED_DATA as u64 => {
+                        redraw |= send_snapshot(session, model, out, catchup, conn.zstd, false, &mut batch).await
                     }
                     Step::Send => {}
                 }
@@ -1321,7 +1438,7 @@ async fn terminal(
             let rtt = conn.rtt();
             let mut gap = false;
             for (i, out) in outs.iter_mut().enumerate() {
-                if i == 0 && hold.is_some() {
+                if i == 0 && held_output {
                     continue;
                 }
                 if !pipe {
@@ -1421,6 +1538,8 @@ async fn terminal(
         // one ACK for the input at the top of the loop (7.5)
         let mut next = first;
         let mut processed = 0;
+        // The last RESIZE of this turn: only it is applied (each one can rebuild the model)
+        let mut resize = None;
         loop {
             let message = match next {
                 None => {
@@ -1494,7 +1613,8 @@ async fn terminal(
                     received,
                     error_received,
                 } => {
-                    if let Err(code) = outs[0].ack(session, received) {
+                    let rtt = conn.rtt();
+                    if let Err(code) = outs[0].ack(session, received, rtt) {
                         return Outcome::Error(code);
                     }
                     if pipe {
@@ -1502,7 +1622,7 @@ async fn terminal(
                         let Some(error_received) = error_received else {
                             return Outcome::Error(ErrorCode::FRAME_ERROR);
                         };
-                        if let Err(code) = outs[1].ack(session, error_received) {
+                        if let Err(code) = outs[1].ack(session, error_received, rtt) {
                             return Outcome::Error(code);
                         }
                     }
@@ -1510,7 +1630,7 @@ async fn terminal(
                 // A pipe session has no terminal: RESIZE is ignored (7.14.5)
                 Message::Resize(size) => {
                     if !pipe {
-                        resize_session(session, size.cols, size.rows)
+                        resize = Some(size);
                     }
                 }
                 Message::KeyConfirm { key_id } => {
@@ -1533,14 +1653,11 @@ async fn terminal(
                 Message::Detach => {
                     // All input before it was processed: acknowledge what was received and
                     // finish (7.11). Input still held was not received: the client keeps it
-                    let _ = write(
-                        send,
-                        &[Message::Ack {
-                            received: next_input,
-                            error_received: None,
-                        }],
-                    )
-                    .await;
+                    let ack = Message::Ack {
+                        received: next_input,
+                        error_received: None,
+                    };
+                    let _ = tokio::time::timeout(DETACH_ACK, write(send, &[ack])).await;
                     return Outcome::Finished;
                 }
                 Message::Hangup => {
@@ -1570,6 +1687,9 @@ async fn terminal(
                 Ok(m) => next = Some(m),
                 Err(_) => break,
             }
+        }
+        if let Some(size) = resize {
+            resize_session(session, size.cols, size.rows).await;
         }
     }
 }
@@ -1622,6 +1742,9 @@ async fn ending(session: &Arc<PtySession>, outs: &mut [Out], send: &mut SendStre
     let _ = tokio::time::timeout(Duration::from_secs(2), write(send, &batch)).await;
     outcome
 }
+
+#[cfg(test)]
+mod tests;
 
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
 

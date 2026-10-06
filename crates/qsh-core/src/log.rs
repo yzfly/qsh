@@ -28,11 +28,16 @@ pub fn enabled(level: Level) -> bool {
     level != Level::Off && LEVEL.load(Ordering::Relaxed) >= level as u8
 }
 
+/// The longest log line, in characters.
+const MAX_LINE: usize = 4096;
+
 fn write(level: Level, args: Arguments<'_>) {
     if enabled(level) {
+        // Log lines quote what the other side sent (error messages, names): as text only
+        let line = crate::text::sanitize(&args.to_string(), MAX_LINE);
         let mut stderr = std::io::stderr().lock();
         // \r: the client's terminal may be in raw mode
-        let _ = write!(stderr, "qsh: {args}\r\n");
+        let _ = write!(stderr, "qsh: {line}\r\n");
     }
 }
 

@@ -388,9 +388,13 @@ pub struct DoctorArgs {
     /// The ports to check and open, FIRST-LAST (default: the configured range)
     #[arg(long, value_name = "FIRST-LAST")]
     pub ports: Option<String>,
-    /// Read /etc, /proc, /sys and /var under DIR instead of / (tests and image builds)
-    #[arg(long, value_name = "DIR")]
+    /// Tests only: read /etc, /proc, /sys and /var under DIR instead of /, without following
+    /// symbolic links; no command of the host runs (see --commands)
+    #[arg(long, value_name = "DIR", hide = true)]
     pub root: Option<PathBuf>,
+    /// Tests only, with --root: the stub programs that stand in for the host's commands
+    #[arg(long, value_name = "DIR", hide = true, requires = "root")]
+    pub commands: Option<PathBuf>,
 }
 
 /// Options of `qsh-server tune`.
@@ -417,9 +421,13 @@ pub struct TuneArgs {
     /// The ports to open, FIRST-LAST (default: the configured range and extra ports)
     #[arg(long, value_name = "FIRST-LAST")]
     pub ports: Option<String>,
-    /// Read and change /etc, /proc/sys and /var under DIR instead of / (tests and image builds; no root needed)
-    #[arg(long, value_name = "DIR")]
+    /// Tests only: read and change /etc, /proc/sys and /var under DIR instead of /, without
+    /// following symbolic links; no command of the host runs (see --commands)
+    #[arg(long, value_name = "DIR", hide = true)]
     pub root: Option<PathBuf>,
+    /// Tests only, with --root: the stub programs that stand in for the host's commands
+    #[arg(long, value_name = "DIR", hide = true, requires = "root")]
+    pub commands: Option<PathBuf>,
 }
 
 /// Options of `qsh-server daemon`.
@@ -434,21 +442,6 @@ pub struct DaemonArgs {
     /// Exit after an hour without sessions (set when started on demand)
     #[arg(long, hide = true)]
     pub on_demand: bool,
-    /// Resume from the state an older image of this daemon handed over (an upgrade in place)
-    #[arg(long, hide = true, requires_all = ["state_fd", "key_fd"])]
-    pub resume: bool,
-    /// The descriptor of the sealed state (with --resume)
-    #[arg(long, hide = true, value_name = "FD", requires = "resume")]
-    pub state_fd: Option<i32>,
-    /// The descriptor of the pipe with the state's key (with --resume)
-    #[arg(long, hide = true, value_name = "FD", requires = "resume")]
-    pub key_fd: Option<i32>,
-    /// The descriptor of the previous program, run again if resuming fails (with --resume)
-    #[arg(long, hide = true, value_name = "FD", requires = "resume")]
-    pub fallback_exe_fd: Option<i32>,
-    /// The new program could not resume; this is the previous one again (with --resume)
-    #[arg(long, hide = true, requires = "resume")]
-    pub fell_back: bool,
 }
 
 /// Parse `FIRST-LAST` (or a single port).
@@ -606,24 +599,13 @@ mod tests {
         ));
         let args = ServerArgs::try_parse_from(["qsh-server", "handoff-probe"]).unwrap();
         assert!(matches!(args.command, ServerCommand::HandoffProbe));
-        let args = ServerArgs::try_parse_from([
-            "qsh-server",
-            "daemon",
-            "--resume",
-            "--state-fd=5",
-            "--key-fd=6",
-            "--fallback-exe-fd=7",
-            "--foreground",
-            "--on-demand",
-        ])
-        .unwrap();
+        let args = ServerArgs::try_parse_from(["qsh-server", "daemon", "--foreground", "--on-demand"]).unwrap();
         let ServerCommand::Daemon(d) = args.command else {
             panic!()
         };
-        assert!(d.resume && d.foreground && d.on_demand && !d.fell_back);
-        assert_eq!((d.state_fd, d.key_fd, d.fallback_exe_fd), (Some(5), Some(6), Some(7)));
-        // The descriptors only with --resume, and --resume only with them
-        assert!(ServerArgs::try_parse_from(["qsh-server", "daemon", "--state-fd=5"]).is_err());
+        assert!(d.foreground && d.on_demand);
+        // The new image of an upgrade is started with `handoff-resume`, a frozen command line
+        // recognized before clap (m2.md 10.3 step 5); the daemon command has no such options
         assert!(ServerArgs::try_parse_from(["qsh-server", "daemon", "--resume", "--state-fd=5"]).is_err());
     }
 

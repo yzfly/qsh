@@ -39,6 +39,36 @@ fn pipe_pair() -> (Connection, Connection) {
     (client, server)
 }
 
+/// A server that sends PINGs and never reads the PONGs cannot grow the client's queue of
+/// answers without bound: beyond 16 waiting, a PING goes unanswered.
+#[tokio::test]
+async fn pings_without_reading_the_answers_queue_little() {
+    let (client, server) = pipe_pair();
+    // As after authentication: no limit on what the client sends
+    server.set_preauth_limit(None);
+    let far = tokio::spawn(async move {
+        let (_, mut send, recv) = server.accept().await.unwrap();
+        let mut recv = BufReader::new(recv);
+        let _hello = read_message(&mut recv, MAX_HELLO).await.unwrap();
+        let hello = Message::ServerHello {
+            version: u64::from(proto::VERSION),
+            nonce: [0; 32],
+            capabilities: Vec::new(),
+            implementation: "test".into(),
+        };
+        write_message(&mut send, &hello).await.unwrap();
+        for data in 0..50_000 {
+            write_message(&mut send, &Message::Ping { data }).await.unwrap();
+        }
+        // The control stream stays open, unread
+        (send, recv)
+    });
+    let conn = Conn::hello(client).await.unwrap();
+    let _streams = far.await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(conn.pongs_pending() <= 16, "{}", conn.pongs_pending());
+}
+
 /// After a network change every connection is probed: one that answers is kept, one that
 /// answers nothing is closed (its sessions then race the transports again), and sessions
 /// waiting out a back-off are woken.

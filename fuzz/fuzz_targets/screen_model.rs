@@ -31,7 +31,13 @@ fuzz_target!(|data: &[u8]| {
             }
             continue;
         }
-        assert_eq!(lazy.feed(chunk), direct.feed(chunk), "line feeds counted differently");
+        let feeds = (lazy.feed(chunk), direct.feed(chunk));
+        // Output beyond the work budget is not fed (the daemon then drops the model); the two
+        // may run out a chunk apart, as the budget also grows with time
+        if lazy.exhausted() || direct.exhausted() {
+            return;
+        }
+        assert_eq!(feeds.0, feeds.1, "line feeds counted differently");
     }
     let first = lazy.capture(100);
     assert_eq!(first, direct.capture(100), "lazy feeding changed the model");

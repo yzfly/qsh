@@ -10,7 +10,7 @@
 
 use std::io;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::crypto::SessionKey;
@@ -50,6 +50,9 @@ pub const MAX_STATE_FILE: u64 = 64 << 30;
 
 /// A descriptor number that is not there (a closed pipe).
 pub const NO_FD: u32 = u32::MAX;
+
+/// Most programs a state remembers as refused or failed ([`State::refused`]).
+pub const MAX_REFUSED: usize = 64;
 
 /// How long the version probe may take (10.3 step 2).
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -215,6 +218,55 @@ impl SessionState {
     }
 }
 
+/// The identity of a file: device, inode and change time. A package upgrade that replaces a
+/// program gives it another inode; an inode number used again later comes with another change
+/// time, and so does any change of the file's content or mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FileId {
+    /// The device.
+    pub dev: u64,
+    /// The inode.
+    pub ino: u64,
+    /// The change time, seconds since the epoch.
+    pub ctime: i64,
+    /// The change time's nanoseconds (below 10^9).
+    pub ctime_ns: u32,
+}
+
+impl FileId {
+    /// The identity of the file `meta` describes.
+    pub fn of(meta: &std::fs::Metadata) -> FileId {
+        FileId {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            ctime: meta.ctime(),
+            ctime_ns: u32::try_from(meta.ctime_nsec()).unwrap_or(0).min(999_999_999),
+        }
+    }
+}
+
+/// A program the daemon does not try again by itself (security.md 4.8, m2.md 10.2): its probe
+/// or its checks said no, or an upgrade to it failed. Only an explicit `qsh-server upgrade
+/// --force` tries it again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Refused {
+    /// The program.
+    pub id: FileId,
+    /// An upgrade to it was attempted and failed (rather than refused before an attempt).
+    pub failed: bool,
+}
+
+/// The daemon's own options (`qsh-server daemon`): handed to the next image inside the state,
+/// not on its command line, so that a later version that renames an option still resumes
+/// (m2.md 10.3 step 5).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DaemonOptions {
+    /// Started on demand: exits after an hour without sessions.
+    pub on_demand: bool,
+    /// `--ports FIRST-LAST` (or `QSH_SERVER_PORTS`), over the configuration files.
+    pub ports: Option<(u16, u16)>,
+}
+
 /// Everything the new image needs.
 #[derive(Debug, Clone)]
 pub struct State {
@@ -226,6 +278,14 @@ pub struct State {
     pub restarts: u32,
     /// Upgrades that failed so far.
     pub failures: u32,
+    /// The daemon's own options.
+    pub options: DaemonOptions,
+    /// Programs not to try again by itself, oldest first (at most [`MAX_REFUSED`]).
+    pub refused: Vec<Refused>,
+    /// The program this state was written for. When it cannot resume and the old image takes
+    /// over again (m2.md 10.4), that one adds it to its refused programs: a failed program is
+    /// never tried again automatically.
+    pub attempt: Option<FileId>,
     /// The primary port (UDP and TCP).
     pub port: u16,
     /// The daemon's own descriptors.
@@ -300,6 +360,12 @@ impl Writer {
         self.u64(b.base);
         self.bytes(&b.bytes);
     }
+    fn file_id(&mut self, id: &FileId) {
+        self.u64(id.dev);
+        self.u64(id.ino);
+        self.u64(id.ctime as u64);
+        self.u32(id.ctime_ns);
+    }
 }
 
 /// Encode `state` (format [`FORMAT`]). Lengths beyond the format's limits are an error, so
@@ -310,6 +376,13 @@ pub fn encode(state: &State) -> Result<Vec<u8>, StateError> {
     }
     if state.listeners.len() > MAX_LISTENERS || state.sessions.len() > MAX_SESSIONS {
         return Err(bad("too many listeners or sessions"));
+    }
+    if state.refused.len() > MAX_REFUSED {
+        return Err(bad("too many refused programs"));
+    }
+    check_options(&state.options)?;
+    for id in state.refused.iter().map(|r| &r.id).chain(state.attempt.as_ref()) {
+        check_file_id(id)?;
     }
     let size: usize = state
         .sessions
@@ -323,6 +396,24 @@ pub fn encode(state: &State) -> Result<Vec<u8>, StateError> {
     w.u64(state.started_ms);
     w.u32(state.restarts);
     w.u32(state.failures);
+    let o = &state.options;
+    w.u8(u8::from(o.on_demand) | (u8::from(o.ports.is_some()) << 1));
+    if let Some((first, last)) = o.ports {
+        w.u16(first);
+        w.u16(last);
+    }
+    w.u16(state.refused.len() as u16);
+    for r in &state.refused {
+        w.file_id(&r.id);
+        w.u8(u8::from(r.failed));
+    }
+    match &state.attempt {
+        Some(id) => {
+            w.u8(1);
+            w.file_id(id);
+        }
+        None => w.u8(0),
+    }
     w.u16(state.port);
     w.u16(state.listeners.len() as u16);
     for l in &state.listeners {
@@ -411,6 +502,22 @@ pub fn encode(state: &State) -> Result<Vec<u8>, StateError> {
         }
     }
     Ok(w.0)
+}
+
+/// The checks of the options that [`encode`] and [`decode`] share.
+fn check_options(o: &DaemonOptions) -> Result<(), StateError> {
+    match o.ports {
+        Some((first, last)) if first == 0 || first > last => Err(bad("bad port range")),
+        _ => Ok(()),
+    }
+}
+
+/// The checks of a file identity that [`encode`] and [`decode`] share.
+fn check_file_id(id: &FileId) -> Result<(), StateError> {
+    if id.ctime_ns >= 1_000_000_000 {
+        return Err(bad("bad change time"));
+    }
+    Ok(())
 }
 
 /// The checks of one session that [`encode`] and [`decode`] share.
@@ -508,6 +615,16 @@ impl<'a> Reader<'a> {
         let bytes = self.bytes(capacity as usize)?;
         Ok(BufferState { capacity, base, bytes })
     }
+    fn file_id(&mut self) -> Result<FileId, StateError> {
+        let id = FileId {
+            dev: self.u64()?,
+            ino: self.u64()?,
+            ctime: self.u64()? as i64,
+            ctime_ns: self.u32()?,
+        };
+        check_file_id(&id)?;
+        Ok(id)
+    }
 }
 
 /// A descriptor number from the state: a plain descriptor above stderr.
@@ -537,6 +654,29 @@ pub fn decode(bytes: &[u8]) -> Result<State, StateError> {
     let started_ms = r.u64()?;
     let restarts = r.u32()?;
     let failures = r.u32()?;
+    let flags = r.u8()?;
+    if flags & !0b11 != 0 {
+        return Err(bad("unknown options"));
+    }
+    let options = DaemonOptions {
+        on_demand: flags & 1 != 0,
+        ports: if flags & 2 != 0 {
+            Some((r.u16()?, r.u16()?))
+        } else {
+            None
+        },
+    };
+    check_options(&options)?;
+    let n = r.u16()? as usize;
+    if n > MAX_REFUSED {
+        return Err(bad("too many refused programs"));
+    }
+    let mut refused = Vec::with_capacity(n);
+    for _ in 0..n {
+        let id = r.file_id()?;
+        refused.push(Refused { id, failed: r.flag()? });
+    }
+    let attempt = if r.flag()? { Some(r.file_id()?) } else { None };
     let port = r.u16()?;
     let n = r.u16()? as usize;
     if n > MAX_LISTENERS {
@@ -649,6 +789,9 @@ pub fn decode(bytes: &[u8]) -> Result<State, StateError> {
         started_ms,
         restarts,
         failures,
+        options,
+        refused,
+        attempt,
         port,
         listeners,
         sessions,
@@ -662,34 +805,121 @@ pub fn decode(bytes: &[u8]) -> Result<State, StateError> {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The executable to run, and its probe
+// The executable to run, its probe, and the new image's command line
 
-/// Check `path` as the program of an upgrade (m2.md 10.3 step 1, security.md 4.8): an
-/// absolute path to a regular file, owned by root or by this user, not writable by group or
-/// others, executable.
-pub fn validate_exe(path: &Path) -> Result<(), String> {
-    if !path.is_absolute() {
-        return Err(format!("{} is not an absolute path", path.display()));
+/// A test hook (unstable; builds with the cargo feature `test-hooks` only): the directories
+/// above this one are not checked by [`Exe::check`]. The tests' worlds live under `/tmp`,
+/// which every user can write.
+pub(crate) const TEST_TRUSTED_DIR: &str = "QSH_TEST_TRUSTED_DIR";
+
+/// A program opened for an upgrade (m2.md 10.3 step 1, security.md 4.8). It is checked on its
+/// descriptor; on Linux it is also probed and executed through that descriptor, never through
+/// its path again, so that what runs is what was checked. Elsewhere its path is checked to
+/// still name the same file right before the probe and right before the `execve`.
+#[derive(Debug)]
+pub struct Exe {
+    /// The path it was named by.
+    pub path: PathBuf,
+    /// The same path with every symbolic link resolved: the one whose directories are checked.
+    pub real: PathBuf,
+    /// The file, open read-only and close-on-exec.
+    pub file: std::fs::File,
+    /// Its identity when it was opened.
+    pub id: FileId,
+}
+
+impl Exe {
+    /// Open the program at `path`, an absolute path. Its symbolic links are resolved first and
+    /// the file is then opened without following another one (one that appears meanwhile is
+    /// someone's doing), and without waiting if it is a FIFO.
+    pub fn open(path: &Path) -> Result<Exe, String> {
+        use std::os::unix::fs::OpenOptionsExt;
+        if !path.is_absolute() {
+            return Err(format!("{} is not an absolute path", path.display()));
+        }
+        let real = std::fs::canonicalize(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&real)
+            .map_err(|e| format!("{}: {e}", real.display()))?;
+        let meta = file.metadata().map_err(|e| format!("{}: {e}", real.display()))?;
+        Ok(Exe {
+            path: path.to_path_buf(),
+            real,
+            id: FileId::of(&meta),
+            file,
+        })
     }
-    let meta = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    if !meta.is_file() {
-        return Err(format!("{} is not a regular file", path.display()));
+
+    /// Check it (m2.md 10.3 step 1, security.md 4.8), on the open file: a regular file, owned by
+    /// root or by this user, not writable by group or others, executable. And every directory
+    /// above it: owned by root or by this user, not writable by others (not even with the
+    /// sticky bit, like `/tmp`: whoever can create a name in a directory can put a program
+    /// where this one is expected), and writable by its group only when that is the user's
+    /// private group ([`crate::sys::private_group`]). A directory another user could write,
+    /// or a group (Debian's `/usr/local`, `root:staff 2775`), is refused like a file they
+    /// could write.
+    pub fn check(&self) -> Result<(), String> {
+        let path = self.path.display();
+        let meta = self.file.metadata().map_err(|e| format!("{path}: {e}"))?;
+        if !meta.is_file() {
+            return Err(format!("{path} is not a regular file"));
+        }
+        let euid = crate::sys::euid();
+        if meta.uid() != 0 && meta.uid() != euid {
+            return Err(format!("{path} belongs to another user"));
+        }
+        let mode = meta.permissions().mode();
+        if mode & 0o022 != 0 {
+            return Err(format!(
+                "{path} is writable by group or others (mode {:o})",
+                mode & 0o7777
+            ));
+        }
+        if mode & 0o111 == 0 {
+            return Err(format!("{path} is not executable"));
+        }
+        let trusted = std::env::var_os(TEST_TRUSTED_DIR)
+            .filter(|_| cfg!(feature = "test-hooks"))
+            .map(PathBuf::from);
+        let private = crate::sys::private_group();
+        for dir in self.real.ancestors().skip(1) {
+            if trusted.as_deref().is_some_and(|t| t != dir && t.starts_with(dir)) {
+                break;
+            }
+            let m = std::fs::symlink_metadata(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+            if let Some(why) = dir_refusal(m.uid(), m.gid(), m.mode(), euid, private) {
+                return Err(format!(
+                    "{path} is in {}, which {why} (mode {:o})",
+                    dir.display(),
+                    m.mode() & 0o7777
+                ));
+            }
+        }
+        Ok(())
     }
-    if meta.uid() != 0 && meta.uid() != crate::sys::euid() {
-        return Err(format!("{} belongs to another user", path.display()));
+
+    /// True when its path still names the file that was opened: for systems that cannot
+    /// execute a descriptor, right before using the path.
+    pub fn unchanged(&self) -> bool {
+        file_identity(&self.real) == Some(self.id)
     }
-    let mode = meta.permissions().mode();
-    if mode & 0o022 != 0 {
-        return Err(format!(
-            "{} is writable by group or others (mode {:o})",
-            path.display(),
-            mode & 0o7777
-        ));
+}
+
+/// Why a directory (owner `uid`, group `gid`, `mode`) cannot hold a program that user `euid`,
+/// whose private group is `private`, executes in place of its daemon. None: it can.
+fn dir_refusal(uid: u32, gid: u32, mode: u32, euid: u32, private: Option<u32>) -> Option<&'static str> {
+    if uid != 0 && uid != euid {
+        return Some("belongs to another user");
     }
-    if mode & 0o111 == 0 {
-        return Err(format!("{} is not executable", path.display()));
+    if mode & 0o002 != 0 {
+        return Some("every user can write");
     }
-    Ok(())
+    if mode & 0o020 != 0 && Some(gid) != private {
+        return Some("its group can write");
+    }
+    None
 }
 
 /// What an executable said about itself (`qsh-server handoff-probe`).
@@ -730,20 +960,42 @@ pub fn parse_probe(output: &[u8]) -> Result<Probe, String> {
 }
 
 /// Run `exe handoff-probe` (10.3 step 2): no shell, an empty environment except `PATH`, at
-/// most [`PROBE_TIMEOUT`] and [`PROBE_MAX_OUTPUT`] bytes of output.
-pub async fn probe(exe: &Path) -> Result<Probe, String> {
+/// most [`PROBE_TIMEOUT`] and [`PROBE_MAX_OUTPUT`] bytes of output. On Linux the program run
+/// is the open file (`/proc/self/fd/N`), not whatever its path names now.
+pub async fn probe(exe: &Exe) -> Result<Probe, String> {
     use tokio::io::AsyncReadExt;
+    let name = exe.path.display();
     let path = std::env::var_os("PATH").unwrap_or_else(|| super::pty::DEFAULT_PATH.into());
-    let mut child = tokio::process::Command::new(exe)
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let mut command = {
+        use std::os::fd::AsRawFd;
+        let fd = exe.file.as_raw_fd();
+        let mut command = std::process::Command::new(format!("/proc/self/fd/{fd}"));
+        crate::sys::inherit_in_child(&mut command, fd);
+        command
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let mut command = {
+        if !exe.unchanged() {
+            return Err(format!("{name} was replaced while it was being checked"));
+        }
+        std::process::Command::new(&exe.real)
+    };
+    {
+        use std::os::unix::process::CommandExt;
+        command.arg0("qsh-server");
+    }
+    command
         .arg("handoff-probe")
         .env_clear()
         .env("PATH", path)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let mut child = tokio::process::Command::from(command)
         .kill_on_drop(true)
         .spawn()
-        .map_err(|e| format!("cannot run {}: {e}", exe.display()))?;
+        .map_err(|e| format!("cannot run {name}: {e}"))?;
     let mut stdout = child.stdout.take().ok_or("no output")?;
     let run = async {
         let mut out = Vec::new();
@@ -759,34 +1011,80 @@ pub async fn probe(exe: &Path) -> Result<Probe, String> {
         parse_probe(&out)
     };
     match tokio::time::timeout(PROBE_TIMEOUT, run).await {
-        Ok(result) => result.map_err(|e| format!("{}: {e}", exe.display())),
+        Ok(result) => result.map_err(|e| format!("{name}: {e}")),
         Err(_) => Err(format!(
-            "{}: no answer to the version probe within {PROBE_TIMEOUT:?}",
-            exe.display()
+            "{name}: no answer to the version probe within {PROBE_TIMEOUT:?}"
         )),
     }
 }
 
-/// A semantic version: (major, minor, patch, pre-release). None when unparseable.
+/// A semantic version: (major, minor, patch, pre-release). None when it is not one: three
+/// numbers without leading zeros, then optionally `-` and dot-separated identifiers of ASCII
+/// letters, digits and hyphens (numeric ones without leading zeros), then optionally `+` and
+/// build metadata, which is ignored.
 fn parse_version(text: &str) -> Option<(u64, u64, u64, Option<&str>)> {
     let text = text.split('+').next()?;
     let (core, pre) = match text.split_once('-') {
         Some((core, pre)) => (core, Some(pre)),
         None => (text, None),
     };
+    let number = |s: &str| -> Option<u64> {
+        let leading_zero = s.len() > 1 && s.starts_with('0');
+        (!s.is_empty() && !leading_zero && s.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| s.parse().ok())
+            .flatten()
+    };
     let mut parts = core.split('.');
-    let major = parts.next()?.parse().ok()?;
-    let minor = parts.next()?.parse().ok()?;
-    let patch = parts.next()?.parse().ok()?;
+    let major = number(parts.next()?)?;
+    let minor = number(parts.next()?)?;
+    let patch = number(parts.next()?)?;
     if parts.next().is_some() {
         return None;
+    }
+    if let Some(pre) = pre {
+        let valid = |id: &str| {
+            let numeric = id.bytes().all(|b| b.is_ascii_digit());
+            !id.is_empty()
+                && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                && !(numeric && id.len() > 1 && id.starts_with('0'))
+        };
+        if !pre.split('.').all(valid) {
+            return None;
+        }
     }
     Some((major, minor, patch, pre))
 }
 
-/// True when version `a` is strictly newer than `b` (semantic versioning; a pre-release is
-/// older than its release; pre-releases of the same version compare as text). Unparseable
-/// versions are never newer.
+/// The precedence of two pre-release tags (semantic versioning 2.0.0, item 11): identifier by
+/// identifier, numeric ones numerically, a numeric one lower than an alphanumeric one,
+/// alphanumeric ones in ASCII order; when one is a prefix of the other, the shorter is lower.
+fn compare_pre(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let numeric = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+    let (mut x, mut y) = (a.split('.'), b.split('.'));
+    loop {
+        let order = match (x.next(), y.next()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            // Numerically, however long: no leading zeros (parse_version), so the longer is larger
+            (Some(p), Some(q)) => match (numeric(p), numeric(q)) {
+                (true, true) => p.len().cmp(&q.len()).then_with(|| p.cmp(q)),
+                (true, false) => Ordering::Less,
+                (false, true) => Ordering::Greater,
+                (false, false) => p.cmp(q),
+            },
+        };
+        if order != Ordering::Equal {
+            return order;
+        }
+    }
+}
+
+/// True when version `a` is strictly newer than `b` by semantic versioning precedence (a
+/// pre-release is older than its release; pre-releases compare identifier by identifier, numeric
+/// ones numerically and below alphanumeric ones, a shorter prefix lower; build
+/// metadata is ignored). Versions that are not semantic versions are never newer.
 pub fn newer(a: &str, b: &str) -> bool {
     let (Some(a), Some(b)) = (parse_version(a), parse_version(b)) else {
         return false;
@@ -796,15 +1094,101 @@ pub fn newer(a: &str, b: &str) -> bool {
     }
     match (a.3, b.3) {
         (None, Some(_)) => true,
-        (Some(x), Some(y)) => x > y,
+        (Some(x), Some(y)) => compare_pre(x, y) == std::cmp::Ordering::Greater,
         _ => false,
     }
 }
 
-/// The identity of the file at `path` (device, inode), to notice that a package upgrade
-/// replaced it (m2.md 10.2, upgrades when idle).
-pub fn file_identity(path: &Path) -> Option<(u64, u64)> {
-    std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+/// The identity of the file at `path`, following symbolic links, to notice that a package
+/// upgrade replaced it (m2.md 10.2, upgrades when idle).
+pub fn file_identity(path: &Path) -> Option<FileId> {
+    std::fs::metadata(path).ok().map(|m| FileId::of(&m))
+}
+
+/// The command (`argv[1]`) a new image is started with (m2.md 10.3 step 5). This command
+/// line is frozen with the state formats: every version that reads a format accepts it in
+/// exactly this form, and the program recognizes it before parsing anything else, so that a
+/// later version that changes its other options or subcommands still resumes. The daemon's
+/// own options travel in the state ([`DaemonOptions`]).
+pub const RESUME_COMMAND: &str = "handoff-resume";
+
+/// What a new image of the daemon was given by the old one (`qsh-server handoff-resume`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Resume {
+    /// The format of the state.
+    pub format: u16,
+    /// The sealed state.
+    pub state_fd: i32,
+    /// The pipe with the state's key.
+    pub key_fd: i32,
+    /// The old image's executable, to execute again if this one cannot resume (Linux).
+    pub fallback_exe_fd: Option<i32>,
+    /// This is the old image again: the new one could not resume (m2.md 10.4).
+    pub fell_back: bool,
+}
+
+impl Resume {
+    /// The command line: `qsh-server handoff-resume --format=F --state-fd=N --key-fd=M
+    /// [--fallback-exe-fd=E] [--fell-back]`.
+    pub fn to_args(&self) -> Vec<String> {
+        let mut args = vec![
+            "qsh-server".to_string(),
+            RESUME_COMMAND.into(),
+            format!("--format={}", self.format),
+            format!("--state-fd={}", self.state_fd),
+            format!("--key-fd={}", self.key_fd),
+        ];
+        if let Some(fd) = self.fallback_exe_fd {
+            args.push(format!("--fallback-exe-fd={fd}"));
+        }
+        if self.fell_back {
+            args.push("--fell-back".into());
+        }
+        args
+    }
+
+    /// Recognize the command line of [`Resume::to_args`]: None when `args[1]` is not
+    /// [`RESUME_COMMAND`]; an error when it is but the rest is not exactly that form.
+    pub fn from_args(args: &[std::ffi::OsString]) -> Option<Result<Resume, String>> {
+        if args.get(1).map(|a| a.as_os_str()) != Some(std::ffi::OsStr::new(RESUME_COMMAND)) {
+            return None;
+        }
+        let parse = || -> Result<Resume, String> {
+            let (mut format, mut state_fd, mut key_fd, mut fallback_exe_fd, mut fell_back) =
+                (None, None, None, None, false);
+            for arg in &args[2..] {
+                let arg = arg.to_str().ok_or("an argument that is not UTF-8")?;
+                let fd = |v: &str| -> Result<i32, String> {
+                    v.parse::<i32>()
+                        .ok()
+                        .filter(|fd| *fd >= 3)
+                        .ok_or_else(|| format!("bad descriptor {v:?}"))
+                };
+                match arg.split_once('=') {
+                    Some(("--format", v)) if format.is_none() => {
+                        format = Some(v.parse::<u16>().map_err(|_| format!("bad format {v:?}"))?)
+                    }
+                    Some(("--state-fd", v)) if state_fd.is_none() => state_fd = Some(fd(v)?),
+                    Some(("--key-fd", v)) if key_fd.is_none() => key_fd = Some(fd(v)?),
+                    Some(("--fallback-exe-fd", v)) if fallback_exe_fd.is_none() => fallback_exe_fd = Some(fd(v)?),
+                    None if arg == "--fell-back" && !fell_back => fell_back = true,
+                    _ => return Err(format!("unexpected argument {arg:?}")),
+                }
+            }
+            let format = format.ok_or("no --format")?;
+            if !FORMATS.contains(&format) {
+                return Err(format!("state format {format} is not known"));
+            }
+            Ok(Resume {
+                format,
+                state_fd: state_fd.ok_or("no --state-fd")?,
+                key_fd: key_fd.ok_or("no --key-fd")?,
+                fallback_exe_fd,
+                fell_back,
+            })
+        };
+        Some(parse())
+    }
 }
 
 /// Read the sealed state from `file` (from its start, whatever its offset) and open it with
@@ -890,6 +1274,36 @@ mod tests {
             started_ms: 1_791_199_000_000,
             restarts: 2,
             failures: 1,
+            options: DaemonOptions {
+                on_demand: true,
+                ports: Some((60443, 60542)),
+            },
+            refused: vec![
+                Refused {
+                    id: FileId {
+                        dev: 2049,
+                        ino: 1234,
+                        ctime: 1_791_199_000,
+                        ctime_ns: 5,
+                    },
+                    failed: true,
+                },
+                Refused {
+                    id: FileId {
+                        dev: 2049,
+                        ino: 99,
+                        ctime: -1,
+                        ctime_ns: 999_999_999,
+                    },
+                    failed: false,
+                },
+            ],
+            attempt: Some(FileId {
+                dev: 2049,
+                ino: 77,
+                ctime: 1_791_199_001,
+                ctime_ns: 0,
+            }),
             port: 60443,
             listeners: vec![
                 Listener {
@@ -926,6 +1340,10 @@ mod tests {
         assert_eq!(
             (&a.writer, a.started_ms, a.restarts, a.failures, a.port, &a.listeners),
             (&b.writer, b.started_ms, b.restarts, b.failures, b.port, &b.listeners)
+        );
+        assert_eq!(
+            (&a.options, &a.refused, &a.attempt),
+            (&b.options, &b.refused, &b.attempt)
         );
         assert_eq!(a.sessions.len(), b.sessions.len());
         for (x, y) in a.sessions.iter().zip(&b.sessions) {
@@ -1071,6 +1489,14 @@ mod tests {
         check(&|s| s.listeners.retain(|l| l.kind != ListenerKind::Lock), "no lock");
         check(&|s| s.sessions[1].id = s.sessions[0].id, "a session id twice");
         check(&|s| s.sessions[0].pid = 1, "init is never a session");
+        check(&|s| s.options.ports = Some((2, 1)), "an empty port range");
+        check(
+            &|s| s.refused[0].id.ctime_ns = 1_000_000_000,
+            "a change time beyond a second",
+        );
+        let mut s = state();
+        s.refused = vec![s.refused[0]; MAX_REFUSED + 1];
+        assert!(encode(&s).is_err(), "too many refused programs");
         // What encode refuses, decode refuses too
         let mut s = state();
         s.sessions[0].output.capacity = 4;
@@ -1107,6 +1533,105 @@ mod tests {
         assert!(newer("0.3.0+build5", "0.2.9"));
     }
 
+    /// Review L4: pre-release tags compared as text made 1.0.0-rc.9 newer than 1.0.0-rc.10
+    /// and 1.0.0-alpha.1 newer than 1.0.0-alpha. Semantic versioning 2.0.0, item 11.
+    #[test]
+    fn pre_releases_follow_semantic_versioning_precedence() {
+        // The example of the specification, in increasing precedence
+        let order = [
+            "1.0.0-alpha",
+            "1.0.0-alpha.1",
+            "1.0.0-alpha.beta",
+            "1.0.0-beta",
+            "1.0.0-beta.2",
+            "1.0.0-beta.11",
+            "1.0.0-rc.1",
+            "1.0.0",
+        ];
+        for (i, a) in order.iter().enumerate() {
+            for (j, b) in order.iter().enumerate() {
+                assert_eq!(newer(a, b), i > j, "{a} newer than {b}");
+            }
+        }
+        assert!(newer("1.0.0-rc.10", "1.0.0-rc.9"));
+        assert!(!newer("1.0.0-rc.9", "1.0.0-rc.10"));
+        // Numeric identifiers of any length
+        assert!(newer("1.0.0-99999999999999999999999", "1.0.0-9999999999999999999999"));
+        // Numeric lower than alphanumeric
+        assert!(newer("1.0.0-a", "1.0.0-1"));
+        // Build metadata does not count
+        assert!(!newer("1.0.0+2", "1.0.0+1"));
+        // Not semantic versions: never newer
+        for bad in ["1.0.0-", "1.0.0-a..b", "1.0.0-01", "01.0.0", "1.0.0-a_b", "1.0.0-é"] {
+            assert!(!newer(bad, "0.0.1"), "{bad}");
+            assert!(!newer("9.9.9", bad), "{bad}");
+        }
+    }
+
+    /// Review M3: the new image's command line is a frozen form, recognized before anything
+    /// else is parsed; anything else in that position is not it.
+    #[test]
+    fn the_resume_command_line_round_trips_and_is_strict() {
+        let os = |v: Vec<String>| v.into_iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
+        for r in [
+            Resume {
+                format: FORMAT,
+                state_fd: 7,
+                key_fd: 8,
+                fallback_exe_fd: Some(9),
+                fell_back: false,
+            },
+            Resume {
+                format: FORMAT,
+                state_fd: 70,
+                key_fd: 3,
+                fallback_exe_fd: None,
+                fell_back: true,
+            },
+        ] {
+            assert_eq!(Resume::from_args(&os(r.to_args())), Some(Ok(r)));
+        }
+        let parse = |words: &[&str]| Resume::from_args(&os(words.iter().map(|w| w.to_string()).collect()));
+        assert_eq!(parse(&["qsh-server", "daemon", "--resume"]), None);
+        assert_eq!(parse(&["qsh-server"]), None);
+        for bad in [
+            &["qsh-server", "handoff-resume"][..],
+            &["qsh-server", "handoff-resume", "--format=1", "--state-fd=7"],
+            &[
+                "qsh-server",
+                "handoff-resume",
+                "--format=9",
+                "--state-fd=7",
+                "--key-fd=8",
+            ],
+            &[
+                "qsh-server",
+                "handoff-resume",
+                "--format=1",
+                "--state-fd=1",
+                "--key-fd=8",
+            ],
+            &[
+                "qsh-server",
+                "handoff-resume",
+                "--format=1",
+                "--state-fd=7",
+                "--key-fd=8",
+                "--ports=1-2",
+            ],
+            &[
+                "qsh-server",
+                "handoff-resume",
+                "--format=1",
+                "--state-fd=7",
+                "--state-fd=7",
+                "--key-fd=8",
+            ],
+        ] {
+            assert!(matches!(parse(bad), Some(Err(_))), "{bad:?}");
+        }
+    }
+
     #[test]
     fn the_probe_line_round_trips() {
         let line = probe_line("0.4.0");
@@ -1123,20 +1648,75 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("qsh-handoff-exe-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         let exe = dir.join("qsh-server");
         std::fs::write(&exe, b"#!/bin/sh\n").unwrap();
         let set = |mode| std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(mode)).unwrap();
+        // The directories above the test's own are not this test's business (/tmp)
+        let check = |path: &Path| {
+            std::env::set_var(TEST_TRUSTED_DIR, &dir);
+            Exe::open(path).and_then(|e| e.check())
+        };
         set(0o755);
-        assert_eq!(validate_exe(&exe), Ok(()));
+        if cfg!(feature = "test-hooks") {
+            assert_eq!(check(&exe), Ok(()));
+        }
         set(0o775);
-        assert!(validate_exe(&exe).unwrap_err().contains("writable by group"));
+        assert!(check(&exe).unwrap_err().contains("writable by group"));
         set(0o757);
-        assert!(validate_exe(&exe).is_err());
+        assert!(check(&exe).is_err());
         set(0o644);
-        assert!(validate_exe(&exe).unwrap_err().contains("not executable"));
-        assert!(validate_exe(Path::new("qsh-server")).unwrap_err().contains("absolute"));
-        assert!(validate_exe(&dir).unwrap_err().contains("regular file"));
-        assert!(validate_exe(&dir.join("missing")).is_err());
+        assert!(check(&exe).unwrap_err().contains("not executable"));
+        assert!(check(Path::new("qsh-server")).unwrap_err().contains("absolute"));
+        assert!(check(&dir).unwrap_err().contains("regular file"));
+        assert!(check(&dir.join("missing")).is_err());
+        // A FIFO is not waited for
+        let fifo = dir.join("fifo");
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success());
+        assert!(check(&fifo).unwrap_err().contains("regular file"));
+        std::env::remove_var(TEST_TRUSTED_DIR);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Review M1: every directory above the program is checked too. /tmp, which every user
+    /// can write (sticky or not), cannot hold it; nor can a directory its group can write,
+    /// unless that group is the user's private group.
+    #[test]
+    fn the_directories_above_the_program_are_checked() {
+        let dir = std::env::temp_dir().join(format!("qsh-handoff-dirs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let exe = dir.join("qsh-server");
+        std::fs::write(&exe, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let tmp_is_shared = std::fs::metadata(std::env::temp_dir()).unwrap().mode() & 0o002 != 0;
+        if tmp_is_shared && !cfg!(feature = "test-hooks") {
+            let error = Exe::open(&exe).and_then(|e| e.check()).unwrap_err();
+            assert!(error.contains("every user can write"), "{error}");
+        }
+        // Through a symbolic link: the real directories are the ones checked
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&exe, &link).unwrap();
+        let opened = Exe::open(&link).unwrap();
+        assert_eq!(opened.real, exe);
+        let me = crate::sys::euid();
+        let private = Some(4242);
+        assert_eq!(dir_refusal(0, 0, 0o40755, me, None), None);
+        assert_eq!(dir_refusal(me, 9, 0o40755, me, None), None);
+        assert_eq!(
+            dir_refusal(me + 1, 9, 0o40755, me, None),
+            Some("belongs to another user")
+        );
+        assert_eq!(dir_refusal(0, 0, 0o41777, me, None), Some("every user can write"));
+        assert_eq!(dir_refusal(me, 0, 0o40757, me, None), Some("every user can write"));
+        assert_eq!(dir_refusal(0, 50, 0o42775, me, None), Some("its group can write"));
+        assert_eq!(dir_refusal(me, 50, 0o40775, me, private), Some("its group can write"));
+        assert_eq!(dir_refusal(me, 4242, 0o40775, me, private), None);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1156,19 +1736,30 @@ mod tests {
             "good",
             r#"[ "$1" = handoff-probe ] && [ -z "$HOME" ] && echo '{"qsh-server":"9.0.0","handoff":[1]}'"#,
         );
+        let run = |path: PathBuf| async move { probe(&Exe::open(&path)?).await };
         assert_eq!(
-            probe(&good).await.unwrap(),
+            run(good.clone()).await.unwrap(),
             Probe {
                 version: "9.0.0".into(),
                 formats: vec![1]
             }
         );
-        assert!(probe(&script("fails", "exit 3")).await.unwrap_err().contains("failed"));
-        assert!(probe(&script("junk", "echo hello"))
+        assert!(run(script("fails", "exit 3")).await.unwrap_err().contains("failed"));
+        assert!(run(script("junk", "echo hello"))
             .await
             .unwrap_err()
             .contains("did not answer"));
-        assert!(probe(&dir.join("missing")).await.is_err());
+        assert!(run(dir.join("missing")).await.is_err());
+        // Review M1: what runs is the file that was opened, not what its path names later
+        let opened = Exe::open(&good).unwrap();
+        let replaced = script("other", "echo '{\"qsh-server\":\"0.0.1\",\"handoff\":[1]}'");
+        std::fs::rename(&replaced, &good).unwrap();
+        let answer = probe(&opened).await;
+        if cfg!(any(target_os = "linux", target_os = "android")) {
+            assert_eq!(answer.unwrap().version, "9.0.0");
+        } else {
+            assert!(answer.unwrap_err().contains("replaced"));
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 }

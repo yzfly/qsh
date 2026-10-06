@@ -95,6 +95,16 @@ impl SshCommand {
         cmd
     }
 
+    /// `ssh -t … destination <remote>` with a terminal, in front of the user (`qsh doctor HOST
+    /// --tune`), and without any forwarding, like every ssh qsh runs (security.md 4.6). The
+    /// caller sets up stdin, stdout and stderr (inherited by default).
+    pub fn with_terminal(&self, remote: &str) -> std::process::Command {
+        let mut cmd = std::process::Command::new(&self.program);
+        cmd.arg("-t").args(&Self::COMMON[1..]);
+        cmd.args(&self.options).arg("--").arg(&self.destination).arg(remote);
+        cmd
+    }
+
     /// `ssh -T … destination '<discovery> bootstrap'`, interactive: ssh asks for passwords and
     /// second factors on the terminal as usual (no BatchMode). stdin and stdout are pipes (the
     /// request goes on stdin, never in argv where `ps` shows it); stderr is the user's.

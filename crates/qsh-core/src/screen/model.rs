@@ -14,13 +14,68 @@
 //!   nothing else of what was dropped can be seen (the cursor column is 0 after CR LF, the
 //!   pen is replayed, the scanner keeps titles and modes). The property test in `tests.rs`
 //!   compares lazy and direct feeding.
+//! - **A work budget.** `vt100` gets the scanner's output, which bounds what one sequence can
+//!   ask of it (`scan.rs`); what is left is the work that is legitimately proportional to the
+//!   screen (clearing it, inserting lines), and a program can ask for that in a loop. Each chunk
+//!   costs what the scanner counted; the model may spend [`BUDGET_PER_BYTE`] cells per byte of
+//!   output, plus [`BUDGET_PER_SECOND`] (saved up to [`BUDGET_BURST`]). A chunk beyond that is
+//!   not fed: the model is [exhausted](super::Model::exhausted), and the session goes on
+//!   without one (protocol.md 7.8.7), its output untouched.
 
 use super::scan::{Action, Scanned, Scanner};
 use super::snapshot::{Capture, Cell, Color, Grid, Intensity, Line, Modes, Mouse, MouseEncoding, Pen};
-use super::{Model, SNAPSHOT_TAIL_LINES};
+use super::{Model, MODEL_MAX_CELLS, SNAPSHOT_TAIL_LINES};
+use std::time::Instant;
 
 /// The most output kept for lazy feeding: beyond, it is fed.
 const PENDING_MAX: usize = 256 * 1024;
+
+/// Work beyond the ordinary a model may do per byte of output, in cells (module documentation).
+pub const BUDGET_PER_BYTE: u64 = 64;
+/// … per second, whatever the output: 64 screens of the largest size (a few per cent of a
+/// core) …
+pub const BUDGET_PER_SECOND: u64 = 64 * MODEL_MAX_CELLS as u64;
+/// … saved up to this much.
+pub const BUDGET_BURST: u64 = 32 * MODEL_MAX_CELLS as u64;
+
+/// What a rebuild for a narrower screen costs per cell of the screens and per byte of their
+/// encoding, in cells: capturing a cell allocates its text, and every byte of the encoding is
+/// parsed again, each several times the work of moving a cell.
+const REBUILD_COST: u64 = 8;
+
+/// The work budget of one model (module documentation).
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Budget {
+    /// Cells that may be spent now.
+    balance: u64,
+    at: Instant,
+}
+
+impl Budget {
+    pub(super) fn new(now: Instant) -> Budget {
+        Budget {
+            balance: BUDGET_BURST,
+            at: now,
+        }
+    }
+
+    /// Spend `cost` on `bytes` of output at `now`: false if it exceeds the budget.
+    pub(super) fn spend(&mut self, now: Instant, bytes: usize, cost: u64) -> bool {
+        let saved = now.saturating_duration_since(self.at).as_secs_f64() * BUDGET_PER_SECOND as f64;
+        self.at = now;
+        self.balance = self.balance.saturating_add(saved as u64).min(BUDGET_BURST);
+        let available = self
+            .balance
+            .saturating_add((bytes as u64).saturating_mul(BUDGET_PER_BYTE));
+        match available.checked_sub(cost) {
+            Some(left) => {
+                self.balance = left;
+                true
+            }
+            None => false,
+        }
+    }
+}
 
 /// A screen model on the `vt100` crate.
 pub struct Vt100Model {
@@ -41,6 +96,12 @@ pub struct Vt100Model {
     carry: Vec<u8>,
     /// A resize to apply once the parser is between two sequences.
     pending_resize: Option<(u16, u16)>,
+    budget: Budget,
+    /// The budget was exceeded: nothing is fed any more.
+    exhausted: bool,
+    /// Bytes given to `vt100` for the output (the scanner's output), for the tests.
+    #[cfg(test)]
+    vt100_bytes: u64,
 }
 
 impl std::fmt::Debug for Vt100Model {
@@ -69,7 +130,7 @@ impl Vt100Model {
         let (cols, rows) = (cols.max(1), rows.max(1));
         Vt100Model {
             parser: vt100::Parser::new(rows, cols, SNAPSHOT_TAIL_LINES),
-            scan: Scanner::default(),
+            scan: Scanner::new(cols, rows),
             scanned: Scanned::default(),
             cols,
             rows,
@@ -78,6 +139,10 @@ impl Vt100Model {
             lazy: true,
             carry: Vec::new(),
             pending_resize: None,
+            budget: Budget::new(Instant::now()),
+            exhausted: false,
+            #[cfg(test)]
+            vt100_bytes: 0,
         }
     }
 
@@ -315,7 +380,7 @@ impl Model for Vt100Model {
     }
 
     fn held(&self) -> usize {
-        self.carry.len()
+        self.carry.len() + self.scan.held()
     }
 
     fn resize(&mut self, cols: u16, rows: u16) {
@@ -333,11 +398,49 @@ impl Model for Vt100Model {
     fn capture(&mut self, tail: usize) -> Capture {
         self.capture_now(tail)
     }
+
+    fn exhausted(&self) -> bool {
+        self.exhausted
+    }
+
+    #[cfg(test)]
+    fn vt100_bytes(&self) -> u64 {
+        self.vt100_bytes
+    }
+
+    /// What the encoding of the screen in use contains at least (`snapshot::encode` writes
+    /// each row from the default pen): the text of its characters (a byte for a wide one, which
+    /// may become a space), and 3 bytes (the shortest SGR) wherever a character's pen differs
+    /// from the previous character's in the row.
+    fn least_size(&mut self) -> usize {
+        self.flush();
+        let (cols, rows) = (self.cols, self.rows);
+        let screen = self.parser.screen();
+        let mut size = 0;
+        for row in 0..rows {
+            let mut pen = Pen::default();
+            for cell in (0..cols).filter_map(|col| screen.cell(row, col)) {
+                if !cell.has_contents() || cell.is_wide_continuation() {
+                    continue;
+                }
+                size += if cell.is_wide() { 1 } else { cell.contents().len() };
+                let this = cell_pen(cell);
+                if this != pen {
+                    size += 3;
+                    pen = this;
+                }
+            }
+        }
+        size
+    }
 }
 
 impl Vt100Model {
     /// Feed bytes that end on a character boundary.
     fn feed_whole(&mut self, bytes: &[u8]) -> u64 {
+        if self.exhausted {
+            return 0;
+        }
         if let Some((cols, rows)) = self.pending_resize {
             if self.scan.at_rest() {
                 self.resize_to(cols, rows);
@@ -346,6 +449,16 @@ impl Vt100Model {
         let at_rest = self.scan.at_rest();
         let mut scanned = std::mem::take(&mut self.scanned);
         self.scan.scan(bytes, &mut scanned);
+        if !self.budget.spend(Instant::now(), bytes.len(), scanned.cost) {
+            self.exhausted = true;
+            self.scanned = scanned;
+            return 0;
+        }
+        let bytes = &scanned.bytes[..];
+        #[cfg(test)]
+        {
+            self.vt100_bytes += bytes.len() as u64;
+        }
         let normal = !self.alternate_active() && self.regions[0] == self.full();
         let line_feeds = if self.lazy && scanned.simple && at_rest && normal {
             // Kept for later: only its end will be fed (module documentation)
@@ -392,6 +505,9 @@ impl Vt100Model {
     }
 
     fn resize_to(&mut self, cols: u16, rows: u16) {
+        if self.exhausted {
+            return;
+        }
         let (cols, rows) = (cols.max(1), rows.max(1));
         self.pending_resize = None;
         if (cols, rows) == (self.cols, self.rows) {
@@ -411,6 +527,7 @@ impl Vt100Model {
             return;
         }
         self.parser.screen_mut().set_size(rows, cols);
+        self.scan.set_size(cols, rows);
         // vt100's Grid::set_size, for both screens
         let old = self.rows;
         for region in self.regions.iter_mut() {
@@ -424,6 +541,13 @@ impl Vt100Model {
     /// (rows kept from the top, cells from the left, wrap flags dropped), the tail of the
     /// scrollback kept.
     fn rebuild(&mut self, cols: u16, rows: u16) {
+        // Its cost: a capture and an encoding of both screens (cells), then feeding the
+        // encoding to the new model (bytes, each a parse and often a cell); charged before each
+        let cells = u64::from(self.cols) * u64::from(self.rows) + u64::from(cols) * u64::from(rows);
+        if !self.budget.spend(Instant::now(), 0, REBUILD_COST * cells) {
+            self.exhausted = true;
+            return;
+        }
         let mut capture = self.capture_now(SNAPSHOT_TAIL_LINES);
         let old_rows = capture.rows;
         let cut_grid = |g: &mut Grid| {
@@ -454,12 +578,20 @@ impl Vt100Model {
         capture.rows = rows;
         let skip = capture.alternate.is_none() && !capture.tail.is_empty();
         let data = super::snapshot::encode(&capture, skip);
+        if !self.budget.spend(Instant::now(), 0, REBUILD_COST * data.len() as u64) {
+            self.exhausted = true;
+            return;
+        }
         let mut fresh = Vt100Model::new(cols, rows);
         fresh.lazy = false;
         fresh.feed_whole(&data);
-        fresh.scan.redraw = self.scan.redraw;
+        // The scanner follows the program's output, which goes on where it was (in the middle
+        // of a sequence, perhaps): the snapshot reproduced what it keeps
+        fresh.scan = std::mem::take(&mut self.scan);
+        fresh.scan.set_size(cols, rows);
         fresh.lazy = self.lazy;
         fresh.carry = std::mem::take(&mut self.carry);
+        fresh.budget = self.budget;
         *self = fresh;
     }
 

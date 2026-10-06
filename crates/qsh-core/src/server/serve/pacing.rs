@@ -7,6 +7,13 @@ use std::time::{Duration, Instant};
 
 /// The delivery-rate window: `T` is the best per-second average of its last this long.
 const RATE_WINDOW: Duration = Duration::from_secs(10);
+/// A delivery-rate sample spans at least this long, and at least a quarter of the minimum
+/// round trip time: ACKs that arrive together (coalesced by the path or the transport) are
+/// one sample, not a rate of gigabytes per second.
+const MIN_SAMPLE: Duration = Duration::from_millis(1);
+/// A sample counts at most this many times `T` (or the initial estimate): `T` can double
+/// per sample, not jump to whatever a burst of ACKs suggests.
+const MAX_GROWTH: f64 = 2.0;
 /// Before the first sample on the mux transports (TLS, ssh pipe): 1 MiB/s.
 pub(super) const INITIAL_RATE_MUX: f64 = 1024.0 * 1024.0;
 /// The window: at least this much on a tty session …
@@ -61,9 +68,9 @@ pub(super) fn window(rate: f64, rtt: Duration, pipe: bool) -> u64 {
 pub(super) struct Rate {
     /// Per second of samples: (start, bytes, time).
     buckets: VecDeque<(Instant, u64, Duration)>,
-    /// When the previous accepted ACK arrived.
-    last_ack: Option<Instant>,
-    /// Output was not waiting at some point since then: the next sample measures the
+    /// When the current sample started (an accepted ACK), and what was delivered in it since.
+    sample: Option<(Instant, u64)>,
+    /// Output was not waiting at some point during the current sample: it measures the
     /// program, not the path.
     limited: bool,
     /// `T` before the first sample.
@@ -74,7 +81,7 @@ impl Rate {
     pub(super) fn new(initial: f64) -> Rate {
         Rate {
             buckets: VecDeque::new(),
-            last_ack: None,
+            sample: None,
             limited: true,
             initial,
         }
@@ -86,18 +93,30 @@ impl Rate {
     }
 
     /// An ACK newly acknowledged `delivered` output offsets (skipped ones not counted);
-    /// `waiting`: output is waiting to be sent right now.
-    pub(super) fn ack(&mut self, now: Instant, delivered: u64, waiting: bool) {
-        if let Some(previous) = self.last_ack {
-            let time = now.saturating_duration_since(previous);
-            if !self.limited && !time.is_zero() {
-                match self.buckets.back_mut() {
-                    Some(b) if now.saturating_duration_since(b.0) < Duration::from_secs(1) => {
-                        b.1 += delivered;
-                        b.2 += time;
-                    }
-                    _ => self.buckets.push_back((now, delivered, time)),
+    /// `waiting`: output is waiting to be sent right now; `rtt`: the minimum round trip time.
+    /// The sample ends here if it spans at least `max(1 ms, rtt / 4)`; otherwise it goes on.
+    pub(super) fn ack(&mut self, now: Instant, delivered: u64, waiting: bool, rtt: Duration) {
+        let Some((start, before)) = self.sample else {
+            self.sample = Some((now, 0));
+            self.limited = !waiting;
+            return;
+        };
+        let delivered = before + delivered;
+        let time = now.saturating_duration_since(start);
+        if time < MIN_SAMPLE.max(rtt / 4) {
+            self.sample = Some((start, delivered));
+            self.limited |= !waiting;
+            return;
+        }
+        if !self.limited {
+            let most = (MAX_GROWTH * self.rate(now).max(self.initial) * time.as_secs_f64()) as u64;
+            let delivered = delivered.min(most);
+            match self.buckets.back_mut() {
+                Some(b) if now.saturating_duration_since(b.0) < Duration::from_secs(1) => {
+                    b.1 += delivered;
+                    b.2 += time;
                 }
+                _ => self.buckets.push_back((now, delivered, time)),
             }
         }
         while self
@@ -107,7 +126,7 @@ impl Rate {
         {
             self.buckets.pop_front();
         }
-        self.last_ack = Some(now);
+        self.sample = Some((now, 0));
         self.limited = !waiting;
     }
 
@@ -136,10 +155,28 @@ impl Rate {
 pub(super) enum Step {
     /// Send output as usual.
     Send,
-    /// Send no output until then (the program's reaction to input is awaited).
-    Hold(Instant),
+    /// Send no output until then (the program's reaction to input is awaited), or until the
+    /// snapshot in flight is acknowledged (None).
+    Hold(Option<Instant>),
     /// Take a skip snapshot now.
     Snapshot,
+}
+
+/// An attachment's output stream as the triggers see it (protocol.md 7.8.5).
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Stream {
+    /// `U`: output not acknowledged, skipped ranges not counted.
+    pub unacked: u64,
+    /// `B`: output not sent yet.
+    pub unsent: u64,
+    pub last_ack: u64,
+    /// The output's end.
+    pub end: u64,
+    /// `T`, and how much sampled time it rests on.
+    pub rate: f64,
+    pub sampled: Duration,
+    /// A snapshot is in flight (sent, not acknowledged): no other is sent before it is.
+    pub busy: bool,
 }
 
 /// The triggers of smart catch-up for one attachment (m2.md 6.4).
@@ -153,6 +190,9 @@ pub(super) struct Catchup {
     output: (Instant, u64),
     /// A resync snapshot is due once the attachment has sent everything (m2.md 6.5).
     pub(super) resync: bool,
+    /// No snapshot could be made of the output up to this offset: the backlog trigger waits
+    /// for more output (the attempt would only cost the same again).
+    failed: Option<u64>,
     quic: bool,
 }
 
@@ -163,6 +203,7 @@ impl Catchup {
             interrupt: None,
             output: (now, end),
             resync: false,
+            failed: None,
             quic,
         }
     }
@@ -188,42 +229,50 @@ impl Catchup {
         self.interrupt.is_some()
     }
 
-    /// What to do, with `unacked` output not acknowledged (`end − max(last_ack, gap_to)`),
-    /// `last_ack`, and the delivery rate with its sampled time.
-    pub(super) fn step(&self, now: Instant, unacked: u64, last_ack: u64, rate: f64, sampled: Duration) -> Step {
+    /// What to do with the output stream `s`. At most one snapshot is in flight: a trigger
+    /// that fires meanwhile waits for its acknowledgement (the input trigger holding the
+    /// output), so that one fresh snapshot follows instead of a stack of them.
+    pub(super) fn step(&self, now: Instant, s: &Stream) -> Step {
         if let Some(since) = self.interrupt {
             let settled = self.output.0 + SETTLE;
             let latest = since + SETTLE_MAX;
-            return if now >= settled || now >= latest {
-                Step::Snapshot
+            return if now < settled && now < latest {
+                Step::Hold(Some(settled.min(latest)))
+            } else if s.busy {
+                Step::Hold(None)
             } else {
-                Step::Hold(settled.min(latest))
+                Step::Snapshot
             };
         }
         let enough = if self.quic { SAMPLED_QUIC } else { SAMPLED_MUX };
-        let backlog = unacked > ((CATCHUP_AFTER.as_secs_f64() * rate) as u64).max(CATCHUP_MIN);
+        let backlog = s.unacked > ((CATCHUP_AFTER.as_secs_f64() * s.rate) as u64).max(CATCHUP_MIN);
         let rested = self
             .last
-            .is_none_or(|(at, offset)| last_ack >= offset && now.saturating_duration_since(at) >= HYSTERESIS);
-        if backlog && sampled >= enough && rested {
+            .is_none_or(|(at, offset)| s.last_ack >= offset && now.saturating_duration_since(at) >= HYSTERESIS);
+        // Something to skip, and something new since a snapshot could not be made
+        let new = s.unsent > 0 && self.failed.is_none_or(|f| s.end > f);
+        if backlog && s.sampled >= enough && rested && new && !s.busy {
             Step::Snapshot
         } else {
             Step::Send
         }
     }
 
-    /// A snapshot at `offset` was sent.
+    /// A snapshot at `offset` was sent (or an OUTPUT_GAP to `offset` instead).
     pub(super) fn taken(&mut self, now: Instant, offset: u64) {
         self.last = Some((now, offset));
         self.interrupt = None;
         self.resync = false;
+        self.failed = None;
     }
 
-    /// No snapshot could be taken (none fits, or the model is gone): give up on the input
-    /// trigger rather than hold output.
-    pub(super) fn abandon(&mut self) {
+    /// No snapshot could be taken of the output up to `end` (none fits, or the model is gone):
+    /// give up on the input trigger rather than hold output, and on the backlog trigger until
+    /// more output arrives.
+    pub(super) fn failed(&mut self, end: u64) {
         self.interrupt = None;
         self.resync = false;
+        self.failed = Some(end);
     }
 }
 

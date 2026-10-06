@@ -55,9 +55,11 @@ the document itself.
 
 ## Verifying releases
 
-Release assets are listed with their SHA-256 in `SHA256SUMS` and carry a build provenance
-attestation signed by the GitHub Actions workflow that built them:
+Release assets are listed with their SHA-256 in `SHA256SUMS`, which is signed with the qsh
+release key (minisign format, `SHA256SUMS.minisig`; key id 247743DF6C75BDD8), and carry a
+build provenance attestation signed by the GitHub Actions workflow that built them:
 
 ```sh
+minisign -Vm SHA256SUMS -P RWTYvXVs30N3JIE/A5TMPWUWD9ktnPZqQ6lSzYJahI7u5lpiPBCKWHlf
 gh attestation verify qsh-VERSION-TARGET.tar.gz --repo yzfly/qsh
 ```

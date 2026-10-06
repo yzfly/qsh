@@ -136,6 +136,9 @@ pub mod test_hooks {
         /// terminal for its cursor position) when the screen shows the marker. No panic: a
         /// server bug that only the client can see (protocol.md 7.8.4).
         Snapshot,
+        /// A session's screen model takes 3 s to process output that completes the marker (as
+        /// one would on output that is expensive to emulate), holding its lock meanwhile.
+        Stall,
     }
 
     static MARKERS: Mutex<Vec<(Hook, Vec<u8>)>> = Mutex::new(Vec::new());

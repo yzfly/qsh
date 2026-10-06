@@ -9,7 +9,10 @@ use clap::Parser;
 use qsh_cli::cli::{parse_ports, DaemonArgs, DoctorArgs, ServerArgs, ServerCommand, TuneArgs};
 use qsh_cli::doctor::{self, checks, report, tune};
 use qsh_core::config::{Config, ConfigPaths, ServerSettings};
-use qsh_core::server::{self, Daemon, DaemonLauncher, Reexec, Resume, ServerConfig, StartError, ON_DEMAND_IDLE_EXIT};
+use qsh_core::server::handoff::DaemonOptions;
+use qsh_core::server::{
+    self, Daemon, DaemonLauncher, Reexec, Resume, Resuming, ServerConfig, StartError, ON_DEMAND_IDLE_EXIT,
+};
 use qsh_core::{log, Paths};
 
 /// Print what is wrong with the configuration files, for people (`qsh-server status`).
@@ -47,6 +50,17 @@ fn server_settings(paths: &Paths) -> ServerSettings {
 }
 
 fn main() -> ExitCode {
+    // The new image of an upgrade in place: a frozen command line, recognized before anything
+    // else, and the fallback to the old image armed first (m2.md 10.3 step 5, 10.4)
+    let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    match Resume::from_args(&argv) {
+        Some(Ok(resume)) => return ExitCode::from(resume_daemon(resume)),
+        Some(Err(e)) => {
+            eprintln!("qsh-server: {e}");
+            return ExitCode::from(2);
+        }
+        None => {}
+    }
     let args = match ServerArgs::try_parse() {
         Ok(a) => a,
         Err(e) => {
@@ -179,8 +193,23 @@ fn doctor_user(sys: &dyn doctor::System) -> checks::User {
 }
 
 /// `qsh-server doctor` (m2.md 8.1, 8.2).
+/// The system doctor and tune look at: the real one, or (tests) a stand-in root whose only
+/// commands are stubs.
+fn host(root: Option<&std::path::Path>, commands: Option<&std::path::Path>) -> Result<doctor::system::Host, u8> {
+    match root {
+        None => Ok(doctor::system::Host::real()),
+        Some(root) => doctor::system::Host::stand_in(root, commands).map_err(|e| {
+            eprintln!("qsh-server: {}: {e}", root.display());
+            2
+        }),
+    }
+}
+
 async fn doctor_command(paths: &Paths, launcher: &DaemonLauncher, args: DoctorArgs) -> u8 {
-    let sys = doctor::system::Host::new(args.root.clone().unwrap_or_else(|| "/".into()));
+    let sys = match host(args.root.as_deref(), args.commands.as_deref()) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
     let (range, extra_ports) = match configured_ports(paths, args.ports.as_deref()) {
         Ok(p) => p,
         Err(code) => return code,
@@ -241,7 +270,10 @@ async fn doctor_command(paths: &Paths, launcher: &DaemonLauncher, args: DoctorAr
 /// `qsh-server tune` (m2.md 8.4).
 fn tune_command(args: TuneArgs) -> u8 {
     let paths = Paths::from_env();
-    let sys = doctor::system::Host::new(args.root.clone().unwrap_or_else(|| "/".into()));
+    let sys = match host(args.root.as_deref(), args.commands.as_deref()) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
     let (range, extra) = match configured_ports(&paths, args.ports.as_deref()) {
         Ok(p) => p,
         Err(code) => return code,
@@ -265,7 +297,9 @@ fn tune_command(args: TuneArgs) -> u8 {
             ports,
         },
     };
-    let needs_root = sys.is_real_root() && qsh_core::sys::euid() != 0;
+    // A stand-in root is the invoking user's own directory, changed with the user's own
+    // rights; its commands are stubs (security.md 4.9)
+    let needs_root = sys.is_real() && qsh_core::sys::euid() != 0;
     let mut ask = |question: &str| -> Option<bool> {
         use std::io::{BufRead, Write};
         let stdin = std::io::stdin();
@@ -416,37 +450,27 @@ async fn daemon(paths: Paths, mut launcher: DaemonLauncher, args: DaemonArgs) ->
     log_panics();
     let mut config = ServerConfig::new(paths.clone());
     server_settings(&paths).apply(&mut config);
-    // A daemon in a program of its own upgrades in place, giving the next image these options
-    // again (m2.md 10.3 step 5)
-    let mut own: Vec<std::ffi::OsString> = vec!["--foreground".into()];
-    if args.on_demand {
-        own.push("--on-demand".into());
-    }
-    if let Some(ports) = &args.ports {
-        own.extend(["--ports".into(), ports.into()]);
-    }
-    let mut reexec = Reexec::new(own);
-    // Test hook (feature test-hooks): how often to look for a replaced executable, in ms
-    if let Some(ms) = std::env::var("QSH_TEST_UPGRADE_CHECK_MS")
-        .ok()
-        .filter(|_| cfg!(feature = "test-hooks"))
-        .and_then(|ms| ms.parse::<u64>().ok())
-        .filter(|ms| *ms >= 10)
-    {
-        reexec.check_every = std::time::Duration::from_millis(ms);
-    }
-    config.reexec = Some(reexec);
     // The command line (or QSH_SERVER_PORTS through it) over the files
-    if let Some(text) = &args.ports {
-        match parse_ports(text) {
-            Some(range) => config.ports = range,
+    let ports = match &args.ports {
+        Some(text) => match parse_ports(text) {
+            Some(range) => Some((*range.start(), *range.end())),
             None => {
                 eprintln!("qsh-server: bad port range {text:?}; expected FIRST-LAST");
                 return 2;
             }
-        }
-    }
-    if !args.foreground && !args.resume {
+        },
+        None => None,
+    };
+    // A daemon in a program of its own upgrades in place, handing the next image these options
+    // in the state (m2.md 10.3 step 5)
+    apply_options(
+        &mut config,
+        DaemonOptions {
+            on_demand: args.on_demand,
+            ports,
+        },
+    );
+    if !args.foreground {
         if let Some(ports) = &args.ports {
             launcher.args.extend(["--ports".into(), ports.into()]);
         }
@@ -459,35 +483,81 @@ async fn daemon(paths: Paths, mut launcher: DaemonLauncher, args: DaemonArgs) ->
             }
         };
     }
-    if args.on_demand {
+    let result = Daemon::run_until(config, stop_signal()).await;
+    daemon_exit(result)
+}
+
+/// The daemon's options and the reexec of a daemon that is a program of its own.
+fn apply_options(config: &mut ServerConfig, options: DaemonOptions) {
+    if let Some((first, last)) = options.ports {
+        config.ports = first..=last;
+    }
+    if options.on_demand {
         config.idle_exit = Some(ON_DEMAND_IDLE_EXIT);
     }
-    // SIGTERM (service managers) and SIGINT stop the daemon as `qsh-server stop` does: every
-    // session is ended and each attached client gets its final message (protocol.md 7.13)
-    let stop = async {
-        use tokio::signal::unix::{signal, SignalKind};
-        match (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) {
-            (Ok(mut term), Ok(mut int)) => {
-                tokio::select! {
-                    _ = term.recv() => {}
-                    _ = int.recv() => {}
-                }
+    let mut reexec = Reexec::new(options);
+    // Test hook (feature test-hooks): how often to look for a replaced executable, in ms
+    if let Some(ms) = std::env::var("QSH_TEST_UPGRADE_CHECK_MS")
+        .ok()
+        .filter(|_| cfg!(feature = "test-hooks"))
+        .and_then(|ms| ms.parse::<u64>().ok())
+        .filter(|ms| *ms >= 10)
+    {
+        reexec.check_every = std::time::Duration::from_millis(ms);
+    }
+    config.reexec = Some(reexec);
+}
+
+/// `qsh-server handoff-resume …`: the new image of an upgrade in place (m2.md 10.3 steps 7 to
+/// 9). The fallback is armed before anything else; from then on every failure executes the
+/// old image again (Linux) instead of losing the sessions.
+fn resume_daemon(resume: Resume) -> u8 {
+    log::set_level(log::Level::Info);
+    log_panics();
+    let resuming = match Resuming::begin(resume) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("qsh-server: cannot resume: {e}");
+            return 1;
+        }
+    };
+    let paths = Paths::from_env();
+    let mut config = ServerConfig::new(paths.clone());
+    server_settings(&paths).apply(&mut config);
+    apply_options(&mut config, resuming.options());
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let e = resuming.fail(&format!("cannot start the async runtime: {e}"));
+            eprintln!("qsh-server: {e}");
+            return 1;
+        }
+    };
+    let code = runtime.block_on(async { daemon_exit(Daemon::resume_until(config, resuming, stop_signal()).await) });
+    runtime.shutdown_background();
+    code
+}
+
+/// SIGTERM (service managers) and SIGINT stop the daemon as `qsh-server stop` does: every
+/// session is ended and each attached client gets its final message (protocol.md 7.13).
+async fn stop_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    match (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) {
+        (Ok(mut term), Ok(mut int)) => {
+            tokio::select! {
+                _ = term.recv() => {}
+                _ = int.recv() => {}
             }
-            _ => std::future::pending::<()>().await,
         }
-    };
-    let result = match (args.resume, args.state_fd, args.key_fd) {
-        (true, Some(state_fd), Some(key_fd)) => {
-            let resume = Resume {
-                state_fd,
-                key_fd,
-                fallback_exe_fd: args.fallback_exe_fd,
-                fell_back: args.fell_back,
-            };
-            Daemon::resume_until(config, resume, stop).await
-        }
-        _ => Daemon::run_until(config, stop).await,
-    };
+        _ => std::future::pending::<()>().await,
+    }
+}
+
+fn daemon_exit(result: Result<(), StartError>) -> u8 {
     match result {
         Ok(()) => 0,
         Err(StartError::AlreadyRunning) => {

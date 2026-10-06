@@ -260,9 +260,40 @@ pub enum Remote {
     Error(String),
 }
 
+/// The most of the remote report's output read (the rest is dropped).
+pub const MAX_REMOTE_OUTPUT: u64 = 1 << 20;
+
+/// How long `qsh-server doctor --json --probe` over ssh may take, logins included.
+pub const REMOTE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The longest string of a remote report kept.
+const MAX_REMOTE_STRING: usize = 1024;
+
+/// Every string in `v`, made text only and bounded (security.md 4.6): the report is the
+/// server's, and its summaries, fixes and notes are printed on the user's terminal.
+fn sanitize_strings(v: &mut Value) {
+    match v {
+        Value::String(text) => *text = qsh_core::text::sanitize(text, MAX_REMOTE_STRING),
+        Value::Array(items) => items.iter_mut().for_each(sanitize_strings),
+        Value::Object(members) => {
+            let clean: serde_json::Map<String, Value> = std::mem::take(members)
+                .into_iter()
+                .map(|(k, mut v)| {
+                    sanitize_strings(&mut v);
+                    (qsh_core::text::sanitize(&k, 64), v)
+                })
+                .collect();
+            *members = clean;
+        }
+        _ => {}
+    }
+}
+
 /// Find the report in the output of the remote command: the last line that is a JSON object
-/// with `"doctor"` (login scripts may print before it).
+/// with `"doctor"` (login scripts may print before it). Every string of it, and of the
+/// errors made from ssh's output, is text only ([`qsh_core::text::sanitize`]).
 pub fn parse_remote(status: Option<i32>, stdout: &str, stderr: &str) -> Remote {
+    let stderr = qsh_core::text::sanitize(stderr.trim(), MAX_REMOTE_STRING);
     let report = stdout
         .lines()
         .rev()
@@ -273,36 +304,35 @@ pub fn parse_remote(status: Option<i32>, stdout: &str, stderr: &str) -> Remote {
                 .ok()
                 .filter(|v| v.get("doctor").is_some())
         });
-    if let Some(r) = report {
+    if let Some(mut r) = report {
+        sanitize_strings(&mut r);
         return Remote::Report(r);
     }
     match status {
         Some(42) | Some(127) => Remote::NoServer,
         Some(2) if stderr.contains("doctor") || stderr.contains("unrecognized subcommand") => Remote::Old,
         Some(126) => Remote::Error("qsh-server on the host cannot be executed (another architecture?)".into()),
-        Some(255) => Remote::Error(format!("ssh failed: {}", stderr.trim())),
-        Some(s) => Remote::Error(format!("qsh-server doctor exited with status {s}: {}", stderr.trim())),
+        Some(255) => Remote::Error(format!("ssh failed: {stderr}")),
+        Some(s) => Remote::Error(format!("qsh-server doctor exited with status {s}: {stderr}")),
         None => Remote::Error("ssh was killed".into()),
     }
 }
 
+/// `qsh-server doctor --json --probe` over ssh, within [`REMOTE_TIMEOUT`] and
+/// [`MAX_REMOTE_OUTPUT`] bytes.
 async fn remote_report(config: &ClientConfig, interactive: bool) -> Remote {
     let ssh = config.ssh.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let mut cmd = ssh.one_off(&ssh.remote_command("doctor --json --probe"), !interactive);
-        cmd.stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        cmd.output()
+        let cmd = ssh.one_off(&ssh.remote_command("doctor --json --probe"), !interactive);
+        super::system::run_capped(cmd, REMOTE_TIMEOUT, MAX_REMOTE_OUTPUT, 64 << 10)
     })
     .await;
     match result {
-        Ok(Ok(out)) => parse_remote(
-            out.status.code(),
-            &String::from_utf8_lossy(&out.stdout),
-            &String::from_utf8_lossy(&out.stderr),
-        ),
-        Ok(Err(e)) => Remote::Error(format!("cannot run ssh: {e}")),
+        Ok(Some(out)) if out.status == -1 => Remote::Error(format!(
+            "qsh-server doctor over ssh gave no report within {REMOTE_TIMEOUT:?}"
+        )),
+        Ok(Some(out)) => parse_remote(Some(out.status), &out.stdout, &out.stderr),
+        Ok(None) => Remote::Error("cannot run ssh".into()),
         Err(e) => Remote::Error(e.to_string()),
     }
 }
@@ -494,13 +524,48 @@ fn target_of(config: &ClientConfig, host: &str, report: &Value) -> Option<Target
     })
 }
 
-/// Probe every transport and port of `target` (when there is one) and the ssh pipe, at once.
+/// The most QUIC and TLS probes open at once. Each is an unauthenticated connection for about
+/// 3 s, and the daemon admits at most `MAX_PREAUTH_PER_SOURCE` (8) of those per source address
+/// (protocol.md 6.6): more would be refused by the daemon's own limit, and recorded as the
+/// network blocking the transport (review M5). Two stay free for a real client of the same
+/// address meanwhile.
+pub const PROBES_AT_ONCE: usize = qsh_core::proto::limits::MAX_PREAUTH_PER_SOURCE - 2;
+const _: () = assert!(PROBES_AT_ONCE >= 1 && PROBES_AT_ONCE < qsh_core::proto::limits::MAX_PREAUTH_PER_SOURCE);
+
+/// Run `jobs` with at most `at_once` of them at a time; their results in the order given.
+pub async fn at_most<T: Send + 'static>(
+    jobs: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send>>>,
+    at_once: usize,
+) -> Vec<T> {
+    let permits = Arc::new(tokio::sync::Semaphore::new(at_once.max(1)));
+    let tasks: Vec<_> = jobs
+        .into_iter()
+        .map(|job| {
+            let permits = permits.clone();
+            tokio::spawn(async move {
+                let _permit = permits.acquire_owned().await;
+                job.await
+            })
+        })
+        .collect();
+    let mut out = Vec::new();
+    for t in tasks {
+        if let Ok(v) = t.await {
+            out.push(v);
+        }
+    }
+    out
+}
+
+/// Probe every transport and port of `target` (when there is one), at most
+/// [`PROBES_AT_ONCE`] at a time, and the ssh pipe meanwhile.
 async fn probe_all(target: Option<&Target>, config: &ClientConfig) -> Vec<Probe> {
-    let mut tasks = Vec::new();
+    type Job = std::pin::Pin<Box<dyn std::future::Future<Output = Probe> + Send>>;
+    let mut jobs: Vec<Job> = Vec::new();
     if let Some(t) = target {
         let client = Arc::new(QuicClient::new());
         for port in t.candidates(Transport::Quic, None) {
-            tasks.push(tokio::spawn(probe_quic(
+            jobs.push(Box::pin(probe_quic(
                 client.clone(),
                 t.host.clone(),
                 port,
@@ -508,15 +573,13 @@ async fn probe_all(target: Option<&Target>, config: &ClientConfig) -> Vec<Probe>
             )));
         }
         for port in t.candidates(Transport::Tls, None) {
-            tasks.push(tokio::spawn(probe_tls(t.host.clone(), port, t.fingerprint)));
+            jobs.push(Box::pin(probe_tls(t.host.clone(), port, t.fingerprint)));
         }
     }
-    tasks.push(tokio::spawn(probe_pipe(config.ssh.clone())));
-    let mut probes = Vec::new();
-    for t in tasks {
-        if let Ok(p) = t.await {
-            probes.push(p);
-        }
+    let pipe = tokio::spawn(probe_pipe(config.ssh.clone()));
+    let mut probes = at_most(jobs, PROBES_AT_ONCE).await;
+    if let Ok(p) = pipe.await {
+        probes.push(p);
     }
     probes
 }
@@ -989,24 +1052,23 @@ pub async fn run(config: Option<ClientConfig>, opts: Options) -> i32 {
     code
 }
 
+/// The remote program of `qsh doctor HOST --tune`: the discovery of protocol.md 10.2, but
+/// sudo runs only a qsh-server that root owns and nobody else can change, in directories
+/// nobody else can change (review L2: `~/.local/bin/qsh-server` is the user's to replace, and
+/// sudo would run it as root). Its real path is what sudo runs. Exit 42: no qsh-server; 43:
+/// one that is not installed for root (it says how to install it).
+pub const TUNE_REMOTE: &str = "sh -c 'safe() { set -- $(ls -lnd -- \"$1\" 2>/dev/null); case \"$1\" in ?????w*|????????w*) return 1;; esac; [ \"$3\" = 0 ]; }; for p in \"$(command -v qsh-server)\" \"$HOME/.local/bin/qsh-server\"; do [ -n \"$p\" ] && [ -x \"$p\" ] || continue; r=$(readlink -f -- \"$p\") || continue; d=$r; ok=1; while :; do safe \"$d\" || { ok=0; break; }; [ \"$d\" = / ] && break; d=$(dirname -- \"$d\"); done; if [ $ok = 1 ]; then exec sudo -- \"$r\" tune --apply; fi; echo \"qsh: $p is not owned by root, or root does not own a directory above it: sudo does not run it\" >&2; echo \"qsh: install qsh-server for the whole system (a package, or the install script as root), then: sudo qsh-server tune --apply\" >&2; exit 43; done; exit 42'";
+
 /// `ssh -t HOST sudo qsh-server tune --apply`, in front of the user: the plan, the
-/// confirmation and sudo's password prompt happen on this terminal (security.md 4.9).
+/// confirmation and sudo's password prompt happen on this terminal (security.md 4.9). With
+/// the forwarding options of every ssh qsh runs (security.md 4.6).
 fn tune_over_ssh(config: &ClientConfig) -> i32 {
     let ssh = &config.ssh;
-    // The discovery command of protocol.md 10.2, with sudo in front of the program found
-    // (sudo's secure_path does not contain ~/.local/bin)
-    let remote = "sh -c 'for p in \"$(command -v qsh-server)\" \"$HOME/.local/bin/qsh-server\"; do if [ -n \"$p\" ] && [ -x \"$p\" ]; then exec sudo \"$p\" tune --apply; fi; done; exit 42'";
     eprintln!(
         "\nqsh: running sudo qsh-server tune --apply on {} (ssh -t): it shows its plan and asks before changing anything",
         ssh.destination
     );
-    let status = std::process::Command::new(&ssh.program)
-        .arg("-t")
-        .args(&ssh.options)
-        .arg("--")
-        .arg(&ssh.destination)
-        .arg(remote)
-        .status();
+    let status = ssh.with_terminal(TUNE_REMOTE).status();
     match status {
         Ok(s) => s.code().unwrap_or(qsh_core::client::EXIT_ERROR),
         Err(e) => {

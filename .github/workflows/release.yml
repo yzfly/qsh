@@ -8,7 +8,7 @@
 # Assets of release vX.Y.Z:
 #   qsh-X.Y.Z-<target>.tar.gz   qsh-X.Y.Z-<target>/{qsh, qsh-server, LICENSE-*, README.md, man/, completions/}
 #   qsh_X.Y.Z-1_{amd64,arm64}.deb, qsh-X.Y.Z-1.{x86_64,aarch64}.rpm, qsh_X.Y.Z-r1_{x86_64,aarch64}.apk
-#   install.sh, SHA256SUMS
+#   install.sh, SHA256SUMS, SHA256SUMS.minisig (the release key's signature of SHA256SUMS)
 # scripts/install.sh depends on these names.
 name: Release
 
@@ -95,7 +95,8 @@ jobs:
           curl -fsSL https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}/install.sh | sh -s -- --version ${VERSION}
           \`\`\`
 
-          Verify a download: \`sha256sum -c SHA256SUMS --ignore-missing\`, and its build provenance:
+          Verify a download: \`minisign -Vm SHA256SUMS -P RWTYvXVs30N3JIE/A5TMPWUWD9ktnPZqQ6lSzYJahI7u5lpiPBCKWHlf\`,
+          then \`sha256sum -c SHA256SUMS --ignore-missing\`, and its build provenance:
           \`gh attestation verify qsh-${VERSION}-x86_64-unknown-linux-musl.tar.gz --repo ${GITHUB_REPOSITORY}\`.
           EOF
           cat extras/notes.md
@@ -298,6 +299,31 @@ jobs:
           mv ../SHA256SUMS SHA256SUMS
           cat SHA256SUMS
           sha256sum -c SHA256SUMS
+
+      # The qsh release key signs SHA256SUMS in the minisign format (docs/security.md section 8);
+      # qsh install and install.sh check it against the public key compiled into qsh. The secret
+      # key is the repository secret QSH_MINISIGN_KEY (an unencrypted minisign secret key file,
+      # as scripts/sign-release.py keygen writes it). A release is refused without it; a
+      # development build is left unsigned.
+      - name: Sign SHA256SUMS
+        env:
+          QSH_MINISIGN_KEY: ${{ secrets.QSH_MINISIGN_KEY }}
+          PUBLISH: ${{ needs.prepare.outputs.publish }}
+        run: |
+          if [[ -z "$QSH_MINISIGN_KEY" ]]; then
+            if [[ "$PUBLISH" == true ]]; then
+              echo "::error::the repository secret QSH_MINISIGN_KEY is not set; a release must be signed"
+              exit 1
+            fi
+            echo "::warning::QSH_MINISIGN_KEY is not set: SHA256SUMS is not signed (development build)"
+            exit 0
+          fi
+          umask 077
+          key="$RUNNER_TEMP/qsh-release.key"
+          printf '%s\n' "$QSH_MINISIGN_KEY" > "$key"
+          python3 -I scripts/sign-release.py sign "$key" dist/SHA256SUMS "qsh $VERSION SHA256SUMS"
+          rm -f "$key"
+          cat dist/SHA256SUMS.minisig
 
       - uses: actions/upload-artifact@v7
         with:

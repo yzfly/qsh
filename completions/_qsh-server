@@ -47,13 +47,8 @@ _arguments "${_arguments_options[@]}" : \
 (daemon)
 _arguments "${_arguments_options[@]}" : \
 '--ports=[Ports to try, FIRST-LAST; the first free on both UDP and TCP is used]:FIRST-LAST:_default' \
-'--state-fd=[The descriptor of the sealed state (with --resume)]:FD:_default' \
-'--key-fd=[The descriptor of the pipe with the state'\''s key (with --resume)]:FD:_default' \
-'--fallback-exe-fd=[The descriptor of the previous program, run again if resuming fails (with --resume)]:FD:_default' \
 '--foreground[Stay in the foreground (for service managers); otherwise start in the background]' \
 '--on-demand[Exit after an hour without sessions (set when started on demand)]' \
-'--resume[Resume from the state an older image of this daemon handed over (an upgrade in place)]' \
-'--fell-back[The new program could not resume; this is the previous one again (with --resume)]' \
 '*-v[Log more (repeat for more)]' \
 '-h[Print help]' \
 '--help[Print help]' \
@@ -85,7 +80,8 @@ _arguments "${_arguments_options[@]}" : \
 (doctor)
 _arguments "${_arguments_options[@]}" : \
 '--ports=[The ports to check and open, FIRST-LAST (default\: the configured range)]:FIRST-LAST:_default' \
-'--root=[Read /etc, /proc, /sys and /var under DIR instead of / (tests and image builds)]:DIR:_files' \
+'--root=[Tests only\: read /etc, /proc, /sys and /var under DIR instead of /, without following symbolic links; no command of the host runs (see --commands)]:DIR:_files' \
+'--commands=[Tests only, with --root\: the stub programs that stand in for the host'\''s commands]:DIR:_files' \
 '--json[Print JSON (schema version 1, stable check ids; see qsh-server(1))]' \
 '--probe[Start the daemon if it does not run, and report its ports and certificate (what qsh doctor HOST runs)]' \
 '*-v[Log more (repeat for more)]' \
@@ -97,7 +93,8 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 '--allow-low-ports=[Let every user bind ports from PORT up (ip_unprivileged_port_start; single-user hosts only)]:PORT:_default' \
 '--ports=[The ports to open, FIRST-LAST (default\: the configured range and extra ports)]:FIRST-LAST:_default' \
-'--root=[Read and change /etc, /proc/sys and /var under DIR instead of / (tests and image builds; no root needed)]:DIR:_files' \
+'--root=[Tests only\: read and change /etc, /proc/sys and /var under DIR instead of /, without following symbolic links; no command of the host runs (see --commands)]:DIR:_files' \
+'--commands=[Tests only, with --root\: the stub programs that stand in for the host'\''s commands]:DIR:_files' \
 '(--revert)--apply[Make the changes (root; asks first)]' \
 '--revert[Undo what tune changed, as recorded in /var/lib/qsh/tune.json (root; asks first)]' \
 '-y[Do not ask (scripts)]' \

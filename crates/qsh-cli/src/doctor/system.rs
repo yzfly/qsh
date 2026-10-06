@@ -1,7 +1,7 @@
 //! What doctor reads and tune changes, behind one trait: files (under a root directory that
 //! stands for `/`), commands, the environment and a few system calls. [`Host`] is the real
-//! one; the tests use fixture trees (`fixtures.rs`) and temporary roots with stub
-//! commands on `PATH`.
+//! one; the tests use fixture trees (`fixtures.rs`) and temporary roots with a directory of
+//! stub commands (`--root DIR --commands DIR`).
 
 use std::io::{self, Read};
 use std::net::IpAddr;
@@ -49,6 +49,8 @@ pub enum Bind {
 pub struct Meta {
     /// Owner.
     pub uid: u32,
+    /// Group.
+    pub gid: u32,
     /// Permission bits (`0o7777`).
     pub mode: u32,
     /// A directory (not through a symbolic link).
@@ -84,40 +86,69 @@ pub trait System {
     /// The source address of the IPv4 default route (no packet is sent).
     fn source_v4(&self) -> Option<IpAddr>;
 
-    /// Write `content` to `path` with `mode`: a temporary file next to it, then renamed.
-    fn write(&self, path: &str, content: &[u8], mode: u32) -> io::Result<()>;
+    /// Write `content` to `path` with `mode` and, when given, `owner` (uid, gid): a temporary
+    /// file next to it, then renamed. A symbolic link is never followed.
+    fn write(&self, path: &str, content: &[u8], mode: u32, owner: Option<(u32, u32)>) -> io::Result<()>;
     /// Overwrite an existing file in place (a sysctl under /proc/sys).
     fn set(&self, path: &str, content: &str) -> io::Result<()>;
     /// Remove a file.
     fn remove(&self, path: &str) -> io::Result<()>;
-    /// Create a directory (not its parents) with mode 0755.
-    fn mkdir(&self, path: &str) -> io::Result<()>;
+    /// Create a directory (not its parents) with `mode`.
+    fn mkdir(&self, path: &str, mode: u32) -> io::Result<()>;
     /// Remove an empty directory.
     fn rmdir(&self, path: &str) -> io::Result<()>;
 }
 
-/// The real system, or a directory standing in for `/` (`--root`). Files are read and written
-/// under the root; commands, the environment and the system calls are the host's.
-#[derive(Debug, Clone)]
+/// The `PATH` commands are looked up in when doctor or tune runs as root: the system's
+/// directories only, never the one of whoever ran sudo (security.md 4.9).
+pub const ROOT_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
+
+/// The real system, or a directory standing in for `/` (`--root DIR`, tests only).
+///
+/// On the real system files are read as their paths say (`/etc/os-release` is often a link),
+/// while everything tune changes is reached without following a symbolic link (an `openat`
+/// walk, [`qsh_core::sys::Beneath`]). Commands are looked up in [`ROOT_PATH`] when running as
+/// root, in the inherited `PATH` otherwise.
+///
+/// Under a stand-in root every file is reached without following any link and nothing can
+/// lead outside it; and no command of the host runs: only the stub programs of the
+/// `commands` directory, by name. Without one, no command runs at all.
+#[derive(Debug)]
 pub struct Host {
     root: PathBuf,
+    beneath: Option<qsh_core::sys::Beneath>,
+    commands: Option<PathBuf>,
 }
 
 impl Default for Host {
     fn default() -> Self {
-        Host::new("/")
+        Host::real()
     }
 }
 
 impl Host {
-    /// The system whose `/` is `root`.
-    pub fn new(root: impl Into<PathBuf>) -> Host {
-        Host { root: root.into() }
+    /// The real system.
+    pub fn real() -> Host {
+        Host {
+            root: PathBuf::from("/"),
+            beneath: qsh_core::sys::Beneath::open(Path::new("/")).ok(),
+            commands: None,
+        }
     }
 
-    /// True when the root is the real `/`.
-    pub fn is_real_root(&self) -> bool {
-        self.root.canonicalize().map(|p| p == Path::new("/")).unwrap_or(false)
+    /// The system whose `/` is the directory `root`, with the stub programs of `commands` as
+    /// its only commands (tests).
+    pub fn stand_in(root: &Path, commands: Option<&Path>) -> io::Result<Host> {
+        Ok(Host {
+            root: root.to_path_buf(),
+            beneath: Some(qsh_core::sys::Beneath::open(root)?),
+            commands: commands.map(Path::to_path_buf),
+        })
+    }
+
+    /// True when this is the real system.
+    pub fn is_real(&self) -> bool {
+        self.root == Path::new("/")
     }
 
     /// The root directory.
@@ -125,20 +156,47 @@ impl Host {
         &self.root
     }
 
-    /// Where `path` of the system is on this host.
-    pub fn path(&self, path: &str) -> PathBuf {
-        if self.root == Path::new("/") {
-            PathBuf::from(path)
-        } else {
-            self.root.join(path.trim_start_matches('/'))
+    fn beneath(&self) -> io::Result<&qsh_core::sys::Beneath> {
+        self.beneath
+            .as_ref()
+            .ok_or_else(|| io::Error::other(format!("cannot open {}", self.root.display())))
+    }
+
+    /// The program to run for `program`, and the `PATH` it gets; None when there is none.
+    fn program(&self, program: &str) -> Option<(PathBuf, Option<String>)> {
+        if program.is_empty() || program.contains('/') {
+            return None;
         }
+        if !self.is_real() {
+            let dir = self.commands.as_ref()?;
+            let path = dir.join(program);
+            return path
+                .is_file()
+                .then(|| (path, Some(format!("{}:{ROOT_PATH}", dir.display()))));
+        }
+        if qsh_core::sys::euid() != 0 {
+            return Some((PathBuf::from(program), None));
+        }
+        ROOT_PATH
+            .split(':')
+            .map(|d| Path::new(d).join(program))
+            .find(|p| p.is_file())
+            .map(|p| (p, Some(ROOT_PATH.to_string())))
     }
 }
 
 /// Run a command with a timeout; None when it cannot be started.
 pub fn run_command(program: &str, args: &[&str], timeout: Duration) -> Option<Output> {
-    let mut child = Command::new(program)
-        .args(args)
+    let mut command = Command::new(program);
+    command.args(args);
+    run_capped(command, timeout, 16 << 20, 1 << 20)
+}
+
+/// Run `command` (stdin closed, `LC_ALL=C`) for at most `timeout`, keeping at most `out_limit`
+/// bytes of its standard output and `err_limit` of its standard error (the rest is read and
+/// dropped, so that it never blocks on a full pipe). None when it cannot be started.
+pub fn run_capped(mut command: Command, timeout: Duration, out_limit: u64, err_limit: u64) -> Option<Output> {
+    let mut child = command
         .env("LC_ALL", "C")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -146,15 +204,16 @@ pub fn run_command(program: &str, args: &[&str], timeout: Duration) -> Option<Ou
         .spawn()
         .ok()?;
     // Read both pipes on threads: a full pipe would block the command forever
-    fn reader(pipe: impl io::Read + Send + 'static, limit: u64) -> std::thread::JoinHandle<String> {
+    fn reader(mut pipe: impl io::Read + Send + 'static, limit: u64) -> std::thread::JoinHandle<String> {
         std::thread::spawn(move || {
             let mut text = Vec::new();
-            let _ = pipe.take(limit).read_to_end(&mut text);
+            let _ = (&mut pipe).take(limit).read_to_end(&mut text);
+            let _ = io::copy(&mut pipe, &mut io::sink());
             String::from_utf8_lossy(&text).into_owned()
         })
     }
-    let out_thread = reader(child.stdout.take()?, 16 << 20);
-    let err_thread = reader(child.stderr.take()?, 1 << 20);
+    let out_thread = reader(child.stdout.take()?, out_limit);
+    let err_thread = reader(child.stderr.take()?, err_limit);
     let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
@@ -174,41 +233,75 @@ pub fn run_command(program: &str, args: &[&str], timeout: Duration) -> Option<Ou
     })
 }
 
+/// Most bytes doctor reads of one file.
+const READ_LIMIT: u64 = 16 << 20;
+
 impl System for Host {
     fn read(&self, path: &str) -> Option<String> {
-        let bytes = std::fs::read(self.path(path)).ok()?;
+        let bytes = if self.is_real() {
+            let mut bytes = Vec::new();
+            std::fs::File::open(path)
+                .ok()?
+                .take(READ_LIMIT)
+                .read_to_end(&mut bytes)
+                .ok()?;
+            bytes
+        } else {
+            self.beneath().ok()?.read(path, READ_LIMIT).ok()?
+        };
         Some(String::from_utf8_lossy(&bytes).into_owned())
     }
 
     fn exists(&self, path: &str) -> bool {
-        std::fs::symlink_metadata(self.path(path)).is_ok()
+        self.meta(path).is_some()
     }
 
     fn list(&self, dir: &str) -> Vec<String> {
-        let mut names: Vec<String> = std::fs::read_dir(self.path(dir))
-            .map(|entries| {
-                entries
-                    .filter_map(|e| Some(e.ok()?.file_name().to_string_lossy().into_owned()))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let mut names: Vec<String> = if self.is_real() {
+            std::fs::read_dir(dir)
+                .map(|entries| {
+                    entries
+                        .filter_map(|e| Some(e.ok()?.file_name().to_string_lossy().into_owned()))
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            self.beneath().and_then(|b| b.list(dir)).unwrap_or_default()
+        };
         names.sort();
         names
     }
 
     fn meta(&self, path: &str) -> Option<Meta> {
         use std::os::unix::fs::MetadataExt;
-        let m = std::fs::symlink_metadata(self.path(path)).ok()?;
+        if self.is_real() {
+            let m = std::fs::symlink_metadata(path).ok()?;
+            return Some(Meta {
+                uid: m.uid(),
+                gid: m.gid(),
+                mode: m.mode() & 0o7777,
+                dir: m.is_dir(),
+                symlink: m.file_type().is_symlink(),
+            });
+        }
+        let st = self.beneath().ok()?.stat(path).ok()?;
         Some(Meta {
-            uid: m.uid(),
-            mode: m.mode() & 0o7777,
-            dir: m.is_dir(),
-            symlink: m.file_type().is_symlink(),
+            uid: st.uid,
+            gid: st.gid,
+            mode: st.mode & 0o7777,
+            dir: st.is_dir(),
+            symlink: st.is_symlink(),
         })
     }
 
     fn run(&self, program: &str, args: &[&str]) -> Option<Output> {
-        run_command(program, args, COMMAND_TIMEOUT)
+        let (path, search) = self.program(program)?;
+        let mut command = Command::new(path);
+        command.args(args);
+        if let Some(search) = search {
+            command.env("PATH", search);
+        }
+        run_capped(command, COMMAND_TIMEOUT, 16 << 20, 1 << 20)
     }
 
     fn env(&self, name: &str) -> Option<String> {
@@ -251,54 +344,23 @@ impl System for Host {
         qsh_core::netwatch::NetSnapshot::take().ipv4.map(|r| r.source)
     }
 
-    fn write(&self, path: &str, content: &[u8], mode: u32) -> io::Result<()> {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let target = self.path(path);
-        let name = target
-            .file_name()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no file name"))?
-            .to_string_lossy()
-            .into_owned();
-        let tmp = target.with_file_name(format!(".{name}.qsh-tune-{}", std::process::id()));
-        let _ = std::fs::remove_file(&tmp);
-        let result = (|| {
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(mode)
-                .open(&tmp)?;
-            file.write_all(content)?;
-            file.sync_all()?;
-            // The umask may have taken bits away
-            std::fs::set_permissions(&tmp, std::os::unix::fs::PermissionsExt::from_mode(mode))?;
-            std::fs::rename(&tmp, &target)
-        })();
-        if result.is_err() {
-            let _ = std::fs::remove_file(&tmp);
-        }
-        result
+    fn write(&self, path: &str, content: &[u8], mode: u32, owner: Option<(u32, u32)>) -> io::Result<()> {
+        self.beneath()?.write(path, content, mode, owner)
     }
 
     fn set(&self, path: &str, content: &str) -> io::Result<()> {
-        use std::io::Write;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(self.path(path))?;
-        file.write_all(content.as_bytes())
+        self.beneath()?.set(path, content.as_bytes())
     }
 
     fn remove(&self, path: &str) -> io::Result<()> {
-        std::fs::remove_file(self.path(path))
+        self.beneath()?.remove(path)
     }
 
-    fn mkdir(&self, path: &str) -> io::Result<()> {
-        use std::os::unix::fs::DirBuilderExt;
-        std::fs::DirBuilder::new().mode(0o755).create(self.path(path))
+    fn mkdir(&self, path: &str, mode: u32) -> io::Result<()> {
+        self.beneath()?.mkdir(path, mode)
     }
 
     fn rmdir(&self, path: &str) -> io::Result<()> {
-        std::fs::remove_dir(self.path(path))
+        self.beneath()?.rmdir(path)
     }
 }

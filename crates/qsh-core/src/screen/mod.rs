@@ -64,6 +64,20 @@ pub trait Model: Send {
     fn alternate(&self) -> bool;
     /// Everything a snapshot reproduces, with up to `tail` lines of scrollback.
     fn capture(&mut self, tail: usize) -> Capture;
+    /// The model refused output that would cost it more work than it may do (`model.rs`): its
+    /// state no longer follows the output.
+    fn exhausted(&self) -> bool {
+        false
+    }
+    /// Bytes given to the emulator so far, for the tests.
+    #[cfg(test)]
+    fn vt100_bytes(&self) -> u64 {
+        0
+    }
+    /// A lower bound of the size of a snapshot (the text it shows), cheaper than capturing.
+    fn least_size(&mut self) -> usize {
+        0
+    }
 }
 
 /// Chunks remembered for [`Live::lines_since`].
@@ -102,6 +116,23 @@ pub struct Live {
     line_feeds: u64,
     /// (end offset, line feeds) after each chunk.
     checkpoints: VecDeque<(u64, u64)>,
+    /// Resizes at output offsets the model has not been fed up to yet: (offset, columns, rows).
+    resizes: VecDeque<(u64, u16, u16)>,
+}
+
+/// Resizes waiting for the model's output to reach them, at most (the newest replaces the
+/// last beyond).
+const PENDING_RESIZES: usize = 16;
+
+/// Why [`Live::snapshot_from`] gave no snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unavailable {
+    /// The model has not been fed up to the offset yet (the reader thread is on its way): try
+    /// again after the output that is coming.
+    Behind,
+    /// None can be made at or after the offset: no model, beyond `MAX_SNAPSHOT`, the model
+    /// stands before it (in the middle of a sequence), or the model failed now.
+    Never,
 }
 
 impl std::fmt::Debug for Live {
@@ -124,6 +155,7 @@ impl Live {
             end: None,
             line_feeds: 0,
             checkpoints: VecDeque::new(),
+            resizes: VecDeque::new(),
         };
         if fits(cols, rows) {
             match fault::contain(|| Box::new(Vt100Model::new(cols, rows)) as Box<dyn Model>) {
@@ -185,6 +217,15 @@ impl Live {
         ));
     }
 
+    /// The model exceeded its work budget: drop it, as after a fault.
+    fn over_budget(&mut self) {
+        self.stop();
+        let name = if self.name.is_empty() { "?" } else { &self.name };
+        log::info(format_args!(
+            "session {name}: the output asked more work of the screen model than it may do; no snapshots for this session from now on"
+        ));
+    }
+
     /// No model any more (its output is not fed to it any more): no snapshots, silently.
     pub fn stop(&mut self) {
         let model = self.model.take();
@@ -192,8 +233,35 @@ impl Live {
     }
 
     /// Output entered the buffer at `offset`. Bytes before what was fed already are skipped
-    /// (installing the sink replays the buffer).
-    pub fn feed(&mut self, offset: u64, bytes: &[u8]) {
+    /// (installing the sink replays the buffer). Resizes waiting for an offset within it
+    /// ([`Live::resize_at`]) are applied there.
+    pub fn feed(&mut self, mut offset: u64, mut bytes: &[u8]) {
+        loop {
+            self.apply_resizes();
+            let Some(&(at, ..)) = self.resizes.front() else { break };
+            if at <= offset || at >= offset + bytes.len() as u64 {
+                break;
+            }
+            let (now, later) = bytes.split_at((at - offset) as usize);
+            self.feed_part(offset, now);
+            (offset, bytes) = (at, later);
+        }
+        self.feed_part(offset, bytes);
+        self.apply_resizes();
+    }
+
+    /// The resizes the model's output has reached.
+    fn apply_resizes(&mut self) {
+        while let Some(&(at, cols, rows)) = self.resizes.front() {
+            if self.model.is_some() && self.end.is_some_and(|end| end < at) {
+                return;
+            }
+            self.resizes.pop_front();
+            self.resize(cols, rows);
+        }
+    }
+
+    fn feed_part(&mut self, offset: u64, bytes: &[u8]) {
         self.contain("on output", |live| {
             let skip = live.end.map_or(0, |end| end.saturating_sub(offset));
             let bytes = usize::try_from(skip).ok().and_then(|s| bytes.get(s..))?;
@@ -203,7 +271,12 @@ impl Live {
             if live.end.is_none() {
                 live.checkpoints.push_back((offset, 0));
             }
-            live.line_feeds += live.model.as_mut()?.feed(bytes);
+            let model = live.model.as_mut()?;
+            live.line_feeds += model.feed(bytes);
+            if model.exhausted() {
+                live.over_budget();
+                return None;
+            }
             let end = offset + skip + bytes.len() as u64;
             live.end = Some(end);
             if live.checkpoints.len() == CHECKPOINTS {
@@ -214,6 +287,19 @@ impl Live {
         });
     }
 
+    /// The terminal's new size from output offset `at` on: now if the model has been fed up to
+    /// there, else once it is (the reader thread feeds the model after appending the output to
+    /// the buffer, so the model can be a chunk behind the buffer's end).
+    pub fn resize_at(&mut self, at: u64, cols: u16, rows: u16) {
+        if self.end.is_none_or(|end| end >= at) {
+            return self.resize(cols, rows);
+        }
+        if self.resizes.back().is_some_and(|r| r.0 == at) || self.resizes.len() == PENDING_RESIZES {
+            self.resizes.pop_back();
+        }
+        self.resizes.push_back((at, cols, rows));
+    }
+
     /// The terminal's new size. Beyond the caps the model is dropped for good: its state
     /// could not be trusted again.
     pub fn resize(&mut self, cols: u16, rows: u16) {
@@ -222,7 +308,11 @@ impl Live {
             return;
         }
         self.contain("resizing", |live| {
-            live.model.as_mut()?.resize(cols, rows);
+            let model = live.model.as_mut()?;
+            model.resize(cols, rows);
+            if model.exhausted() {
+                live.over_budget();
+            }
             Some(())
         });
     }
@@ -249,16 +339,45 @@ impl Live {
         self.line_feeds.saturating_sub(at)
     }
 
-    /// A snapshot at the current end (before a character not complete yet, which then follows
-    /// it as output): a skip snapshot when `skip_from` (the offset the client
+    /// The output offset the model has been fed up to.
+    pub fn end(&self) -> Option<u64> {
+        self.end
+    }
+
+    /// A snapshot at an offset at or after `from` (the offset the client expects): a skip
+    /// snapshot (`skip`, with the tail of the lines that scrolled off since `from`) or a resync
+    /// snapshot, as [`Live::snapshot`] makes them.
+    pub fn snapshot_from(&mut self, from: u64, skip: bool) -> Result<Snapshot, Unavailable> {
+        if self.model.is_none() {
+            return Err(Unavailable::Never);
+        }
+        if self.end.unwrap_or(0) < from {
+            return Err(Unavailable::Behind);
+        }
+        let snapshot = self.snapshot_at_least(skip.then_some(from), from);
+        snapshot.ok_or(Unavailable::Never)
+    }
+
+    /// A snapshot at the current end (before a character or sequence not complete yet, which
+    /// then follows it as output): a skip snapshot when `skip_from` (the offset the client
     /// expects) is given, with the tail of the lines that scrolled off since then; a resync
     /// snapshot otherwise. None without a model, when it would exceed `MAX_SNAPSHOT`, or when
     /// the model or the encoder failed (the model is then dropped).
     pub fn snapshot(&mut self, skip_from: Option<u64>) -> Option<Snapshot> {
+        self.snapshot_at_least(skip_from, 0)
+    }
+
+    /// [`Live::snapshot`], or None when it would stand before `from`. The size is estimated
+    /// first, so that a screen whose text alone exceeds `MAX_SNAPSHOT` costs no encoding.
+    fn snapshot_at_least(&mut self, skip_from: Option<u64>, from: u64) -> Option<Snapshot> {
         self.contain("taking a snapshot", |live| {
-            let model = live.model.as_ref()?;
+            let model = live.model.as_mut()?;
             let held = model.held() as u64;
             let offset = live.end.unwrap_or(0).checked_sub(held)?;
+            if offset < from || model.least_size() > MAX_SNAPSHOT {
+                return None;
+            }
+            let model = live.model.as_ref()?;
             let tail = match skip_from {
                 Some(from) => {
                     let rows = model.size().1;
@@ -305,9 +424,13 @@ mod faulty {
         last: Vec<u8>,
     }
 
-    /// `model`, failing on a marker when one was added for [`Hook::Model`].
+    /// How long [`Hook::Stall`] stalls.
+    const STALL: std::time::Duration = std::time::Duration::from_secs(3);
+
+    /// `model`, failing (or stalling) on a marker when one was added for [`Hook::Model`] (or
+    /// [`Hook::Stall`]).
     pub(super) fn wrap(model: Box<dyn Model>) -> Box<dyn Model> {
-        if !test_hooks::armed(Hook::Model) {
+        if !test_hooks::armed(Hook::Model) && !test_hooks::armed(Hook::Stall) {
             return model;
         }
         Box::new(Faulty {
@@ -327,8 +450,12 @@ mod faulty {
 
     impl Model for Faulty {
         fn feed(&mut self, bytes: &[u8]) -> u64 {
+            let stalled = test_hooks::tripped(Hook::Stall, &self.last);
             self.last.extend_from_slice(bytes);
             test_hooks::check(Hook::Model, &self.last);
+            if !stalled && test_hooks::tripped(Hook::Stall, &self.last) {
+                std::thread::sleep(STALL);
+            }
             let cut = self.last.len().saturating_sub(KEEP);
             self.last.drain(..cut);
             self.inner.feed(bytes)
@@ -347,6 +474,16 @@ mod faulty {
         }
         fn capture(&mut self, tail: usize) -> Capture {
             self.inner.capture(tail)
+        }
+        fn exhausted(&self) -> bool {
+            self.inner.exhausted()
+        }
+        #[cfg(test)]
+        fn vt100_bytes(&self) -> u64 {
+            self.inner.vt100_bytes()
+        }
+        fn least_size(&mut self) -> usize {
+            self.inner.least_size()
         }
     }
 }

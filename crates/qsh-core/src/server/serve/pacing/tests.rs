@@ -7,6 +7,19 @@ use std::collections::VecDeque;
 
 const MS: Duration = Duration::from_millis(1);
 
+/// An output stream with `unacked` output not acknowledged, some of it not sent.
+fn stream(unacked: u64, last_ack: u64, rate: f64, sampled: Duration) -> Stream {
+    Stream {
+        unacked,
+        unsent: unacked / 2,
+        last_ack,
+        end: last_ack + unacked,
+        rate,
+        sampled,
+        busy: false,
+    }
+}
+
 #[test]
 fn the_window_follows_rate_and_rtt_within_its_bounds() {
     // 1 MiB/s over 270 ms: 1.25 × 1 MiB × 0.37 s
@@ -27,20 +40,54 @@ fn the_rate_is_the_best_second_of_samples_while_output_waits() {
     let mut rate = Rate::new(INITIAL_RATE_MUX);
     assert_eq!(rate.rate(t0), INITIAL_RATE_MUX);
     // The first ACK only starts the clock; an application-limited interval is no sample
-    rate.ack(t0, 0, true);
-    rate.ack(t0 + 100 * MS, 10_000, true);
+    let rtt = 40 * MS;
+    rate.ack(t0, 0, true, rtt);
+    rate.ack(t0 + 100 * MS, 10_000, true, rtt);
     assert_eq!(rate.rate(t0 + 100 * MS), 100_000.0);
     rate.limited();
-    rate.ack(t0 + 200 * MS, 1_000_000, true);
+    rate.ack(t0 + 200 * MS, 1_000_000, true, rtt);
     assert_eq!(rate.rate(t0 + 200 * MS), 100_000.0);
     // A faster second wins; samples older than 10 s are forgotten
     rate.limited();
-    rate.ack(t0 + 1500 * MS, 0, true);
-    rate.ack(t0 + 1600 * MS, 50_000, true);
+    rate.ack(t0 + 1500 * MS, 0, true, rtt);
+    rate.ack(t0 + 1600 * MS, 50_000, true, rtt);
     assert_eq!(rate.rate(t0 + 1600 * MS), 500_000.0);
     assert_eq!(rate.sampled(t0 + 1600 * MS), 200 * MS);
-    rate.ack(t0 + 12_000 * MS, 1000, true);
+    rate.ack(t0 + 12_000 * MS, 1000, true, rtt);
     assert!(rate.rate(t0 + 12_000 * MS) < 500_000.0);
+}
+
+/// ACKs that arrive in bursts, microseconds apart (coalesced by the path, the transport or a
+/// client that was descheduled), measure the path, not the microseconds between them: output
+/// that comes in bursts from the program, over a 1 MB/s path, once gave samples of 5 GB/s (the
+/// time before a burst is application-limited, so only the microseconds within it counted),
+/// which pinned the window at 8 MiB and turned compression off.
+#[test]
+fn bursts_of_acks_do_not_inflate_the_rate() {
+    let t0 = Instant::now();
+    let rtt = 40 * MS;
+    let mut rate = Rate::new(INITIAL_RATE_MUX);
+    let mut now = t0;
+    for _ in 0..200 {
+        now += 50 * MS;
+        // Nothing to send for a moment between bursts
+        rate.limited();
+        // 50 KB per 50 ms, in five ACKs 2 µs apart
+        for _ in 0..5 {
+            now += Duration::from_micros(2);
+            rate.ack(now, 10_000, true, rtt);
+        }
+    }
+    let t = rate.rate(now);
+    assert!(t < 2_000_000.0, "{t}");
+    assert!(window(t, rtt, false) < 1 << 20);
+    assert!(Squeeze::new().wanted(now, t, 4096, 0));
+    // A real increase is followed, doubling per sample at most
+    for _ in 0..40 {
+        now += 20 * MS;
+        rate.ack(now, 1_000_000, true, rtt);
+    }
+    assert!(rate.rate(now) > 20_000_000.0, "{}", rate.rate(now));
 }
 
 #[test]
@@ -49,26 +96,57 @@ fn backlog_trigger_with_samples_and_hysteresis() {
     let mut c = Catchup::new(t0, 0, false);
     let rate = 100_000.0;
     // Below max(2 s × T, 256 KiB): nothing
-    assert_eq!(c.step(t0, 256 * 1024, 0, rate, Duration::from_secs(5)), Step::Send);
-    // Above, but less than 1 s of samples on the mux layer (500 ms on QUIC)
-    assert_eq!(c.step(t0, 300_000, 0, rate, 800 * MS), Step::Send);
     assert_eq!(
-        Catchup::new(t0, 0, true).step(t0, 300_000, 0, rate, 800 * MS),
+        c.step(t0, &stream(256 * 1024, 0, rate, Duration::from_secs(5))),
+        Step::Send
+    );
+    // Above, but less than 1 s of samples on the mux layer (500 ms on QUIC)
+    assert_eq!(c.step(t0, &stream(300_000, 0, rate, 800 * MS)), Step::Send);
+    assert_eq!(
+        Catchup::new(t0, 0, true).step(t0, &stream(300_000, 0, rate, 800 * MS)),
         Step::Snapshot
     );
-    assert_eq!(c.step(t0, 300_000, 0, rate, Duration::from_secs(1)), Step::Snapshot);
+    assert_eq!(
+        c.step(t0, &stream(300_000, 0, rate, Duration::from_secs(1))),
+        Step::Snapshot
+    );
+    // Nothing to skip: everything was sent
+    let sent = Stream {
+        unsent: 0,
+        ..stream(300_000, 0, rate, Duration::from_secs(1))
+    };
+    assert_eq!(c.step(t0, &sent), Step::Send);
     c.taken(t0, 1_000_000);
     // Not before the snapshot is acknowledged and 1 s has passed
     let t1 = t0 + Duration::from_secs(2);
-    assert_eq!(c.step(t1, 300_000, 999_999, rate, Duration::from_secs(3)), Step::Send);
-    assert_eq!(
-        c.step(t0 + 500 * MS, 300_000, 1_000_000, rate, Duration::from_secs(3)),
-        Step::Send
-    );
-    assert_eq!(
-        c.step(t1, 300_000, 1_000_000, rate, Duration::from_secs(3)),
-        Step::Snapshot
-    );
+    let s = Duration::from_secs(3);
+    assert_eq!(c.step(t1, &stream(300_000, 999_999, rate, s)), Step::Send);
+    assert_eq!(c.step(t0 + 500 * MS, &stream(300_000, 1_000_000, rate, s)), Step::Send);
+    assert_eq!(c.step(t1, &stream(300_000, 1_000_000, rate, s)), Step::Snapshot);
+    // Nor while one is in flight
+    let busy = Stream {
+        busy: true,
+        ..stream(300_000, 1_000_000, rate, s)
+    };
+    assert_eq!(c.step(t1, &busy), Step::Send);
+}
+
+/// A snapshot that cannot be made (too big, no model) is not tried again on every wakeup:
+/// the backlog trigger waits for more output.
+#[test]
+fn a_failed_snapshot_disarms_the_backlog_trigger_until_more_output() {
+    let t0 = Instant::now();
+    let mut c = Catchup::new(t0, 0, false);
+    let s = stream(300_000, 0, 100_000.0, Duration::from_secs(3));
+    assert_eq!(c.step(t0, &s), Step::Snapshot);
+    c.failed(s.end);
+    assert_eq!(c.step(t0 + MS, &s), Step::Send);
+    let more = Stream { end: s.end + 1, ..s };
+    assert_eq!(c.step(t0 + MS, &more), Step::Snapshot);
+    // The input trigger is given up as well
+    c.input(t0, 2_000_000, 100_000);
+    c.failed(more.end);
+    assert!(!c.interrupted());
 }
 
 #[test]
@@ -80,26 +158,28 @@ fn input_trigger_waits_for_the_program_to_settle() {
     assert!(!c.interrupted());
     c.input(t0, 2_000_000, 100_000);
     assert!(c.interrupted());
+    let s = stream(0, 0, 1e6, Duration::ZERO);
     // Output still flowing: hold, at most 100 ms
-    assert_eq!(c.step(t0 + 5 * MS, 0, 0, 1e6, Duration::ZERO), Step::Hold(t0 + 20 * MS));
+    assert_eq!(c.step(t0 + 5 * MS, &s), Step::Hold(Some(t0 + 20 * MS)));
     c.output(t0 + 15 * MS, 10);
-    assert_eq!(
-        c.step(t0 + 16 * MS, 0, 0, 1e6, Duration::ZERO),
-        Step::Hold(t0 + 35 * MS)
-    );
-    assert_eq!(c.step(t0 + 35 * MS, 0, 0, 1e6, Duration::ZERO), Step::Snapshot);
+    assert_eq!(c.step(t0 + 16 * MS, &s), Step::Hold(Some(t0 + 35 * MS)));
+    assert_eq!(c.step(t0 + 35 * MS, &s), Step::Snapshot);
     // A program that never pauses: 100 ms
     let mut c = Catchup::new(t0, 0, false);
     c.input(t0, 2_000_000, 100_000);
     for ms in (0..100).step_by(10) {
         c.output(t0 + ms * MS, ms as u64 + 1);
-        assert!(matches!(c.step(t0 + ms * MS, 0, 0, 1e6, Duration::ZERO), Step::Hold(_)));
+        assert!(matches!(c.step(t0 + ms * MS, &s), Step::Hold(Some(_))));
     }
-    assert_eq!(c.step(t0 + 100 * MS, 0, 0, 1e6, Duration::ZERO), Step::Snapshot);
-    // Even right after a backlog snapshot (no hysteresis for input)
+    assert_eq!(c.step(t0 + 100 * MS, &s), Step::Snapshot);
+    // Even right after a backlog snapshot (no hysteresis for input) …
     c.taken(t0, 5);
     c.input(t0 + MS, 2_000_000, 100_000);
-    assert_eq!(c.step(t0 + 200 * MS, 0, 0, 1e6, Duration::ZERO), Step::Snapshot);
+    // … but not while that snapshot is in flight: the output is held until it is acknowledged,
+    // then one fresh snapshot follows at once
+    let busy = Stream { busy: true, ..s };
+    assert_eq!(c.step(t0 + 200 * MS, &busy), Step::Hold(None));
+    assert_eq!(c.step(t0 + 201 * MS, &s), Step::Snapshot);
 }
 
 #[test]
@@ -209,7 +289,7 @@ fn ctrl_c(rtt: Duration, link: f64, snapshot: u64) -> Duration {
         // The server
         while acks.front().is_some_and(|a| a.0 <= now) {
             let (_, r) = acks.pop_front().unwrap();
-            rate.ack(now, r - last_ack, true);
+            rate.ack(now, r - last_ack, true, rtt);
             last_ack = r;
         }
         if input_arrives.is_some_and(|t| t <= now) && !stopped {
@@ -220,7 +300,16 @@ fn ctrl_c(rtt: Duration, link: f64, snapshot: u64) -> Duration {
         }
         if stopped {
             // The program stopped at once: the end no longer grows
-            match catchup.step(now, 0, last_ack, rate.rate(now), rate.sampled(now)) {
+            let s = Stream {
+                unacked: sent - last_ack,
+                unsent: 0,
+                last_ack,
+                end: sent,
+                rate: rate.rate(now),
+                sampled: rate.sampled(now),
+                busy: false,
+            };
+            match catchup.step(now, &s) {
                 Step::Snapshot if snapshot_bytes == 0 => {
                     snapshot_bytes = snapshot;
                     queue.push_back((snapshot, sent, true));

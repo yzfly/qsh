@@ -43,13 +43,8 @@ complete -c qsh-server -n "__fish_qsh_server_using_subcommand pipe" -l version -
 complete -c qsh-server -n "__fish_qsh_server_using_subcommand pipe" -s v -d 'Log more (repeat for more)'
 complete -c qsh-server -n "__fish_qsh_server_using_subcommand pipe" -s h -l help -d 'Print help'
 complete -c qsh-server -n "__fish_qsh_server_using_subcommand daemon" -l ports -d 'Ports to try, FIRST-LAST; the first free on both UDP and TCP is used' -r
-complete -c qsh-server -n "__fish_qsh_server_using_subcommand daemon" -l state-fd -d 'The descriptor of the sealed state (with --resume)' -r
-complete -c qsh-server -n "__fish_qsh_server_using_subcommand daemon" -l key-fd -d 'The descriptor of the pipe with the state\'s key (with --resume)' -r
-complete -c qsh-server -n "__fish_qsh_server_using_subcommand daemon" -l fallback-exe-fd -d 'The descriptor of the previous program, run again if resuming fails (with --resume)' -r
 complete -c qsh-server -n "__fish_qsh_server_using_subcommand daemon" -l foreground -d 'Stay in the foreground (for service managers); otherwise start in the background'
 complete -c qsh-server -n "__fish_qsh_server_using_subcommand daemon" -l on-demand -d 'Exit after an hour without sessions (set when started on demand)'
-complete -c qsh-server -n "__fish_qsh_server_using_subcommand daemon" -l resume -d 'Resume from the state an older image of this daemon handed over (an upgrade in place)'
-complete -c qsh-server -n "__fish_qsh_server_using_subcommand daemon" -l fell-back -d 'The new program could not resume; this is the previous one again (with --resume)'
 complete -c qsh-server -n "__fish_qsh_server_using_subcommand daemon" -s v -d 'Log more (repeat for more)'
 complete -c qsh-server -n "__fish_qsh_server_using_subcommand daemon" -s h -l help -d 'Print help'
 complete -c qsh-server -n "__fish_qsh_server_using_subcommand status" -s v -d 'Log more (repeat for more)'
@@ -61,14 +56,16 @@ complete -c qsh-server -n "__fish_qsh_server_using_subcommand upgrade" -l force 
 complete -c qsh-server -n "__fish_qsh_server_using_subcommand upgrade" -s v -d 'Log more (repeat for more)'
 complete -c qsh-server -n "__fish_qsh_server_using_subcommand upgrade" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c qsh-server -n "__fish_qsh_server_using_subcommand doctor" -l ports -d 'The ports to check and open, FIRST-LAST (default: the configured range)' -r
-complete -c qsh-server -n "__fish_qsh_server_using_subcommand doctor" -l root -d 'Read /etc, /proc, /sys and /var under DIR instead of / (tests and image builds)' -r -F
+complete -c qsh-server -n "__fish_qsh_server_using_subcommand doctor" -l root -d 'Tests only: read /etc, /proc, /sys and /var under DIR instead of /, without following symbolic links; no command of the host runs (see --commands)' -r -F
+complete -c qsh-server -n "__fish_qsh_server_using_subcommand doctor" -l commands -d 'Tests only, with --root: the stub programs that stand in for the host\'s commands' -r -F
 complete -c qsh-server -n "__fish_qsh_server_using_subcommand doctor" -l json -d 'Print JSON (schema version 1, stable check ids; see qsh-server(1))'
 complete -c qsh-server -n "__fish_qsh_server_using_subcommand doctor" -l probe -d 'Start the daemon if it does not run, and report its ports and certificate (what qsh doctor HOST runs)'
 complete -c qsh-server -n "__fish_qsh_server_using_subcommand doctor" -s v -d 'Log more (repeat for more)'
 complete -c qsh-server -n "__fish_qsh_server_using_subcommand doctor" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c qsh-server -n "__fish_qsh_server_using_subcommand tune" -l allow-low-ports -d 'Let every user bind ports from PORT up (ip_unprivileged_port_start; single-user hosts only)' -r
 complete -c qsh-server -n "__fish_qsh_server_using_subcommand tune" -l ports -d 'The ports to open, FIRST-LAST (default: the configured range and extra ports)' -r
-complete -c qsh-server -n "__fish_qsh_server_using_subcommand tune" -l root -d 'Read and change /etc, /proc/sys and /var under DIR instead of / (tests and image builds; no root needed)' -r -F
+complete -c qsh-server -n "__fish_qsh_server_using_subcommand tune" -l root -d 'Tests only: read and change /etc, /proc/sys and /var under DIR instead of /, without following symbolic links; no command of the host runs (see --commands)' -r -F
+complete -c qsh-server -n "__fish_qsh_server_using_subcommand tune" -l commands -d 'Tests only, with --root: the stub programs that stand in for the host\'s commands' -r -F
 complete -c qsh-server -n "__fish_qsh_server_using_subcommand tune" -l apply -d 'Make the changes (root; asks first)'
 complete -c qsh-server -n "__fish_qsh_server_using_subcommand tune" -l revert -d 'Undo what tune changed, as recorded in /var/lib/qsh/tune.json (root; asks first)'
 complete -c qsh-server -n "__fish_qsh_server_using_subcommand tune" -s y -l yes -d 'Do not ask (scripts)'

@@ -1,9 +1,10 @@
 //! `qsh install` and the offer to install, against the fake ssh (see `common`): the "remote"
 //! is this machine with the test world's HOME, and the destination `bare` has no qsh-server
 //! but in `~/.local/bin`. A stub `uname` decides what system the host is; releases come from
-//! a directory through `file://` (QSH_DOWNLOAD_URL).
+//! a directory through `file://` (QSH_DOWNLOAD_URL), their SHA256SUMS signed with a test key
+//! that the test hook QSH_TEST_RELEASE_KEY makes qsh trust.
 
-#![cfg(feature = "self-install")]
+#![cfg(all(feature = "self-install", feature = "test-hooks"))]
 
 mod common;
 
@@ -23,9 +24,30 @@ fn write_exec(path: &Path, text: &str) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-/// A world whose host says it is Linux on x86_64.
+/// The test release key's seed and id.
+const TEST_SEED: [u8; 32] = [42; 32];
+const TEST_KEY_ID: [u8; 8] = *b"qsh-test";
+
+fn test_key() -> qsh_core::minisign::PublicKey {
+    qsh_core::minisign::public_key(&TEST_SEED, TEST_KEY_ID).unwrap()
+}
+
+/// SHA256SUMS.minisig next to `sums`, signed with the test key for `version`.
+fn sign(sums: &Path, version: &str) {
+    let sig = qsh_core::minisign::sign(
+        &TEST_SEED,
+        TEST_KEY_ID,
+        &fs::read(sums).unwrap(),
+        &format!("qsh {version} SHA256SUMS"),
+    )
+    .unwrap();
+    fs::write(sums.with_file_name("SHA256SUMS.minisig"), sig).unwrap();
+}
+
+/// A world whose host says it is Linux on x86_64, and whose qsh trusts the test release key.
 fn world(name: &str) -> World {
-    let w = World::new(name);
+    let mut w = World::new(name);
+    w.set("QSH_TEST_RELEASE_KEY", test_key().to_base64());
     write_exec(
         &w.dir.join("bin/uname"),
         "#!/bin/sh\ncase \"$1\" in -s) echo Linux ;; -m) echo x86_64 ;; *) exec /usr/bin/env -i PATH=/usr/bin:/bin uname \"$@\" ;; esac\n",
@@ -63,6 +85,7 @@ fn release(w: &World, server: &Path) -> (String, PathBuf) {
     assert!(status.success());
     let sum = qsh_core::crypto::hex(&qsh_core::crypto::sha256(&fs::read(dir.join(&archive)).unwrap()));
     fs::write(dir.join("SHA256SUMS"), format!("{sum}  {archive}\n")).unwrap();
+    sign(&dir.join("SHA256SUMS"), VERSION);
     (format!("file://{}", root.display()), dir.join("SHA256SUMS"))
 }
 
@@ -140,16 +163,132 @@ fn install_downloads_and_checks_the_release() {
     assert!(err.contains("checksum OK"), "{err}");
     assert_eq!(fs::read(installed(&w)).unwrap(), fs::read(&stub).unwrap());
 
-    // Tampered: refused, and nothing installed
-    fs::remove_file(installed(&w)).unwrap();
-    fs::write(&sums, format!("{}  qsh-{VERSION}-{TARGET}.tar.gz\n", "0".repeat(64))).unwrap();
-    let mut cmd = w.qsh(&["install", "bare"]);
-    cmd.env("QSH_DOWNLOAD_URL", &url);
-    let out = cmd.stdin(Stdio::null()).output().unwrap();
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(255), "{err}");
-    assert!(err.contains("does not match its checksum"), "{err}");
-    assert!(!installed(&w).exists());
+    assert!(err.contains("signed by the qsh release key"), "{err}");
+
+    let refused = |what: &str, url: &str, expected: &str| {
+        let _ = fs::remove_file(installed(&w));
+        let mut cmd = w.qsh(&["install", "bare"]);
+        cmd.env("QSH_DOWNLOAD_URL", url);
+        let out = cmd.stdin(Stdio::null()).output().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(255), "{what}: {err}");
+        assert!(err.contains(expected), "{what}: {err}");
+        assert!(
+            !err.contains("install script"),
+            "{what}: no fallback to the host: {err}"
+        );
+        assert!(!installed(&w).exists(), "{what}");
+    };
+    // A tampered archive: its checksum
+    let archive = sums.with_file_name(format!("qsh-{VERSION}-{TARGET}.tar.gz"));
+    let good = fs::read(&archive).unwrap();
+    let mut bad = good.clone();
+    let n = bad.len();
+    bad[n - 1] ^= 1;
+    fs::write(&archive, &bad).unwrap();
+    refused("archive", &url, "does not match its checksum");
+    fs::write(&archive, &good).unwrap();
+    // Review L1: a tampered SHA256SUMS, consistent with the tampered archive: its signature
+    let original = fs::read(&sums).unwrap();
+    let sum = qsh_core::crypto::hex(&qsh_core::crypto::sha256(&bad));
+    fs::write(&sums, format!("{sum}  qsh-{VERSION}-{TARGET}.tar.gz\n")).unwrap();
+    fs::write(&archive, &bad).unwrap();
+    refused("sums", &url, "not signed by the qsh release key");
+    fs::write(&archive, &good).unwrap();
+    fs::write(&sums, &original).unwrap();
+    // No signature at all
+    let minisig = sums.with_file_name("SHA256SUMS.minisig");
+    let signature = fs::read(&minisig).unwrap();
+    fs::remove_file(&minisig).unwrap();
+    refused("unsigned", &url, "signature is missing");
+    // Another version's signature
+    sign(&sums, "0.0.1");
+    refused("rollback", &url, "not for qsh");
+    fs::write(&minisig, &signature).unwrap();
+    // Review L1: plain http is not "unavailable" (which would make the host download it): refused
+    refused("http", "http://127.0.0.1:9/qsh/releases", "only https:// and file://");
+}
+
+/// Review L1: install.sh checks the release signature too, with minisign or OpenSSL 3; with
+/// --require-signature it refuses when it cannot. Downloads are served by a stub curl that
+/// maps the https mirror to the release directory, and the script's key is the test key.
+#[test]
+fn install_sh_checks_the_release_signature() {
+    let openssl3 = Command::new("openssl")
+        .arg("version")
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).starts_with("OpenSSL 3"));
+    if !openssl3 {
+        eprintln!("no OpenSSL 3: skipped");
+        return;
+    }
+    let w = world("inst-sh");
+    let stub = w.dir.join("stub-server");
+    write_exec(&stub, &format!("#!/bin/sh\necho 'qsh-server {VERSION}'\n"));
+    let (url, sums) = release(&w, &stub);
+    let local = url.trim_start_matches("file://").to_string();
+    let bin = w.dir.join("shbin");
+    fs::create_dir_all(&bin).unwrap();
+    // curl ... -o FILE URL, with https://mirror.invalid/qsh/releases standing for the directory
+    write_exec(
+        &bin.join("curl"),
+        &format!(
+            "#!/bin/sh\nout=; url=\nwhile [ $# -gt 0 ]; do case \"$1\" in -o) out=$2; shift 2 ;; -*) shift ;; *) url=$1; shift ;; esac; done\n\
+f={local}${{url#https://mirror.invalid/qsh/releases}}\n[ -f \"$f\" ] || exit 22\ncp \"$f\" \"$out\"\n"
+        ),
+    );
+    let script = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/install.sh")).unwrap();
+    assert!(
+        script.contains(qsh_cli::install::RELEASE_KEY),
+        "install.sh has the release key"
+    );
+    let script = script.replace(qsh_cli::install::RELEASE_KEY, &test_key().to_base64());
+    fs::write(w.dir.join("install.sh"), script).unwrap();
+    let run = |extra: &[&str]| {
+        let out = Command::new("sh")
+            .arg(w.dir.join("install.sh"))
+            .args(["--server-only", "--version", VERSION, "--prefix"])
+            .arg(w.dir.join("prefix"))
+            .args(extra)
+            .env_clear()
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("HOME", w.dir.join("home"))
+            .env("QSH_DOWNLOAD_URL", "https://mirror.invalid/qsh/releases")
+            .output()
+            .unwrap();
+        (out.status.code(), String::from_utf8_lossy(&out.stderr).into_owned())
+    };
+    let target = w.dir.join("prefix/bin/qsh-server");
+    // A uname that says x86_64 Linux, as the world's
+    fs::copy(w.dir.join("bin/uname"), bin.join("uname")).unwrap();
+    let (code, err) = run(&["--require-signature"]);
+    assert_eq!(code, Some(0), "{err}");
+    assert!(err.contains("signature OK"), "{err}");
+    assert_eq!(fs::read(&target).unwrap(), fs::read(&stub).unwrap());
+    fs::remove_file(&target).unwrap();
+    // Tampered checksums: refused
+    let original = fs::read(&sums).unwrap();
+    let mut changed = original.clone();
+    changed[0] = if changed[0] == b'0' { b'1' } else { b'0' };
+    fs::write(&sums, &changed).unwrap();
+    let (code, err) = run(&[]);
+    assert_ne!(code, Some(0), "{err}");
+    assert!(err.contains("not signed by the qsh release key"), "{err}");
+    assert!(!target.exists());
+    fs::write(&sums, &original).unwrap();
+    // Another version's signature: refused
+    sign(&sums, "0.0.1");
+    let (code, err) = run(&[]);
+    assert_ne!(code, Some(0), "{err}");
+    assert!(err.contains("signed for another version"), "{err}");
+    assert!(!target.exists(), "{err}");
+    // No way to check it here, and required: refused (an openssl that cannot, no minisign)
+    sign(&sums, VERSION);
+    write_exec(&bin.join("openssl"), "#!/bin/sh\necho 'OpenSSL 1.1.1w'\n");
+    let (code, err) = run(&["--require-signature"]);
+    assert_ne!(code, Some(0), "{err}");
+    assert!(err.contains("cannot check the release signature"), "{err}");
+    assert!(!target.exists(), "{err}");
 }
 
 /// On a terminal, a host without qsh-server gets one question; yes installs it (here from the
@@ -165,10 +304,10 @@ fn the_install_prompt_installs_and_connects() {
     w.set("QSH_DOWNLOAD_URL", url);
     let mut tty = Tty::spawn(w.qsh(&["bare", "echo prompt-ok; exit 3"]));
     tty.wait_for(
-        "qsh-server is not installed on bare. Install it to ~/.local/bin there? [Y/n]",
+        "qsh-server is not installed on bare. Install it to ~/.local/bin there? [y/N]",
         Duration::from_secs(20),
     );
-    tty.send(b"\r");
+    tty.send(b"y\r");
     tty.wait_for("prompt-ok", Duration::from_secs(60));
     assert_eq!(tty.exit_code(Duration::from_secs(20)), 3, "{:?}", tty.text());
     assert!(tty.text().contains("checksum OK"), "{:?}", tty.text());
@@ -178,8 +317,9 @@ fn the_install_prompt_installs_and_connects() {
     fs::remove_file(installed(&w)).unwrap();
     let _ = w.command(QSH_SERVER, &["stop"]).output();
     let mut tty = Tty::spawn(w.qsh(&["bare", "true"]));
-    tty.wait_for("[Y/n]", Duration::from_secs(20));
-    tty.send(b"n\r");
+    // Review L5: no by default; an empty answer is no
+    tty.wait_for("[y/N]", Duration::from_secs(20));
+    tty.send(b"\r");
     assert_eq!(tty.exit_code(Duration::from_secs(20)), 42);
     assert!(tty.text().contains("qsh install bare"), "{:?}", tty.text());
     fs::create_dir_all(w.dir.join("config/qsh")).unwrap();
@@ -187,5 +327,5 @@ fn the_install_prompt_installs_and_connects() {
     fs::set_permissions(w.dir.join("config/qsh/config"), fs::Permissions::from_mode(0o600)).unwrap();
     let mut tty = Tty::spawn(w.qsh(&["bare", "true"]));
     assert_eq!(tty.exit_code(Duration::from_secs(20)), 42, "{:?}", tty.text());
-    assert!(!tty.text().contains("[Y/n]"), "{:?}", tty.text());
+    assert!(!tty.text().contains("[y/N]"), "{:?}", tty.text());
 }

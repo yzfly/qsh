@@ -39,11 +39,13 @@ use crate::sys;
 /// through which the daemon's screen model is fed (work package WP-2), so that the model's state
 /// at offset `E` is available whenever the buffer's end is `E`.
 ///
-/// [`OutputSink::output`] is called on the session's reader thread **while the output buffer's
-/// lock is held** ([`PtySession::output`]), with exactly the bytes appended, in order. It must
-/// be quick and must not lock the output buffer itself or block on anything that may wait for
-/// it. Code that needs the model and the buffer consistent (a snapshot at `end`) locks the
-/// buffer first, then whatever the sink shares with it: always in that order.
+/// [`OutputSink::output`] is called on the session's reader thread **right after** the bytes were
+/// appended to the output buffer ([`PtySession::output`]), with exactly the bytes appended, in
+/// order, and without the buffer's lock: the buffer may already be ahead of what the sink has
+/// seen (by the chunk being fed). The sink must not lock the output buffer itself (that is only
+/// allowed while installing it, under the buffer's lock: [`PtySession::set_output_sink`]). Code
+/// that needs the buffer and what the sink shares locks the buffer first, then that: always in
+/// that order, and it must not assume that the sink has seen the buffer's end.
 pub trait OutputSink: Send {
     /// `bytes` were appended to the output stream at `offset` (the buffer's end is now
     /// `offset + bytes.len()`). Output that fell out of the buffer before the sink was set is
@@ -65,7 +67,7 @@ struct SinkSlot(Option<Box<dyn OutputSink>>);
 impl SinkSlot {
     /// [`OutputSink::output`], with a panic contained ([`crate::fault`]): the sink is then
     /// removed (dropped unused: its state may be half updated), and the session goes on.
-    /// Neither the reader thread nor the output buffer's lock, held here, suffers from it.
+    /// Neither the reader thread nor the output buffer suffers from it.
     fn output(&mut self, id: &SessionId, offset: u64, bytes: &[u8]) {
         let Some(sink) = self.0.as_mut() else { return };
         if let Err(fault) = crate::fault::contain(|| sink.output(offset, bytes)) {
@@ -243,7 +245,7 @@ pub struct PtySession {
     pub output: Mutex<ReplayBuffer>,
     /// A pipe session's stderr, kept until acknowledged (empty on a tty session).
     pub errors: Mutex<ReplayBuffer>,
-    /// Fed with the output as it enters [`PtySession::output`], under its lock.
+    /// Fed with the output as it enters [`PtySession::output`], in order, right after.
     sink: Mutex<SinkSlot>,
     /// Woken when acknowledgements make room in a pipe session's buffers.
     room: Condvar,
@@ -1077,8 +1079,13 @@ fn read_output(
                     let offset = buffer.end();
                     buffer.push(&buf[..n]);
                     if stream == Stream::Output {
-                        // Under the buffer's lock (m2.md 6.2)
-                        s.sink.lock().unwrap().output(&s.id, offset, &buf[..n]);
+                        // The sink's lock is taken before the buffer's is released, so that the
+                        // sink gets the chunks in order (and a sink installed meanwhile gets this
+                        // one in what the buffer holds); it is fed after, so that the output
+                        // buffer is never locked while the model works (m2.md 6.2)
+                        let mut sink = s.sink.lock().unwrap();
+                        drop(buffer);
+                        sink.output(&s.id, offset, &buf[..n]);
                     }
                 }
                 s.changed.notify_waiters();
@@ -1583,6 +1590,9 @@ mod tests {
             started_ms: 0,
             restarts: 0,
             failures: 0,
+            options: Default::default(),
+            refused: Vec::new(),
+            attempt: None,
             port: 1,
             listeners: vec![
                 super::super::handoff::Listener {

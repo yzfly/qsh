@@ -98,7 +98,7 @@ walk() {
 walk "$R" > /tmp/before
 
 export FAKE_ROOT="$R"
-T() { PATH="$S:$PATH" $B tune --root "$R" "$@"; }
+T() { $B tune --root "$R" --commands "$S" "$@"; }
 T > /tmp/plan.txt
 cat /tmp/plan.txt
 grep -q '+net.core.rmem_max = 4194304' /tmp/plan.txt || fail "the plan does not raise rmem_max"
@@ -107,7 +107,7 @@ grep -q 'modprobe tcp_bbr' /tmp/plan.txt || fail "the plan does not load tcp_bbr
 T --apply --yes
 [ "$(cat "$R/proc/sys/net/core/rmem_max")" = 4194304 ] || fail "rmem_max not raised"
 [ -s "$R/var/lib/qsh/tune.json" ] || fail "no record"
-PATH="$S:$PATH" $B doctor --root "$R" --json > /tmp/tuned.json || true
+$B doctor --root "$R" --commands "$S" --json > /tmp/tuned.json || true
 for id in udp-buffers tcp-bbr; do
 	grep -q "\"id\":\"$id\",\"status\":\"ok\"" /tmp/tuned.json || fail "$id is not ok after tune"
 done

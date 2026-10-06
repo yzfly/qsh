@@ -47,8 +47,8 @@ an ordinary ssh login, so qsh never asks you to trust anything ssh does not alre
 curl -fsSL https://github.com/yzfly/qsh/releases/latest/download/install.sh | sh
 ```
 
-The script picks the build for your system, checks it against the release's `SHA256SUMS` and
-installs `qsh` and `qsh-server` into `~/.local/bin` (`/usr/local/bin` as root). Options:
+The script picks the build for your system, checks it against the release's `SHA256SUMS`
+(and that file's signature by the qsh release key, with minisign or OpenSSL 3) and installs `qsh` and `qsh-server` into `~/.local/bin` (`/usr/local/bin` as root). Options:
 `--version 0.1.0`, `--prefix DIR`, `--server-only` (just `qsh-server`, for servers). Prefer to
 read it first? It is [scripts/install.sh](scripts/install.sh).
 
@@ -69,10 +69,12 @@ see [packaging/README.md](packaging/README.md) for local builds and the road int
 <details>
 <summary>Verifying a download</summary>
 
-Every release asset has a checksum in `SHA256SUMS` and a build provenance attestation signed
-through Sigstore by the GitHub Actions run that built it:
+Every release asset has a checksum in `SHA256SUMS`, signed with the qsh release key
+(minisign, `SHA256SUMS.minisig`), and a build provenance attestation signed through Sigstore by
+the GitHub Actions run that built it:
 
 ```sh
+minisign -Vm SHA256SUMS -P RWTYvXVs30N3JIE/A5TMPWUWD9ktnPZqQ6lSzYJahI7u5lpiPBCKWHlf
 sha256sum -c SHA256SUMS --ignore-missing
 gh attestation verify qsh-0.1.0-x86_64-unknown-linux-musl.tar.gz --repo yzfly/qsh
 ```
@@ -98,7 +100,7 @@ Or let qsh do it: the first time you connect to a host without `qsh-server`, qsh
 whether to install it, then connects; `qsh install myserver` does it on its own. qsh looks at the
 host's system over ssh, then copies its own `qsh-server` when it was built for that system, or
 downloads the matching release archive on your machine, checks it against the release's
-`SHA256SUMS` and copies it over, so the host needs no internet access. Builds without the
+`SHA256SUMS` (whose signature it checks first) and copies it over, so the host needs no internet access. Builds without the
 `self-install` feature (distribution packages) never download anything: they print the command
 above instead.
 

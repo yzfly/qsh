@@ -36,13 +36,21 @@ pub fn names(arg: &str, id: &str, name: Option<&str>) -> bool {
     !arg.is_empty() && arg.bytes().all(|b| b.is_ascii_hexdigit()) && id.starts_with(&arg)
 }
 
-fn short(id: &str) -> &str {
-    &id[..id.len().min(8)]
+/// The first 8 characters of a session id, as text (the server's listing is not trusted to
+/// hold only hex digits).
+fn short(id: &str) -> String {
+    qsh_core::text::sanitize(&id.chars().take(8).collect::<String>(), 8)
+}
+
+/// A session's name for people: the server's text, without escape sequences.
+fn name_text(name: Option<&str>) -> String {
+    name.map_or_else(|| "-".into(), |n| qsh_core::text::sanitize(n, 64))
 }
 
 fn command_text(command: Option<&str>) -> String {
     match command {
-        Some(c) => c.replace(['\n', '\r', '\t'], " "),
+        // The server's text: no escape sequences reach the terminal (security.md 4.6)
+        Some(c) => qsh_core::text::sanitize(c, 200),
         None => "(login shell)".into(),
     }
 }
@@ -158,7 +166,7 @@ pub async fn ls_remote(ssh: &SshCommand, store: &SessionStore, json_out: bool, i
     for s in &sessions {
         rows.push(vec![
             short(&s.session).to_string(),
-            s.name.clone().unwrap_or_else(|| "-".into()),
+            name_text(s.name.as_deref()),
             state_of(s, here(s)),
             kind(s.tty == Some(false)).into(),
             age(s.created, now),
@@ -213,7 +221,7 @@ pub fn ls_saved(store: &SessionStore, json_out: bool) -> i32 {
         rows.push(vec![
             s.destination.clone(),
             short(&s.id()).to_string(),
-            s.name.clone().unwrap_or_else(|| "-".into()),
+            name_text(s.name.as_deref()),
             if in_use(s) { "attached here" } else { "saved" }.into(),
             kind(s.pipe).into(),
             age(s.created, now),
@@ -285,7 +293,7 @@ pub async fn kill(ssh: &SshCommand, store: &SessionStore, session: Option<&str>,
 
 fn describe(name: Option<&str>, command: Option<&str>) -> String {
     match (name, command) {
-        (Some(n), _) => format!(" ({n})"),
+        (Some(n), _) => format!(" ({})", name_text(Some(n))),
         (None, Some(c)) => format!(" ({})", command_text(Some(c))),
         (None, None) => String::new(),
     }
@@ -317,7 +325,7 @@ fn listing<'a>(sessions: impl Iterator<Item = &'a SessionInfo>) -> String {
         .map(|s| {
             vec![
                 format!("  {}", short(&s.session)),
-                s.name.clone().unwrap_or_else(|| "-".into()),
+                name_text(s.name.as_deref()),
                 state_of(s, false),
                 age(s.created, now),
                 command_text(s.command.as_deref()),
@@ -349,7 +357,7 @@ fn choose(candidates: &[SessionInfo], destination: &str, tty: bool) -> Result<us
             vec![
                 format!("  {})", i + 1),
                 short(&s.session).to_string(),
-                s.name.clone().unwrap_or_else(|| "-".into()),
+                name_text(s.name.as_deref()),
                 age(s.created, now),
                 command_text(s.command.as_deref()),
             ]
@@ -463,6 +471,18 @@ pub async fn choose_attach(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review L3: the server's names, commands and ids reach the terminal as text only.
+    #[test]
+    fn what_the_server_lists_is_shown_as_text() {
+        assert_eq!(name_text(Some("build\u{1b}]52;c;cm0gLXJm\u{7}")), "build");
+        assert_eq!(name_text(None), "-");
+        assert_eq!(command_text(Some("make\u{1b}[2J -j8\nx")), "make -j8 x");
+        assert_eq!(short("3f2a9c1e00112233"), "3f2a9c1e");
+        // Not hex, and multibyte: no panic, no escape
+        assert_eq!(short("\u{1b}[2Jééééééééé"), "éééé");
+        assert_eq!(describe(Some("a\u{9b}31mb"), None), " (ab)");
+    }
 
     #[test]
     fn sessions_are_named_by_id_prefix_or_name() {

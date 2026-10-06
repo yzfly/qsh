@@ -10,12 +10,16 @@
 //! stop the session threads (≤ 2 s)
 //! state ─▶ sealed anonymous file, key ─▶ pipe
 //! clear close-on-exec on exactly those fds
-//! execve(P, daemon --resume …) ───────────────▶ read key, open + check state, fstat every fd
-//!   (returns only on failure: resume as A)         ├─ fails before commit: fexecve(A) (Linux)
-//!                                                  └─ commit: adopt, start threads, serve
+//! fexecve(P, handoff-resume …) ───────────────▶ read key, arm the fallback (before anything
+//!   (returns only on failure: resume as A)         else), open the state, fstat every fd,
+//!                                                  work on duplicates of every descriptor
+//!                                                  ├─ fails before the threads start:
+//!                                                  │  fexecve(A) (Linux), A' refuses P from now on
+//!                                                  └─ commit: close the originals, start the
+//!                                                     threads, serve
 //! ```
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::ffi::CString;
 use std::fs::File;
 use std::io::{self, Write};
@@ -30,9 +34,9 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
-use super::handoff::{self, Listener, ListenerKind, SessionFds, State, NO_FD};
+use super::handoff::{self, Exe, FileId, Listener, ListenerKind, Refused, Resume, SessionFds, State, NO_FD};
 use super::pty::{Adopted, AdoptedFds, PtySession};
-use super::{adopt, fd_number, serve, version, Listeners, Resume, Runtime, ServerConfig, Shared, StartError};
+use super::{adopt, fd_number, serve, version, Listeners, Runtime, ServerConfig, Shared, StartError};
 use crate::config::Upgrade;
 use crate::crypto::{self, Identity, StateKey, STATE_KEY_LEN};
 use crate::log;
@@ -44,10 +48,18 @@ pub(crate) const TEST_VERSION: &str = "QSH_TEST_VERSION";
 
 /// A test hook (unstable): a comma-separated list of faults, one per upgrade attempt, in
 /// order: `stop` (the session threads do not stop), `serialize` (the state cannot be
-/// written), `exec` (execve fails), `restore` (the new image cannot resume; Linux falls back
-/// to the old one), `none` (this attempt has no fault). Read when the daemon starts, only in
-/// builds with the cargo feature `test-hooks`.
+/// written), `exec` (execve fails); in the new image, which Linux then replaces with the old
+/// one again: `start` (a panic right after the fallback is armed, before the state is even
+/// read: what an early exit of a later version would be), `restore` (the state's descriptors
+/// cannot be checked), `commit` (the last step before the session threads start fails);
+/// `none` (this attempt has no fault). Read when the daemon starts, only in builds with the
+/// cargo feature `test-hooks`.
 pub(crate) const TEST_FAULT: &str = "QSH_TEST_HANDOFF_FAULT";
+
+/// A test hook (unstable, `test-hooks` builds): the version the old image reported through
+/// [`TEST_VERSION`], which the new image does not inherit, so that the old image reports it
+/// again when it takes over after a failure (m2.md 10.4).
+const TEST_FALLBACK_VERSION: &str = "QSH_TEST_FALLBACK_VERSION";
 
 /// GOAWAY (RESTART) has this long to reach the clients before their connections close.
 const GOAWAY_FLUSH: Duration = Duration::from_millis(500);
@@ -62,7 +74,9 @@ pub(crate) enum Fault {
     Stop,
     Serialize,
     Exec,
+    Start,
     Restore,
+    Commit,
 }
 
 impl Fault {
@@ -72,8 +86,15 @@ impl Fault {
             Fault::Stop => "stop",
             Fault::Serialize => "serialize",
             Fault::Exec => "exec",
+            Fault::Start => "start",
             Fault::Restore => "restore",
+            Fault::Commit => "commit",
         }
+    }
+
+    /// A fault of the new image: the old one passes it on.
+    fn of_new_image(self) -> bool {
+        matches!(self, Fault::Start | Fault::Restore | Fault::Commit)
     }
 }
 
@@ -90,16 +111,18 @@ fn faults_from_env() -> VecDeque<Fault> {
             "stop" => Some(Fault::Stop),
             "serialize" => Some(Fault::Serialize),
             "exec" => Some(Fault::Exec),
+            "start" => Some(Fault::Start),
             "restore" => Some(Fault::Restore),
+            "commit" => Some(Fault::Commit),
             _ => None,
         })
         .collect()
 }
 
-/// An upgrade decided on: the program to execute.
+/// An upgrade decided on: the program to execute, open and checked.
 #[derive(Debug)]
 pub(crate) struct Plan {
-    pub exe: PathBuf,
+    pub exe: Exe,
     pub version: String,
     pub why: String,
 }
@@ -137,11 +160,13 @@ pub(crate) struct UpgradeState {
     last_error: Mutex<Option<String>>,
     /// The version this image was upgraded from.
     upgraded_from: Option<String>,
-    /// Programs (device, inode) whose probe said no: not probed again unless forced.
-    refused: Mutex<HashSet<(u64, u64)>>,
+    /// Programs whose checks or probe said no, or an upgrade to which failed: never tried
+    /// again by the daemon itself, only with `--force` (security.md 4.8). Oldest first, at
+    /// most [`handoff::MAX_REFUSED`]; handed on to the next image in the state.
+    refused: Mutex<Vec<Refused>>,
     /// The executable this image was started from, and its identity then.
     exe: Option<PathBuf>,
-    exe_id: Option<(u64, u64)>,
+    exe_id: Option<FileId>,
     /// This image's executable, open (Linux): the fallback of the next upgrade (m2.md 10.4).
     fallback_exe: Option<File>,
     faults: Mutex<VecDeque<Fault>>,
@@ -159,13 +184,22 @@ impl UpgradeState {
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
         let fallback_exe = None;
         let (mut restarts, mut failures, mut last_error, mut upgraded_from) = (0, 0, None, None);
+        let mut refused = Vec::new();
         if let Some((state, fell_back)) = from {
             restarts = state.restarts;
             failures = state.failures;
+            refused = state.refused.clone();
             if fell_back {
                 failures += 1;
                 last_error = Some("the new program could not resume the sessions; the previous one took over again (see the daemon log)".to_string());
+                // Never again by itself: a program that failed would fail every time, and
+                // every attempt ends every connection (review H1)
+                if let Some(id) = state.attempt {
+                    remember(&mut refused, id, true);
+                }
             } else {
+                // This image is the program that was attempted: it worked
+                refused.retain(|r| Some(r.id) != state.attempt);
                 restarts += 1;
                 upgraded_from = Some(state.writer.trim_start_matches("qsh-server/").to_string());
             }
@@ -179,7 +213,7 @@ impl UpgradeState {
             failures: AtomicU32::new(failures),
             last_error: Mutex::new(last_error),
             upgraded_from,
-            refused: Mutex::new(HashSet::new()),
+            refused: Mutex::new(refused),
             exe,
             exe_id,
             fallback_exe,
@@ -194,15 +228,30 @@ impl UpgradeState {
         self.quiescing.load(Ordering::SeqCst)
     }
 
-    /// An upgrade attempt failed; the daemon goes on as it was.
-    pub fn failed(&self, error: &str) {
+    /// An upgrade attempt to `program` failed; the daemon goes on as it was, and does not try
+    /// that program again by itself (only `qsh-server upgrade --force` does).
+    pub fn failed(&self, error: &str, program: Option<FileId>) {
         log::info(format_args!(
             "upgrade failed: {error}; the daemon goes on with its sessions"
         ));
+        if let Some(id) = program {
+            remember(&mut self.refused.lock().unwrap(), id, true);
+        }
         self.failures.fetch_add(1, Ordering::SeqCst);
         *self.last_error.lock().unwrap() = Some(error.to_string());
         self.quiescing.store(false, Ordering::SeqCst);
         self.busy.store(false, Ordering::SeqCst);
+    }
+
+    /// Whether `id` is a program not to try again by itself: Some(true) when an upgrade to it
+    /// failed, Some(false) when its checks or probe said no.
+    fn refused(&self, id: FileId) -> Option<bool> {
+        self.refused
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|r| r.id == id)
+            .map(|r| r.failed)
     }
 
     /// Start the upgrade `plan` (prepared by [`prepare`]).
@@ -227,10 +276,25 @@ impl UpgradeState {
     }
 }
 
+/// Add `id` to the refused programs (at most [`handoff::MAX_REFUSED`], the oldest dropped).
+fn remember(refused: &mut Vec<Refused>, id: FileId, failed: bool) {
+    match refused.iter_mut().find(|r| r.id == id) {
+        Some(r) => r.failed |= failed,
+        None => {
+            if refused.len() >= handoff::MAX_REFUSED {
+                refused.remove(0);
+            }
+            refused.push(Refused { id, failed });
+        }
+    }
+}
+
 /// Decide whether to upgrade to `exe` (m2.md 10.3 steps 1 and 2): this daemon can upgrade,
 /// no other upgrade runs, `exe` is safe to execute, its probe answers with a state format this
-/// daemon writes and a newer version (unless `force`). On success the daemon is reserved for
-/// this upgrade: pass the plan to [`UpgradeState::start`].
+/// daemon writes and a newer version (unless `force`). A program refused here, or one an
+/// upgrade to failed, is not opened, checked or probed again unless `force` (security.md 4.8).
+/// On success the daemon is reserved for this upgrade: pass the plan to
+/// [`UpgradeState::start`].
 pub(crate) async fn prepare(shared: &Shared, exe: &Path, force: bool, why: &str) -> Result<Plan, Refusal> {
     if shared.config.reexec.is_none() {
         return Err(Refusal::new(
@@ -242,26 +306,38 @@ pub(crate) async fn prepare(shared: &Shared, exe: &Path, force: bool, why: &str)
         return Err(Refusal::new("an upgrade is already in progress"));
     }
     let result = async {
-        let id = handoff::file_identity(exe);
-        if !force && id.is_some_and(|id| state.refused.lock().unwrap().contains(&id)) {
-            return Err(Refusal {
-                message: format!("{} was already found unsuitable", exe.display()),
-                not_newer: true,
-            });
-        }
-        handoff::validate_exe(exe).map_err(Refusal::new)?;
-        let probe = handoff::probe(exe).await.map_err(Refusal::new)?;
-        let refuse = |message: String, not_newer: bool| {
-            if let Some(id) = id {
-                state.refused.lock().unwrap().insert(id);
+        // Opened once: the checks, the probe and the execve are about this file (review M1)
+        let exe = Exe::open(exe).map_err(Refusal::new)?;
+        let name = exe.path.display().to_string();
+        match state.refused(exe.id) {
+            Some(true) if !force => {
+                return Err(Refusal::new(format!(
+                    "an upgrade to {name} failed before; the daemon does not try it again by itself (qsh-server upgrade --force does)"
+                )))
             }
+            Some(false) if !force => {
+                return Err(Refusal {
+                    message: format!("{name} was already found unsuitable"),
+                    not_newer: true,
+                })
+            }
+            _ => {}
+        }
+        let refuse = |message: String, not_newer: bool| {
+            remember(&mut state.refused.lock().unwrap(), exe.id, false);
             Err(Refusal { message, not_newer })
+        };
+        if let Err(e) = exe.check() {
+            return refuse(e, false);
+        }
+        let probe = match handoff::probe(&exe).await {
+            Ok(p) => p,
+            Err(e) => return refuse(e, false),
         };
         if !probe.formats.contains(&handoff::FORMAT) {
             return refuse(
                 format!(
-                    "{} reads state formats {:?}; this daemon writes {}",
-                    exe.display(),
+                    "{name} reads state formats {:?}; this daemon writes {}",
                     probe.formats,
                     handoff::FORMAT
                 ),
@@ -271,8 +347,7 @@ pub(crate) async fn prepare(shared: &Shared, exe: &Path, force: bool, why: &str)
         if !force && !handoff::newer(&probe.version, version()) {
             return refuse(
                 format!(
-                    "{} is version {}, not newer than the daemon's {}",
-                    exe.display(),
+                    "{name} is version {}, not newer than the daemon's {}",
                     probe.version,
                     version()
                 ),
@@ -280,7 +355,7 @@ pub(crate) async fn prepare(shared: &Shared, exe: &Path, force: bool, why: &str)
             );
         }
         Ok(Plan {
-            exe: exe.to_path_buf(),
+            exe,
             version: probe.version,
             why: why.to_string(),
         })
@@ -333,7 +408,7 @@ pub(crate) async fn watch_exe(shared: Arc<Shared>) {
         if shared.config.upgrade != Upgrade::Auto {
             continue;
         }
-        if handoff::file_identity(&path).is_none_or(|now| now == started) {
+        if handoff::file_identity(&path).is_none_or(|now| now == started || shared.upgrade.refused(now).is_some()) {
             continue;
         }
         if shared.sessions.all().iter().any(|s| s.attached() > 0) {
@@ -362,7 +437,7 @@ pub(crate) async fn run(shared: &Arc<Shared>, runtime: &mut Runtime, plan: Plan)
     let fault = shared.upgrade.faults.lock().unwrap().pop_front().unwrap_or(Fault::None);
     log::info(format_args!(
         "upgrading in place to {} {} ({})",
-        plan.exe.display(),
+        plan.exe.path.display(),
         plan.version,
         plan.why
     ));
@@ -403,7 +478,7 @@ pub(crate) async fn run(shared: &Arc<Shared>, runtime: &mut Runtime, plan: Plan)
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     // 4. Serialize
-    let handoff = match serialize(shared, runtime, &sessions, fault) {
+    let handoff = match serialize(shared, runtime, &sessions, &plan, fault) {
         Ok(h) => h,
         Err(e) => return resume_here(runtime, &sessions, format!("cannot write the state: {e}")).await,
     };
@@ -434,7 +509,13 @@ async fn resume_here(runtime: &Runtime, sessions: &[Arc<PtySession>], error: Str
 }
 
 /// m2.md 10.3 step 4: the state, sealed into an anonymous file; the key in a pipe.
-fn serialize(shared: &Shared, runtime: &Runtime, sessions: &[Arc<PtySession>], fault: Fault) -> io::Result<Handoff> {
+fn serialize(
+    shared: &Shared,
+    runtime: &Runtime,
+    sessions: &[Arc<PtySession>],
+    plan: &Plan,
+    fault: Fault,
+) -> io::Result<Handoff> {
     if fault == Fault::Serialize {
         return Err(io::Error::other("test fault"));
     }
@@ -472,6 +553,9 @@ fn serialize(shared: &Shared, runtime: &Runtime, sessions: &[Arc<PtySession>], f
             .map_or(0, |d| d.as_millis() as u64),
         restarts: shared.upgrade.restarts.load(Ordering::SeqCst),
         failures: shared.upgrade.failures.load(Ordering::SeqCst),
+        options: shared.config.reexec.as_ref().map(|r| r.options).unwrap_or_default(),
+        refused: shared.upgrade.refused.lock().unwrap().clone(),
+        attempt: Some(plan.exe.id),
         port: shared.port,
         listeners,
         sessions: sessions.iter().filter_map(|s| s.export()).collect(),
@@ -490,10 +574,10 @@ fn serialize(shared: &Shared, runtime: &Runtime, sessions: &[Arc<PtySession>], f
 }
 
 /// The environment of the next image: this one's, without the test hooks that must not pass
-/// on, with the remaining test faults.
-fn next_environment(faults: Option<String>) -> Vec<CString> {
+/// on, with the remaining test faults and `extra` hooks.
+fn next_environment(faults: Option<String>, extra: &[(&str, String)]) -> Vec<CString> {
     let mut env: Vec<CString> = std::env::vars_os()
-        .filter(|(k, _)| k != TEST_VERSION && k != TEST_FAULT)
+        .filter(|(k, _)| k != TEST_VERSION && k != TEST_FAULT && k != TEST_FALLBACK_VERSION)
         .filter_map(|(k, v)| {
             let mut entry = k.as_bytes().to_vec();
             entry.push(b'=');
@@ -504,6 +588,9 @@ fn next_environment(faults: Option<String>) -> Vec<CString> {
     if let Some(faults) = faults.filter(|f| !f.is_empty()) {
         env.extend(CString::new(format!("{TEST_FAULT}={faults}")).ok());
     }
+    if cfg!(feature = "test-hooks") {
+        env.extend(extra.iter().filter_map(|(k, v)| CString::new(format!("{k}={v}")).ok()));
+    }
     env
 }
 
@@ -511,36 +598,14 @@ fn faults_text<'a>(faults: impl Iterator<Item = &'a Fault>) -> String {
     faults.map(|f| f.name()).collect::<Vec<_>>().join(",")
 }
 
-/// `qsh-server daemon --resume …` and this daemon's own options.
-fn resume_arguments(
-    config: &ServerConfig,
-    state_fd: RawFd,
-    key_fd: RawFd,
-    fallback: Option<RawFd>,
-    fell_back: bool,
-) -> Vec<CString> {
-    let mut args = vec![
-        "qsh-server".to_string(),
-        "daemon".into(),
-        "--resume".into(),
-        format!("--state-fd={state_fd}"),
-        format!("--key-fd={key_fd}"),
-    ];
-    if let Some(fd) = fallback {
-        args.push(format!("--fallback-exe-fd={fd}"));
-    }
-    if fell_back {
-        args.push("--fell-back".into());
-    }
-    let mut args: Vec<CString> = args.into_iter().filter_map(|a| CString::new(a).ok()).collect();
-    if let Some(reexec) = &config.reexec {
-        args.extend(reexec.args.iter().filter_map(|a| CString::new(a.as_bytes()).ok()));
-    }
-    args
+fn c_strings(args: Vec<String>) -> Vec<CString> {
+    args.into_iter().filter_map(|a| CString::new(a).ok()).collect()
 }
 
 /// m2.md 10.3 step 5: clear close-on-exec on exactly the descriptors the new image adopts, and
-/// execute it. Returns only when that failed, with close-on-exec set again.
+/// execute it: on Linux the open file that was checked and probed (`fexecve`), elsewhere its
+/// path after checking that it still names that file. Returns only when that failed, with
+/// close-on-exec set again.
 fn exec(shared: &Shared, plan: &Plan, handoff: &Handoff, fault: Fault) -> String {
     let fallback = shared
         .upgrade
@@ -552,24 +617,28 @@ fn exec(shared: &Shared, plan: &Plan, handoff: &Handoff, fault: Fault) -> String
     inherit.push(fd_number(&handoff.file) as RawFd);
     inherit.push(fd_number(&handoff.key) as RawFd);
     inherit.extend(fallback);
-    let path = match CString::new(plan.exe.as_os_str().as_bytes()) {
-        Ok(p) => p,
-        Err(_) => return format!("{} is not a usable path", plan.exe.display()),
-    };
-    let args = resume_arguments(
-        &shared.config,
-        fd_number(&handoff.file) as RawFd,
-        fd_number(&handoff.key) as RawFd,
-        fallback,
-        false,
+    let args = c_strings(
+        Resume {
+            format: handoff::FORMAT,
+            state_fd: fd_number(&handoff.file) as RawFd,
+            key_fd: fd_number(&handoff.key) as RawFd,
+            fallback_exe_fd: fallback,
+            fell_back: false,
+        }
+        .to_args(),
     );
-    // The faults left for the next image: a `restore` fault is its own
+    // The faults left for the next image: a fault of the new image is its own
     let faults = {
         let remaining = shared.upgrade.faults.lock().unwrap();
-        let mine = (fault == Fault::Restore).then_some(&Fault::Restore);
+        let mine = fault.of_new_image().then_some(&fault);
         faults_text(mine.into_iter().chain(remaining.iter()))
     };
-    let env = next_environment(Some(faults));
+    let extra: Vec<(&str, String)> = std::env::var(TEST_VERSION)
+        .ok()
+        .map(|v| (TEST_FALLBACK_VERSION, v))
+        .into_iter()
+        .collect();
+    let env = next_environment(Some(faults), &extra);
     let mut set = Vec::new();
     let mut error = None;
     for fd in &inherit {
@@ -587,15 +656,34 @@ fn exec(shared: &Shared, plan: &Plan, handoff: &Handoff, fault: Fault) -> String
         let e = if fault == Fault::Exec {
             io::Error::other("test fault")
         } else {
-            sys::execve(&path, &args, &env)
+            execute(&plan.exe, &args, &env)
         };
         let _ = sys::raise_nofile_limit();
-        format!("cannot execute {}: {e}", plan.exe.display())
+        format!("cannot execute {}: {e}", plan.exe.path.display())
     });
     for fd in &set {
         let _ = sys::set_inheritable(fd, false);
     }
     error
+}
+
+/// Execute the checked program (returns only when that failed).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn execute(exe: &Exe, args: &[CString], env: &[CString]) -> io::Error {
+    sys::fexecve(&exe.file, args, env)
+}
+
+/// Execute the checked program (returns only when that failed). Without `fexecve` the path
+/// is used, right after checking that it still names the file that was checked.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn execute(exe: &Exe, args: &[CString], env: &[CString]) -> io::Error {
+    let Ok(path) = CString::new(exe.real.as_os_str().as_bytes()) else {
+        return io::Error::other("not a usable path");
+    };
+    if !exe.unchanged() {
+        return io::Error::other("it was replaced after it was checked");
+    }
+    sys::execve(&path, args, env)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -697,21 +785,112 @@ fn read_key(fd: RawFd) -> io::Result<StateKey> {
     Ok(key)
 }
 
-/// Everything checked, nothing changed (before the commit).
-struct Checked {
-    state: State,
-    identity: Identity,
+/// A duplicate of descriptor `fd` of the state, as `T`: until the commit this image works on
+/// duplicates and leaves every original open and untouched, so that the old image can take
+/// over again with exactly what it handed over (m2.md 10.4).
+fn duplicate<T: From<OwnedFd>>(fd: u32) -> io::Result<T> {
+    peek(fd, |f| f.try_clone()).map(|f| T::from(OwnedFd::from(f)))
 }
 
-/// m2.md 10.3 step 7: read and check everything, change nothing.
-fn check(config: &ServerConfig, resume: &Resume, key: &StateKey, fault: bool) -> io::Result<Checked> {
-    // The parser is bounded and fuzzed; a panic in it all the same is an error like any
-    // other here (the caller falls back to the old image), not a crash
-    let state = peek(resume.state_fd as u32, |f| {
-        crate::fault::contain(|| handoff::read_sealed(f, key))
-            .unwrap_or_else(|fault| Err(io::Error::other(format!("the state parser failed ({fault})"))))
-    })?;
-    if fault {
+/// A new image of the daemon on its way to resuming (m2.md 10.3 steps 7 to 9), from the moment
+/// [`Resuming::begin`] armed the fallback. `qsh-server` makes it first thing when started with
+/// [`handoff::RESUME_COMMAND`], before it parses its command line or starts its async runtime:
+/// whatever fails or panics from then until the session threads start executes the old image
+/// again (Linux), so that no change of a later version's options, start-up or configuration
+/// can lose the sessions (review M3).
+#[derive(Debug)]
+pub struct Resuming {
+    resume: Resume,
+    state: State,
+    /// This image's own test fault ([`TEST_FAULT`]).
+    fault: Fault,
+}
+
+impl Resuming {
+    /// Read the state's key, arm the fallback (Linux), then read and open the state. On an
+    /// error after the fallback is armed, the old image is executed again and this returns
+    /// only if that is impossible.
+    pub fn begin(resume: Resume) -> Result<Resuming, String> {
+        let mut faults = faults_from_env();
+        // The old image taking over again has no fault of its own: the rest are for its next
+        // attempts
+        let fault = match faults.front() {
+            Some(f) if f.of_new_image() && !resume.fell_back => faults.pop_front().unwrap_or(Fault::None),
+            _ => Fault::None,
+        };
+        let key = read_key(resume.key_fd).map_err(|e| format!("cannot read the state's key: {e}"))?;
+        fallback::arm(&resume, &key, faults_text(faults.iter()));
+        if fault == Fault::Start {
+            panic!("test fault: start");
+        }
+        // The parser is bounded and fuzzed; a panic in it all the same is an error like any
+        // other here (the old image takes over), not a crash
+        let state = peek(resume.state_fd as u32, |f| {
+            crate::fault::contain(|| handoff::read_sealed(f, &key))
+                .unwrap_or_else(|fault| Err(io::Error::other(format!("the state parser failed ({fault})"))))
+        });
+        drop(key);
+        match state {
+            Ok(state) => Ok(Resuming { resume, state, fault }),
+            Err(e) => Err(Resuming::give_up(&format!("cannot read the state: {e}"))),
+        }
+    }
+
+    /// The daemon's options, from the state.
+    pub fn options(&self) -> handoff::DaemonOptions {
+        self.state.options
+    }
+
+    /// Give up resuming: execute the old image again (Linux). Returns, with `why`, only when
+    /// that is impossible.
+    pub fn fail(self, why: &str) -> String {
+        Resuming::give_up(why)
+    }
+
+    fn give_up(why: &str) -> String {
+        log::info(format_args!("cannot resume from the previous image: {why}"));
+        fallback::run(why);
+        why.to_string()
+    }
+}
+
+/// Everything the new image needs to serve, made on duplicates of the inherited descriptors:
+/// nothing the old image handed over was changed yet.
+struct Ready {
+    shared: Arc<Shared>,
+    runtime: Runtime,
+    plans: mpsc::UnboundedReceiver<Plan>,
+    adopted: Vec<Adopted>,
+    /// The inherited originals, closed at the commit.
+    originals: Vec<u32>,
+    writer: String,
+    fell_back: bool,
+}
+
+/// The new image: from the inherited state to a serving daemon (m2.md 10.3 steps 7 to 9).
+pub(crate) async fn resume(
+    config: ServerConfig,
+    resuming: Resuming,
+) -> Result<(Arc<Shared>, Runtime, mpsc::UnboundedReceiver<Plan>), StartError> {
+    // As a daemon that starts (section 6.6); the previous image put the limit back
+    if let Err(e) = sys::raise_nofile_limit() {
+        log::info(format_args!("cannot raise the limit of open files: {e}"));
+    }
+    let Resuming { resume, state, fault } = resuming;
+    match prepare_resume(config, &resume, state, fault) {
+        Ok(ready) => Ok(commit(ready)),
+        Err(e) => {
+            Resuming::give_up(&e.to_string());
+            Err(e.into())
+        }
+    }
+}
+
+/// m2.md 10.3 steps 7 and 8 up to the commit: check every descriptor, then build the listeners,
+/// the sessions and the runtime on duplicates. Any error here leaves the originals as they were
+/// handed over.
+fn prepare_resume(config: ServerConfig, resume: &Resume, mut state: State, fault: Fault) -> io::Result<Ready> {
+    if fault == Fault::Restore {
         return Err(io::Error::other("test fault"));
     }
     check_descriptors(&state)?;
@@ -719,86 +898,22 @@ fn check(config: &ServerConfig, resume: &Resume, key: &StateKey, fault: bool) ->
     paths.ensure_runtime()?;
     paths.ensure_state()?;
     let identity = Identity::load_or_create(&paths.identity_dir())?;
-    Ok(Checked { state, identity })
-}
-
-/// The new image: from the inherited state to a serving daemon (m2.md 10.3 steps 7 to 9).
-pub(crate) async fn resume(
-    config: ServerConfig,
-    resume: Resume,
-) -> Result<(Arc<Shared>, Runtime, mpsc::UnboundedReceiver<Plan>), StartError> {
-    let mut faults = faults_from_env();
-    let fault = faults.front() == Some(&Fault::Restore);
-    if fault {
-        faults.pop_front();
-    }
-    // As a daemon that starts (section 6.6); the previous image put the limit back
-    if let Err(e) = sys::raise_nofile_limit() {
-        log::info(format_args!("cannot raise the limit of open files: {e}"));
-    }
-    let key = read_key(resume.key_fd)?;
-    fallback::arm(&config, &resume, &key, faults_text(faults.iter()));
-    let checked = match check(&config, &resume, &key, fault) {
-        Ok(c) => c,
-        Err(e) => {
-            log::info(format_args!("cannot resume from the previous image: {e}"));
-            fallback::run(&format!("{e}"));
-            return Err(e.into());
-        }
-    };
-    fallback::disarm();
-    drop(key);
-    // Committed: from here on this image owns the descriptors and the sessions
-    commit(config, resume, checked)
-}
-
-/// Adopt the descriptors and the sessions; start nothing yet but the session threads.
-fn commit(
-    config: ServerConfig,
-    resume: Resume,
-    checked: Checked,
-) -> Result<(Arc<Shared>, Runtime, mpsc::UnboundedReceiver<Plan>), StartError> {
-    let Checked { mut state, identity } = checked;
+    let mut originals = state.descriptors();
+    originals.push(resume.state_fd as u32);
+    originals.extend(resume.fallback_exe_fd.map(|fd| fd as u32));
     let (mut udp, mut tcp, mut control, mut lock) = (Vec::new(), Vec::new(), None, None);
     for l in &state.listeners {
         match l.kind {
-            ListenerKind::Udp => udp.push((l.port, adopt::<std::net::UdpSocket>(l.fd)?)),
-            ListenerKind::Tcp => tcp.push((l.port, adopt::<std::net::TcpListener>(l.fd)?)),
-            ListenerKind::Control => control = Some(adopt::<UnixListener>(l.fd)?),
-            ListenerKind::Lock => lock = Some(adopt::<File>(l.fd)?),
+            ListenerKind::Udp => udp.push((l.port, duplicate::<std::net::UdpSocket>(l.fd)?)),
+            ListenerKind::Tcp => tcp.push((l.port, duplicate::<std::net::TcpListener>(l.fd)?)),
+            ListenerKind::Control => control = Some(duplicate::<UnixListener>(l.fd)?),
+            ListenerKind::Lock => lock = Some(duplicate::<File>(l.fd)?),
         }
     }
     // The primary port first
     let primary = state.port;
     udp.sort_by_key(|(port, _)| *port != primary);
     tcp.sort_by_key(|(port, _)| *port != primary);
-    // The state and the old image's executable are not needed any more
-    drop(adopt::<File>(resume.state_fd as u32));
-    if let Some(fd) = resume.fallback_exe_fd {
-        drop(adopt::<File>(fd as u32));
-    }
-    let sessions = std::mem::take(&mut state.sessions);
-    let mut adopted: Vec<Adopted> = Vec::new();
-    for s in sessions {
-        let id = crypto::hex(&s.id[..4]);
-        let mut fds = AdoptedFds::default();
-        let take = |fd: u32| (fd != NO_FD).then(|| adopt::<File>(fd)).transpose();
-        let taken = match s.fds {
-            SessionFds::Tty { master } => take(master).map(|m| fds.master = m),
-            SessionFds::Pipe { stdin, stdout, stderr } => (|| {
-                fds.stdin = take(stdin)?;
-                fds.stdout = take(stdout)?;
-                fds.stderr = take(stderr)?;
-                Ok(())
-            })(),
-        };
-        match taken.and_then(|()| PtySession::adopt(s, fds)) {
-            Ok(a) => adopted.push(a),
-            Err(e) => log::info(format_args!("session {id}: cannot adopt it: {e}")),
-        }
-    }
-    // Everything this image needs is adopted; nothing else may reach a program it starts
-    sys::cloexec_from(3);
     let control = control.ok_or_else(|| io::Error::other("no control socket"))?;
     control.set_nonblocking(true)?;
     for (_, socket) in &udp {
@@ -813,11 +928,26 @@ fn commit(
         control,
         lock: lock.ok_or_else(|| io::Error::other("no lock"))?,
     };
+    let mut adopted: Vec<Adopted> = Vec::new();
+    for s in std::mem::take(&mut state.sessions) {
+        let id = crypto::hex(&s.id[..4]);
+        let take = |fd: u32| (fd != NO_FD).then(|| duplicate::<File>(fd)).transpose();
+        let mut fds = AdoptedFds::default();
+        match s.fds {
+            SessionFds::Tty { master } => fds.master = take(master)?,
+            SessionFds::Pipe { stdin, stdout, stderr } => {
+                fds.stdin = take(stdin)?;
+                fds.stdout = take(stdout)?;
+                fds.stderr = take(stderr)?;
+            }
+        }
+        let session = PtySession::adopt(s, fds).map_err(|e| io::Error::other(format!("session {id}: {e}")))?;
+        adopted.push(session);
+    }
     let (upgrade, plans) = UpgradeState::new(&config, Some((&state, resume.fell_back)));
-    let paths = config.paths.clone();
     let shared = Arc::new(Shared {
         extra_ports: listeners.extra_ports(primary),
-        account: super::pty::account(&paths.home, config.shell.as_deref()),
+        account: super::pty::account(&config.paths.home, config.shell.as_deref()),
         gate: Arc::new(super::gate::Gate::new(config.preauth)),
         config,
         connections: serve::Registry::default(),
@@ -830,10 +960,44 @@ fn commit(
         upgrade,
     });
     let runtime = Runtime::new(&identity, listeners)?;
-    let mut kept = 0;
-    for a in adopted {
+    for a in &adopted {
         // Its screen model first, from the state, before its threads add output
         super::serve::install_model(&shared, &a.session);
+    }
+    if fault == Fault::Commit {
+        return Err(io::Error::other("test fault"));
+    }
+    Ok(Ready {
+        shared,
+        runtime,
+        plans,
+        adopted,
+        originals,
+        writer: state.writer,
+        fell_back: resume.fell_back,
+    })
+}
+
+/// The commit (m2.md 10.3 step 8): no fallback any more; the inherited originals are closed
+/// (this image owns duplicates of every one it needs), and the session threads start.
+fn commit(ready: Ready) -> (Arc<Shared>, Runtime, mpsc::UnboundedReceiver<Plan>) {
+    let Ready {
+        shared,
+        runtime,
+        plans,
+        adopted,
+        originals,
+        writer,
+        fell_back,
+    } = ready;
+    fallback::disarm();
+    for fd in originals {
+        drop(adopt::<OwnedFd>(fd));
+    }
+    // Everything this image needs is its own; nothing else may reach a program it starts
+    sys::cloexec_from(3);
+    let mut kept = 0;
+    for a in adopted {
         match a.start() {
             Ok(session) => {
                 shared.sessions.insert(session);
@@ -842,22 +1006,20 @@ fn commit(
             Err(e) => log::info(format_args!("a session could not be resumed: {e}")),
         }
     }
-    if resume.fell_back {
+    if fell_back {
         eprintln!(
-            "qsh-server {}: daemon pid {}: the upgrade failed, resumed {} with {kept} session(s)",
+            "qsh-server {}: daemon pid {}: the upgrade failed, resumed {writer} with {kept} session(s)",
             version(),
             std::process::id(),
-            state.writer
         );
     } else {
         eprintln!(
-            "qsh-server {}: daemon pid {}: upgraded in place from {}, {kept} session(s) kept",
+            "qsh-server {}: daemon pid {}: upgraded in place from {writer}, {kept} session(s) kept",
             version(),
             std::process::id(),
-            state.writer
         );
     }
-    Ok((shared, runtime, plans))
+    (shared, runtime, plans)
 }
 
 /// m2.md 10.4: when the new image cannot resume, it executes the old one again (Linux, which
@@ -865,8 +1027,7 @@ fn commit(
 /// package upgrade that replaced the file does not matter). A panic before the commit does
 /// the same, from the panic hook, which runs before any unwinding (release builds unwind). A
 /// panic that `crate::fault::contain` catches does not: it costs one feature of one session,
-/// and is handled where it is caught. (The models of the sessions are made in `commit`, after
-/// `disarm`; their panics are contained by `screen::Live` all the same.)
+/// and is handled where it is caught.
 mod fallback {
     use super::*;
 
@@ -875,26 +1036,26 @@ mod fallback {
     #[cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
     struct Plan {
         exe: RawFd,
+        format: u16,
         state: RawFd,
         key: StateKey,
         faults: String,
-        config: ServerConfig,
     }
 
     static PLAN: Mutex<Option<Plan>> = Mutex::new(None);
 
     /// Prepare the fallback, if this system and the old image allow one.
-    pub(super) fn arm(config: &ServerConfig, resume: &Resume, key: &StateKey, faults: String) {
+    pub(super) fn arm(resume: &Resume, key: &StateKey, faults: String) {
         let Some(exe) = resume.fallback_exe_fd else { return };
         if !cfg!(any(target_os = "linux", target_os = "android")) {
             return;
         }
         *PLAN.lock().unwrap_or_else(|e| e.into_inner()) = Some(Plan {
             exe,
+            format: resume.format,
             state: resume.state_fd,
             key: key.clone(),
             faults,
-            config: config.clone(),
         });
         static HOOK: std::sync::Once = std::sync::Once::new();
         HOOK.call_once(|| {
@@ -930,8 +1091,23 @@ mod fallback {
         let (read, write) = sys::pipe()?;
         File::from(write).write_all(&plan.key[..])?;
         sys::set_inheritable(&read, true)?;
-        let args = resume_arguments(&plan.config, plan.state, fd_number(&read) as RawFd, None, true);
-        let env = next_environment(Some(plan.faults.clone()));
+        let args = c_strings(
+            Resume {
+                format: plan.format,
+                state_fd: plan.state,
+                key_fd: fd_number(&read) as RawFd,
+                fallback_exe_fd: None,
+                fell_back: true,
+            }
+            .to_args(),
+        );
+        // The old image reports the version it reported before (test hook)
+        let extra: Vec<(&str, String)> = std::env::var(TEST_FALLBACK_VERSION)
+            .ok()
+            .map(|v| (TEST_VERSION, v))
+            .into_iter()
+            .collect();
+        let env = next_environment(Some(plan.faults.clone()), &extra);
         log::info(format_args!(
             "could not resume ({why}); executing the previous program again"
         ));

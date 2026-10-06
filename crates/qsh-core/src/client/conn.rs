@@ -33,6 +33,8 @@ const BURST_GAP: Duration = Duration::from_secs(1);
 /// A change of address reaches the client up to this long after the packet that caused it
 /// (the server looks every 500 ms, then one trip back).
 const REBIND_SLACK: Duration = Duration::from_secs(2);
+/// PONGs waiting to be written, at most: beyond, a PING is not answered.
+const PENDING_PONGS: usize = 16;
 
 /// When the client sent something other than a keepalive (m2.md 4.2, condition 3), on
 /// tokio's clock.
@@ -123,6 +125,8 @@ pub struct Conn {
     /// The capabilities negotiated.
     pub(crate) capabilities: Offer,
     control: mpsc::UnboundedSender<Message>,
+    /// PONGs queued for the control stream writer, not written yet (at most [`PENDING_PONGS`]).
+    pongs: Arc<std::sync::atomic::AtomicUsize>,
     /// When anything last arrived, on tokio's clock.
     last_rx: Mutex<tokio::time::Instant>,
     /// Messages received so far.
@@ -228,12 +232,14 @@ impl Conn {
             Err(e) => return Err(e.into()),
         };
         let (control, mut rx) = mpsc::unbounded_channel::<Message>();
+        let pongs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let started = Instant::now();
         let conn = Arc::new(Conn {
             connection,
             nonce,
             capabilities: negotiated,
             control,
+            pongs: pongs.clone(),
             last_rx: Mutex::new(tokio::time::Instant::now()),
             rx_count: std::sync::atomic::AtomicU64::new(0),
             rtt: Mutex::new(None),
@@ -256,6 +262,9 @@ impl Conn {
             while let Some(m) = rx.recv().await {
                 if write_message(&mut send, &m).await.is_err() {
                     break;
+                }
+                if matches!(m, Message::Pong { .. }) {
+                    pongs.fetch_sub(1, Ordering::SeqCst);
                 }
             }
         });
@@ -457,6 +466,12 @@ impl Conn {
         }
     }
 
+    /// PONGs waiting to be written, for the tests.
+    #[cfg(test)]
+    pub(crate) fn pongs_pending(&self) -> usize {
+        self.pongs.load(Ordering::SeqCst)
+    }
+
     /// The round-trip time: QUIC's own estimate, or the last PING.
     pub fn rtt(&self) -> Option<Duration> {
         self.connection.rtt().or(*self.rtt.lock().unwrap())
@@ -482,7 +497,13 @@ async fn control_reader(conn: std::sync::Weak<Conn>, mut recv: BufReader<RecvStr
                 }
             }
             Message::Ping { data } => {
-                let _ = conn.control.send(Message::Pong { data });
+                // Answered unless too many answers wait to be written already: a server that
+                // keeps sending PINGs without reading the answers cannot grow the queue
+                if conn.pongs.fetch_add(1, Ordering::SeqCst) < PENDING_PONGS {
+                    let _ = conn.control.send(Message::Pong { data });
+                } else {
+                    conn.pongs.fetch_sub(1, Ordering::SeqCst);
+                }
             }
             Message::PathInfo { address, port, .. } => {
                 let now = address.map(|a| SocketAddr::new(a, port));

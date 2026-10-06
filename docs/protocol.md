@@ -949,20 +949,27 @@ a slow or absent client never blocks the program.
 
 The server SHOULD NOT keep much more output sent but unacknowledged on an attachment than the
 path holds; the rest waits in the replay buffer. The amount in flight is
-`sent_end − max(last_ack, gap_to)` (section 7.5), where `gap_to` is the `To` of the latest
-OUTPUT_GAP (or the `Offset` of the latest SNAPSHOT) sent on the attachment, 0 if none: skipped
-bytes are not in flight, and the server MUST NOT wait for an acknowledgement of them before it
-sends more. The `Data` of a SNAPSHOT counts as in flight until an ACK with `Received` ≥ its
-`Offset` arrives. This keeps the transport's buffers short, so that output can still be skipped
+`(sent_end − last_ack) − Σ(skipped ∩ (last_ack, sent_end])` (section 7.5), where the skipped
+ranges are those of the OUTPUT_GAPs (`From` to `To`) and SNAPSHOTs (the expected offset to
+`Offset`) sent on the attachment: skipped bytes are not in flight, and the server MUST NOT wait
+for an acknowledgement of them before it sends more; but output sent before a skip is still in
+flight until it is acknowledged (counting from the latest skip instead, as
+`sent_end − max(last_ack, To)`, would drop it to nothing while a whole window is still on the
+wire, and put a second window behind it). The `Data` of a SNAPSHOT counts as in flight until an
+ACK with `Received` ≥ its `Offset` arrives. This keeps the transport's buffers short, so that output can still be skipped
 (section 7.8) and an interrupt typed by the user is followed quickly by the program's reaction.
 
 RECOMMENDED pacing (the reference implementation's): per attachment and output stream, the
-server measures the **delivery rate** `T`: on each ACK that advances `last_ack`, a sample is the
-newly acknowledged offsets (minus skipped ranges inside them) divided by the time since the
-previous accepted ACK, used only when output was waiting in the replay buffer during the whole
-interval (otherwise the sample measures the program, not the path); `T` is the maximum of the
-per-second averages of the samples of the last 10 s; before the first sample, `cwnd / srtt` of
-the QUIC connection, or 1 MiB/s on the mux layer. With `R` the connection's **minimum recent
+server measures the **delivery rate** `T`: a sample is the offsets newly acknowledged by the
+ACKs that advance `last_ack` (minus skipped ranges inside them) divided by the time since the
+sample began (the ACK that ended the previous one); it ends with the first such ACK at least
+`max(1 ms, R / 4)` after it began, so that ACKs coalesced microseconds apart make one sample
+rather than a rate of gigabytes per second; it is used only when output was waiting in the
+replay buffer during the whole sample (otherwise it measures the program, not the path), and
+it counts at most twice the current `T` (or the initial estimate), so that `T` can double per
+sample but not jump; `T` is the maximum of the per-second averages of the samples of the last
+10 s; before the first sample, `cwnd / srtt` of the QUIC connection, or 1 MiB/s on the mux
+layer. With `R` the connection's **minimum recent
 round-trip time** (below), the window is `clamp(1.25 × T × (R + 100 ms), 64 KiB, 8 MiB)` on a
 tty session and `max(2 × T × (R + 100 ms), 256 KiB)`, at most 8 MiB, on a pipe session. `T` is
 counted in output offsets (uncompressed bytes), so the window converts to the same time with
@@ -1224,12 +1231,18 @@ trace of an encoder bug on the server side.
 
 #### 7.8.5 When a server sends a snapshot
 
-RECOMMENDED (the reference implementation's rules; `U` = output not yet acknowledged,
-`end − max(last_ack, gap_to)`; `B` = output not yet sent, `end − sent_end`; `T` and the window
-as in section 7.6):
+RECOMMENDED (the reference implementation's rules; `U` = output neither acknowledged nor
+skipped, `(end − last_ack) − Σ(skipped ∩ (last_ack, end])` as in section 7.6; `B` = output not
+yet sent, `end − sent_end`; `T` and the window as in section 7.6):
 
-- **Backlog**: `U > max(2 s × T, 256 KiB)`, once the attachment has at least 1 s of delivery
-  rate samples (500 ms on QUIC), and subject to the hysteresis.
+- **One at a time**: at most one snapshot is in flight on an attachment (sent, and no ACK with
+  `Received` ≥ its `Offset` yet). A trigger that fires meanwhile is not lost: once the snapshot
+  in flight is acknowledged, one fresh snapshot follows (the input trigger holds the output
+  until then; a resync snapshot waits; the backlog trigger has its hysteresis anyway). Several
+  snapshots in a row would only queue screens behind each other.
+- **Backlog**: `U > max(2 s × T, 256 KiB)` and `B > 0` (there is output to skip), once the
+  attachment has at least 1 s of delivery rate samples (500 ms on QUIC), and subject to the
+  hysteresis.
 - **Input**: the server accepts INPUT while `B > max(window, 64 KiB)`. It stops sending from
   the backlog at once and takes the snapshot when the program's output pauses for 20 ms
   (measured from the input), or after 100 ms, whichever comes first, so that the snapshot shows
@@ -1242,12 +1255,16 @@ as in section 7.6):
 - **Hysteresis** (backlog trigger only): no new backlog snapshot before the previous snapshot
   has been acknowledged (`Received` ≥ its `Offset`) and 1 s has passed since it was sent.
 
-The snapshot is taken at the replay buffer's current end `E` (`Offset` = `E`); the server then
-continues with OUTPUT from `E`. After a snapshot the server does not make the program redraw
-(except as said in section 7.8.4). If no snapshot can be made (it would exceed `MAX_SNAPSHOT`,
-or the session lost its model, section 7.8.7), the server sends OUTPUT_GAP{`sent_end`, `E`}
-instead and makes the program redraw (section 7.7); for the hysteresis this counts as a
-snapshot at `E`.
+The snapshot is taken at the end `E` of the output its model has processed (`Offset` = `E`,
+at or after `sent_end`; the replay buffer's end, or just before it while the newest output is
+still being fed to the model); the server then continues with OUTPUT from `E`. After a snapshot
+the server does not make the program redraw (except as said in section 7.8.4). If no snapshot
+can be made (it would exceed `MAX_SNAPSHOT`, or the session lost its model, section 7.8.7), the
+server sends OUTPUT_GAP{`sent_end`, `E`} instead and makes the program redraw (section 7.7);
+for the hysteresis this counts as a snapshot at `E`. Without output to skip there is no gap: a
+resync snapshot that cannot be made is replaced by the redraw alone, and the backlog trigger
+does not fire again before more output arrives (making the same impossible snapshot again
+would only cost the same again).
 
 Output that falls out of the replay buffer before it was sent is skipped with OUTPUT_GAP at
 once, whatever is in flight (section 7.6); on an attachment that takes snapshots the server
@@ -1276,7 +1293,10 @@ catch-up: the server drops the session's model and continues the session as one 
 (OUTPUT_GAP and a redraw where a snapshot would have been sent, section 7.7). It MUST NOT end
 the session, other sessions or the daemon. (The reference implementation is written in Rust;
 release builds unwind on panic, and every call into the model and the codec runs under
-`catch_unwind`.) The same holds for compression: a fault while compressing a message sends it
+`catch_unwind`.) Output that would cost the model more memory or work than a server allows is
+handled the same way: the server MAY drop the model for it (the reference implementation never
+gives its emulator strings such as OSC, clamps repetition counts to the screen's size, and
+drops a model whose output asks for more work per byte and per second than a budget allows). The same holds for compression: a fault while compressing a message sends it
 uncompressed. A client treats a fault of its own decoder like a frame it cannot decode: it
 fails the channel or the connection and falls back as section 7.8.4 says after a refused
 snapshot or a rejected frame.
@@ -2177,8 +2197,12 @@ qsh-server daemons in place follow them:
   (and its configuration allows automatic upgrades), it answers `{"restarting":true}` instead of
   serving the request, and upgrades to `exe`. The requester closes, reconnects to the socket
   (performing every check of [security.md](security.md) §4.3 again: directory, peer user id) and
-  repeats its request for up to 10 s. An older daemon answers a version-2 request as it always
-  did; the requester simply uses it.
+  repeats its request for up to 10 s; a daemon still answering `{"restarting":true}` after that
+  is an error for the requester, never the reply to its request. An older daemon answers a
+  version-2 request as it always did; the requester simply uses it. A daemon tries a given
+  executable at most once by itself: one whose checks or probe failed, or an upgrade to which
+  failed, is not tried again for the daemon's lifetime (requests naming it are served as they
+  are), only on an explicit `upgrade` with `"force":true`.
 - Op `upgrade` (`{"v":2,"op":"upgrade","exe":"/usr/bin/qsh-server","force":false}`) asks for an
   upgrade explicitly; the answer is `{"restarting":true}` or `{"ok":false,"error":"…"}`.
 - Op `status` answers, from version 2, at least: `version`, `pid`, `udp`, `tcp`, `extra_ports`,
@@ -2191,8 +2215,9 @@ qsh-server daemons in place follow them:
   descriptors of pseudo-terminals, pipes and sockets) never leaves the process: the reference
   implementation re-executes itself in place (same process id, so the session programs remain
   its children) with the state in an anonymous, encrypted file descriptor. Its format is private
-  to the implementation and versioned by the `handoff` numbers; format 1 of qsh-server is
-  documented in m2.md section 10.5. The security requirements are in
+  to the implementation and versioned by the `handoff` numbers, which also version the new
+  program's command line (`qsh-server handoff-resume …`); format 1 of qsh-server is
+  documented in m2.md sections 10.3 and 10.5. The security requirements are in
   [security.md](security.md) §4.8.
 
 ## 11. Errors

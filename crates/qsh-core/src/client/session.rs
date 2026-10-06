@@ -231,6 +231,13 @@ impl State {
 /// comes anywhere near 2^62 bytes, and staying below leaves room for every offset that follows.
 const MAX_OFFSET: u64 = varint::MAX;
 
+/// The output offset after `n` bytes at `offset`, if the client can go on from there
+/// (protocol.md 7.3: checked arithmetic, offsets up to [`MAX_OFFSET`]); None is a
+/// SEQUENCE_ERROR.
+fn output_end(offset: u64, n: u64) -> Option<u64> {
+    offset.checked_add(n).filter(|&end| end <= MAX_OFFSET)
+}
+
 /// Section 7.3, client side, step 2 (and 7.14.6): whether the offsets of ATTACHED fit the
 /// client's state and can be used safely.
 fn offsets_consistent(state: &State, sent: (u64, u64), got: (u64, u64, Option<u64>)) -> bool {
@@ -954,8 +961,11 @@ impl Session {
                                 // Nobody shows the output any more: leave the session running
                                 return Ok(detach(&mut send, &mut outbox, &mut rx).await);
                             }
-                            // offset + n cannot overflow: the decoder refuses such messages
-                            *stream = Inbound::at(offset + n);
+                            // Checked: decompressed output has a length the decoder did not see
+                            let Some(end) = output_end(offset, n) else {
+                                return Ok(sequence_error(&mut send, &mut outbox).await);
+                            };
+                            *stream = Inbound::at(end);
                             self.status.lock().unwrap().bytes_in += n;
                             let unacked = (state.output.received() - acked.0) + (state.errors.received() - acked.1);
                             if unacked >= ack_bytes {
@@ -979,7 +989,7 @@ impl Session {
                                 data: &data,
                             });
                             let expected = state.output.received();
-                            if offset < expected {
+                            if offset < expected || output_end(offset, 0).is_none() {
                                 return Ok(sequence_error(&mut send, &mut outbox).await);
                             }
                             let assembly = snapshot.get_or_insert_with(|| Assembly {
@@ -1072,7 +1082,7 @@ impl Session {
                                 // A pipe session never skips output (7.14.5)
                                 return Ok(protocol_violation(&mut send, &mut outbox).await);
                             }
-                            if from != state.output.received() || from >= to {
+                            if from != state.output.received() || from >= to || output_end(to, 0).is_none() {
                                 return Ok(sequence_error(&mut send, &mut outbox).await);
                             }
                             state.output = Inbound::at(to);
@@ -1369,6 +1379,8 @@ async fn detach(
 
 /// What an ERROR on a terminal channel means for the session (section 11.2).
 fn attach_error(code: ErrorCode, message: String) -> End {
+    // The server's words, shown to the user: as text only (security.md 4.6)
+    let message = crate::text::sanitize(&message, 256);
     let why = if message.is_empty() {
         code.to_string()
     } else {
@@ -1529,6 +1541,21 @@ mod tests {
         p.fresh = false;
         assert!(offsets_consistent(&p, (0, 3), (0, 0, Some(3))));
         assert!(!offsets_consistent(&p, (0, 3), (0, 0, Some(4))));
+    }
+
+    /// Offsets that OUTPUT_GAP, SNAPSHOT or the length of decompressed output (OUTPUT_ZSTD,
+    /// which the decoder cannot check) would take past what the client can count are refused:
+    /// OUTPUT_GAP{.., 2^64 − 6} followed by OUTPUT_ZSTD of 64 bytes no longer wraps (or
+    /// panics, in a debug build).
+    #[test]
+    fn output_offsets_are_checked() {
+        assert_eq!(output_end(10, 5), Some(15));
+        assert_eq!(output_end(MAX_OFFSET, 0), Some(MAX_OFFSET));
+        assert_eq!(output_end(MAX_OFFSET - 64, 64), Some(MAX_OFFSET));
+        assert_eq!(output_end(u64::MAX - 5, 0), None);
+        assert_eq!(output_end(u64::MAX - 5, 64), None);
+        assert_eq!(output_end(MAX_OFFSET, 1), None);
+        assert_eq!(output_end(u64::MAX, u64::MAX), None);
     }
 
     #[test]

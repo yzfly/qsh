@@ -70,7 +70,7 @@ fn a_host_without_qsh_server_exits_42_with_a_hint() {
         "{stderr}"
     );
     // Never a question without a terminal
-    assert!(!stderr.contains("[Y/n]"), "{stderr}");
+    assert!(!stderr.contains("[y/N]"), "{stderr}");
     // ssh failing itself is 255
     let mut w = World::new("nossh");
     w.set("PATH", "/usr/bin:/bin");

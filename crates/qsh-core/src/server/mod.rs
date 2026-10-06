@@ -88,36 +88,25 @@ pub fn version() -> &'static str {
 /// tests, an embedder) has none, and refuses upgrades.
 #[derive(Debug, Clone)]
 pub struct Reexec {
-    /// The daemon's own options (after `daemon`), given again to the new image after
-    /// `daemon --resume …`: `--foreground`, `--on-demand`, `--ports …`.
-    pub args: Vec<OsString>,
+    /// The daemon's own options, handed to the next image in the state (m2.md 10.5).
+    pub options: handoff::DaemonOptions,
     /// How often to check whether the executable it was started from was replaced, to
     /// upgrade by itself when idle (`upgrade = "auto"`).
     pub check_every: Duration,
 }
 
 impl Reexec {
-    /// Re-execute with `args`, checking for a replaced executable every [`UPGRADE_CHECK`].
-    pub fn new(args: Vec<OsString>) -> Reexec {
+    /// Re-execute with `options`, checking for a replaced executable every [`UPGRADE_CHECK`].
+    pub fn new(options: handoff::DaemonOptions) -> Reexec {
         Reexec {
-            args,
+            options,
             check_every: UPGRADE_CHECK,
         }
     }
 }
 
-/// What a new image of the daemon was given by the old one (`qsh-server daemon --resume`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Resume {
-    /// The sealed state ([`handoff`]).
-    pub state_fd: RawFd,
-    /// The pipe with the state's key.
-    pub key_fd: RawFd,
-    /// The old image's executable, to execute again if this one cannot resume (Linux).
-    pub fallback_exe_fd: Option<RawFd>,
-    /// This is the old image again: the new one could not resume (m2.md 10.4).
-    pub fell_back: bool,
-}
+pub use handoff::Resume;
+pub use upgrade::Resuming;
 
 /// How the daemon runs.
 #[derive(Debug, Clone)]
@@ -480,16 +469,16 @@ impl Daemon {
         Daemon::serve(shared, runtime, plans, stop).await
     }
 
-    /// Resume as the new image of an upgrade in place (m2.md 10.3 steps 7 to 9): read and
-    /// check the state, adopt the descriptors and the sessions, and run. If anything fails
-    /// before the first session descriptor is touched (or a panic happens then), the old
+    /// Resume as the new image of an upgrade in place (m2.md 10.3 steps 7 to 9): check the
+    /// state [`Resuming::begin`] read, adopt the descriptors and the sessions, and run. If
+    /// anything fails before the session threads start (or a panic happens then), the old
     /// image is executed again with the same state (Linux, m2.md 10.4).
     pub async fn resume_until(
         config: ServerConfig,
-        resume: Resume,
+        resuming: Resuming,
         stop: impl std::future::Future<Output = ()> + Send,
     ) -> Result<(), StartError> {
-        let (shared, runtime, plans) = upgrade::resume(config, resume).await?;
+        let (shared, runtime, plans) = upgrade::resume(config, resuming).await?;
         Daemon::serve(shared, runtime, plans, stop).await
     }
 
@@ -510,9 +499,11 @@ impl Daemon {
                     break;
                 }
                 Some(plan) = plans.recv() => {
-                    // Returns only when the upgrade failed; the daemon goes on as it was
+                    // Returns only when the upgrade failed; the daemon goes on as it was, and
+                    // does not try that program again by itself
+                    let program = plan.exe.id;
                     let error = upgrade::run(&shared, &mut runtime, plan).await;
-                    shared.upgrade.failed(&error);
+                    shared.upgrade.failed(&error, Some(program));
                     runtime.start(&shared)?;
                 }
             }

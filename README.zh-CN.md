@@ -45,7 +45,8 @@ qsh 不做的事：它不替代 sshd，也不替代你的认证方式。每个�
 curl -fsSL https://github.com/yzfly/qsh/releases/latest/download/install.sh | sh
 ```
 
-脚本会挑选适合你系统的构建，用发布附带的 `SHA256SUMS` 校验，再把 `qsh` 和 `qsh-server`
+脚本会挑选适合你系统的构建，用发布附带的 `SHA256SUMS` 校验（有 minisign 或 OpenSSL 3 时还会校验它的
+qsh 发布密钥签名），再把 `qsh` 和 `qsh-server`
 装进 `~/.local/bin`（root 时装进 `/usr/local/bin`）。选项：`--version 0.1.0`、`--prefix DIR`、
 `--server-only`（只装 `qsh-server`，用于服务器）。想先读一遍？它就是
 [scripts/install.sh](scripts/install.sh)。
@@ -64,10 +65,12 @@ Debian、Fedora、Alpine、Arch（AUR）和 Homebrew 的原生包正在准备中
 <details>
 <summary>校验下载</summary>
 
-每个发布文件都在 `SHA256SUMS` 里有校验和，并有一份构建来源证明（build provenance
-attestation），由构建它的 GitHub Actions 运行通过 Sigstore 签名：
+每个发布文件都在 `SHA256SUMS` 里有校验和（`SHA256SUMS` 由 qsh 发布密钥以 minisign 格式签名，
+即 `SHA256SUMS.minisig`），并有一份构建来源证明（build provenance attestation），由构建它的
+GitHub Actions 运行通过 Sigstore 签名：
 
 ```sh
+minisign -Vm SHA256SUMS -P RWTYvXVs30N3JIE/A5TMPWUWD9ktnPZqQ6lSzYJahI7u5lpiPBCKWHlf
 sha256sum -c SHA256SUMS --ignore-missing
 gh attestation verify qsh-0.1.0-x86_64-unknown-linux-musl.tar.gz --repo yzfly/qsh
 ```

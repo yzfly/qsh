@@ -271,7 +271,12 @@ already has what qsh protects there. What matters is what it can do to the clien
 
 - **Terminal output** is passed to the user's terminal unchanged, as ssh does; escape sequence
   attacks against terminal emulators are the terminal's responsibility, exactly as with ssh. The
-  client's own status line and messages are not part of the output stream.
+  client's own status line and messages are not part of the output stream, and server text that
+  qsh shows in them (error messages, `qsh ls` names and commands, the `qsh doctor HOST`
+  report, log lines) goes through one sanitizer (`qsh_core::text::sanitize`): escape sequences
+  removed (CSI, OSC such as OSC 52, DCS, and the C1 forms), other control characters, DEL and
+  bidirectional formatting characters replaced, length bounded. `qsh doctor HOST` reads at most
+  1 MiB of the remote report within 60 s.
 - **No access to the client.** qsh/1 has no server-initiated channels (protocol §4.3), no agent
   forwarding, no port forwarding and no file transfer; future features of this kind are opt-in
   per connection by the client (capabilities) and per use by the user.
@@ -341,12 +346,26 @@ A daemon upgrades by executing a newer `qsh-server` in its own process, keeping 
   user (section 4.3), with a request naming an executable; and the daemon itself, for the file it
   was started from. Someone who can talk to the control socket can already create sessions and
   run anything as the user.
-- **Which program it executes**: an absolute path to a regular file owned by root or by the
-  user, not writable by group or others (a binary another user could change is refused), that
-  answers the version probe within 5 s with a strictly newer version (downgrades only with an
-  explicit `--force`, never automatically) and a state format both sides know. The probe runs
-  the candidate as the user, with an empty environment except `PATH`, which is no more than the
-  user's own `qsh-server bootstrap` would do with it.
+- **Which program it executes**: an absolute path, resolved once (symbolic links included) and
+  opened once (`O_RDONLY`, close-on-exec, `O_NOFOLLOW`); everything else is about that open
+  file, never the path again. On the descriptor (`fstat`): a regular file owned by root or by
+  the user, not writable by group or others, executable. Every directory above it: owned by
+  root or by the user, not writable by others (not even with the sticky bit: `/tmp` cannot hold
+  it, since whoever can create a name there can put a program where one is expected), and
+  writable by its group only when that group is the user's private group (same name as the
+  user, no other member: user private groups; another account naming that group as its primary
+  group is not searched for). A group-writable directory such as Debian's `/usr/local/bin`
+  (`root:staff`, 2775) is refused like a group-writable file: a daemon there is not upgraded in
+  place and keeps running until its sessions end (the fallback of m2.md 10.2). It must answer
+  the version probe within 5 s with a strictly newer version (downgrades only with an explicit
+  `--force`, never automatically) and a state format both sides know. On Linux the probe runs
+  the open file (`/proc/self/fd/N`) and the upgrade executes it (`fexecve`, which is
+  `execveat(fd, "", AT_EMPTY_PATH)`), so the program that runs is the one that was checked;
+  elsewhere the path is checked to still name the same file (device, inode, change time) right
+  before the probe and right before the `execve`, which leaves a window only for someone who
+  can change the directories above it, that is, the user or root. The probe runs the candidate
+  as the user, with an empty environment except `PATH`, which is no more than the user's own
+  `qsh-server bootstrap` would do with it.
 - **Descriptors**: every descriptor of the daemon is close-on-exec, as before (section 4.3);
   for the exec it clears that flag on exactly the descriptors the new program adopts (its
   listening sockets, the control socket's listener, each session's pseudo-terminal master or
@@ -361,9 +380,24 @@ A daemon upgrades by executing a newer `qsh-server` in its own process, keeping 
   zeroized after use. The state is parsed with bounds on every count and length, and the parser
   is fuzzed, like every network parser.
 - **Failure** never leaves sessions without an owner: every check happens before the exec; an
-  exec that fails returns to the old program unchanged; on Linux the new program that cannot
-  restore the state executes the old program again (kept open since the daemon started) with the
-  same state.
+  exec that fails returns to the old program unchanged; on Linux the new program executes the
+  old program again (kept open since the daemon started) with the same state if anything fails
+  or panics before its session threads start. The new image recognizes its frozen command line
+  (`qsh-server handoff-resume …`, m2.md 10.3 step 5) before parsing anything else and arms this
+  fallback first; it works on duplicates of the inherited descriptors until its commit, so a
+  failure as late as its async runtime or QUIC endpoints still hands the untouched originals
+  back.
+- **A failed program is never tried again automatically.** A program (device, inode and change
+  time of the open file) whose checks or probe said no, or an upgrade to which failed in any
+  way (the threads did not stop, the state could not be written, the exec failed, the new image
+  could not resume and the old one took over again), is remembered for the daemon's lifetime,
+  across upgrades in place and across the fallback (the state carries the list and the program
+  it was written for). Requests of a newer `qsh-server` naming it are then served by the
+  running daemon as they are; only an explicit `qsh-server upgrade --force` tries it again. A
+  replaced file is a new program. Without this, a newer program that cannot take over would be
+  tried at every login, each attempt ending every connection (review H1). A requester that was
+  answered `{"restarting":true}` repeats its request for 10 s; a daemon still restarting after
+  that is an error, never a reply.
 - **Connections** are closed with GOAWAY (RESTART) before the exec; clients re-authenticate on
   new connections as always, with keys that did not change. The QUIC stateless reset key is
   derived from the identity key (HKDF), so it is as secret as that key and survives the restart.
@@ -372,19 +406,41 @@ A daemon upgrades by executing a newer `qsh-server` in its own process, keeping 
 
 `qsh-server doctor` only reads (files under `/proc`, `/sys` and `/etc`, the output of status
 commands) and makes no network calls; run as root it can additionally read firewall rules and
-audit logs. `qsh-server tune --apply` is the only part of qsh that changes anything as root:
+audit logs. As root, doctor and tune run commands from the system's directories only
+(`PATH=/usr/sbin:/usr/bin:/sbin:/bin`), never from the `PATH` of whoever ran sudo.
+`qsh-server tune --apply` is the only part of qsh that changes anything as root:
 
 - it runs only when an administrator runs it with root privileges, shows the complete plan (file
   diffs and exact commands), and asks for confirmation on the terminal (`--yes` for scripts);
   packages, the daemon and the client never run it (`qsh doctor HOST --tune` runs it over
-  `ssh -t` in front of the user, who sees the plan and answers the prompts);
+  `ssh -t`, without agent, X11 or port forwarding, in front of the user, who sees the plan and
+  answers the prompts; and runs sudo only on a `qsh-server` that root owns in directories only
+  root can change, by its real path: a `~/.local/bin/qsh-server` is the user's to replace, and
+  is never run as root);
 - it changes only: `/etc/sysctl.d/90-qsh.conf` (socket buffer limits, the allowed TCP congestion
   controls, and only with explicit flags the default congestion control and
   `ip_unprivileged_port_start`), `/etc/modules-load.d/qsh.conf` (`tcp_bbr`), rules in ufw or
   firewalld that allow the daemon's ports, linger for the invoking user; and its own record,
-  `/var/lib/qsh/tune.json`, which lists every change with what is needed to undo it;
+  `/var/lib/qsh/tune.json`, which lists every change with what is needed to undo it, including
+  copies of the firewall configuration files its commands change (`/etc/ufw/user.rules` is
+  0640): so the record is 0600 in a 0700 `/var/lib/qsh`, and a revert puts every file back with
+  the mode and owner it had;
+- everything tune writes, removes or creates is reached without following a symbolic link
+  (an `openat` walk with `O_NOFOLLOW` from `/`), and files are replaced by renaming a new file
+  over them;
 - `tune --revert` undoes only what that record lists and only where the host still matches
-  what tune wrote, so it never removes an administrator's later change;
+  what tune wrote, so it never removes an administrator's later change. Because the record
+  decides what a revert runs and writes as root, it is used only when the record and
+  `/var/lib/qsh` are not symbolic links, belong to root and are not writable by group or
+  others, and only when every change in it is one tune itself makes: its own two files and the
+  directories above them, the ufw and firewalld files of its commands, the sysctls it sets
+  (with values of their kind), the `tcp_bbr` module, and `ufw`, `firewall-cmd` and `loginctl`
+  in exactly the forms it runs them, with ports, zones and user names of the shapes it uses.
+  Anything else makes tune refuse the whole record;
+- `--root DIR` (hidden, for the tests and the distribution CI) stands in a directory for `/`:
+  every file under it is reached without following any link and nothing can lead outside it,
+  and no command of the host runs, only the stub programs of `--commands DIR`; it changes only
+  what the invoking user can change anyway;
 - **Trade-offs the administrator must accept explicitly**: opening the port range exposes every
   user's daemon to the network (each still requires a session key; consider restricting the
   source addresses, which the printed commands show how to do); `--allow-low-ports=N` lets
@@ -492,8 +548,15 @@ daemon's private key):
 - **Screen models** cost memory per tty session (about 40 bytes per cell for two screens plus 100
   lines); they exist only up to 262 144 cells (larger terminals get none), so a client cannot
   make the daemon allocate a model for an absurd size. Feeding the model costs CPU per byte of
-  output, which the program itself produces (the user's own load). Compression happens only
-  below 4 MiB/s of path rate (protocol §7.12).
+  output, which the program itself produces, but the output may come from anywhere (a file, a
+  log, a web page), so neither memory nor CPU may grow with what it asks for: the model's
+  emulator never sees a string (OSC, DCS, APC, PM, SOS: an unterminated OSC once grew the
+  daemon's memory with the output until it was killed), counts are clamped to the screen's size
+  before the emulator loops on them (`CSI 65535 @` took 1.45 s per 8 bytes), and each session's
+  model has a work budget per byte and per second beyond which it is dropped, as after a fault
+  (m2.md 6.2). The model is fed outside the output buffer's lock and reached from the
+  attachments on blocking threads, so a busy model holds up nothing but its own snapshots.
+  Compression happens only below 4 MiB/s of path rate (protocol §7.12).
 - **Faults in the screen model.** The model is a terminal emulator fed with whatever the
   session's program writes, which is attacker-controlled whenever the program shows untrusted
   data (`cat` of a downloaded file, a log, a web page in a text browser). A bug there (a panic
@@ -532,6 +595,23 @@ daemon's private key):
   ends. qsh respects that policy: sessions then survive only if the daemon runs from the user
   unit with lingering enabled (`loginctl enable-linger`), which is the administrator's decision.
   `qsh-server doctor` reports the situation.
+
+- **Release signatures.** Every release's `SHA256SUMS` is signed with the qsh release key in
+  the minisign format (`SHA256SUMS.minisig`, trusted comment `qsh X.Y.Z SHA256SUMS`). The
+  public key, compiled into `qsh install` and written into `install.sh`:
+
+  ```
+  RWTYvXVs30N3JIE/A5TMPWUWD9ktnPZqQ6lSzYJahI7u5lpiPBCKWHlf    (key id 247743DF6C75BDD8)
+  ```
+
+  `qsh install` always checks the signature and the version in the trusted comment before it
+  trusts a checksum (the verifier is `qsh_core::minisign`: Ed25519 from `ring`, BLAKE2b of its
+  own); `install.sh` checks it with minisign or OpenSSL 3 when either is installed, and refuses
+  without them only with `--require-signature` (which `qsh install`'s fallback on the host
+  uses). Downloads are https only, redirects included. By hand:
+  `minisign -Vm SHA256SUMS -P RWTYvXVs30N3JIE/A5TMPWUWD9ktnPZqQ6lSzYJahI7u5lpiPBCKWHlf`. The
+  secret key lives only with the maintainer and in the release workflow's secret
+  `QSH_MINISIGN_KEY`; `scripts/sign-release.py` signs.
 
 ## 9. Known limitations
 

@@ -15,6 +15,8 @@ pub struct Fake {
     pub files: RefCell<BTreeMap<String, String>>,
     pub dirs: RefCell<std::collections::BTreeSet<String>>,
     pub metas: HashMap<String, Meta>,
+    /// Mode and owner of what was written or created: (mode, uid, gid).
+    pub modes: RefCell<HashMap<String, (u32, u32, u32)>>,
     pub commands: HashMap<String, Output>,
     /// Command line → files it writes (None: removes).
     pub effects: HashMap<String, Vec<(String, Option<String>)>>,
@@ -83,6 +85,7 @@ impl Fake {
             path.into(),
             Meta {
                 uid,
+                gid: uid,
                 mode,
                 dir,
                 symlink: false,
@@ -139,12 +142,23 @@ impl System for Fake {
     }
 
     fn meta(&self, path: &str) -> Option<Meta> {
+        let exists = self.files.borrow().contains_key(path) || self.has_dir(path);
+        if let Some((mode, uid, gid)) = self.modes.borrow().get(path).copied().filter(|_| exists) {
+            return Some(Meta {
+                uid,
+                gid,
+                mode,
+                dir: self.has_dir(path),
+                symlink: false,
+            });
+        }
         if let Some(m) = self.metas.get(path) {
             return Some(*m);
         }
         if self.files.borrow().contains_key(path) {
             return Some(Meta {
                 uid: 0,
+                gid: 0,
                 mode: 0o644,
                 dir: false,
                 symlink: false,
@@ -152,6 +166,7 @@ impl System for Fake {
         }
         self.has_dir(path).then_some(Meta {
             uid: 0,
+            gid: 0,
             mode: 0o755,
             dir: true,
             symlink: false,
@@ -203,11 +218,13 @@ impl System for Fake {
         self.source
     }
 
-    fn write(&self, path: &str, content: &[u8], _mode: u32) -> io::Result<()> {
+    fn write(&self, path: &str, content: &[u8], mode: u32, owner: Option<(u32, u32)>) -> io::Result<()> {
         let dir = parent(path).unwrap_or_default();
         if !self.has_dir(&dir) {
             return Err(io::Error::new(io::ErrorKind::NotFound, format!("no directory {dir}")));
         }
+        let (uid, gid) = owner.unwrap_or((self.euid, self.euid));
+        self.modes.borrow_mut().insert(path.into(), (mode, uid, gid));
         self.files
             .borrow_mut()
             .insert(path.into(), String::from_utf8_lossy(content).into_owned());
@@ -233,7 +250,10 @@ impl System for Fake {
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, path.to_string()))
     }
 
-    fn mkdir(&self, path: &str) -> io::Result<()> {
+    fn mkdir(&self, path: &str, mode: u32) -> io::Result<()> {
+        self.modes
+            .borrow_mut()
+            .insert(path.into(), (mode, self.euid, self.euid));
         self.dirs.borrow_mut().insert(path.into());
         Ok(())
     }

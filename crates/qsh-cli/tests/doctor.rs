@@ -172,9 +172,18 @@ esac
     script(&bin.join("systemd-detect-virt"), "#!/bin/sh\necho none\nexit 1\n");
 }
 
+/// `qsh-server tune ARGS --root ROOT --commands BIN`, BIN next to ROOT.
 fn tune(root: &Path, env: &[(&str, String)], args: &[&str]) -> (i32, String) {
+    let bin = root.parent().unwrap().join("bin");
+    tune_with(root, Some(&bin), env, args)
+}
+
+fn tune_with(root: &Path, commands: Option<&Path>, env: &[(&str, String)], args: &[&str]) -> (i32, String) {
     let mut c = Command::new(QSH_SERVER);
     c.arg("tune").args(args).arg("--root").arg(root).stdin(Stdio::null());
+    if let Some(bin) = commands {
+        c.arg("--commands").arg(bin);
+    }
     for (k, v) in env {
         c.env(k, v);
     }
@@ -325,7 +334,7 @@ esac
 for a; do
   shift
   case "$a" in
-    *"doctor --json --probe"*) a=$(printf '%s' "$a" | sed "s|doctor --json --probe|doctor --json --probe --root {root}|") ;;
+    *"doctor --json --probe"*) a=$(printf '%s' "$a" | sed "s|doctor --json --probe|doctor --json --probe --root {root} --commands {bin}|") ;;
   esac
   set -- "$@" "$a"
 done
@@ -333,7 +342,8 @@ out=$("$real" "$@"); status=$?
 printf '%s\n' "$out" | sed 's/"udp":[0-9]*/"udp":{hole_port}/g'
 exit $status
 "#,
-            root = root.display()
+            root = root.display(),
+            bin = bin.display()
         ),
     );
     let out = world
@@ -423,7 +433,11 @@ fn tune_applies_and_reverts_a_fake_root_byte_for_byte() {
 
     // doctor agrees
     let mut c = Command::new(QSH_SERVER);
-    c.args(["doctor", "--json", "--root"]).arg(&root).stdin(Stdio::null());
+    c.args(["doctor", "--json", "--root"])
+        .arg(&root)
+        .arg("--commands")
+        .arg(&bin)
+        .stdin(Stdio::null());
     for (k, v) in &env {
         c.env(k, v);
     }
@@ -464,4 +478,94 @@ fn qsh_doctor_without_a_host_checks_this_machine() {
     // `qsh -- doctor` is still a host named doctor: the fake ssh runs it
     let (_, _, err) = world.run(&["--", "doctor", "true"]);
     assert!(!err.contains("not available"), "{err}");
+}
+
+/// Review H3: `--root` stands in for `/` for the files only; it never runs a command of the
+/// host. Before, a planted record under the root made `tune --revert --root R` run whatever
+/// program it named, from PATH, as whoever ran it.
+#[test]
+fn a_stand_in_root_runs_no_command_of_the_host() {
+    let dir = PathBuf::from(format!("/tmp/qsht-{}-tune-nocmd", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let (root, bin) = (dir.join("root"), dir.join("bin"));
+    fs::create_dir_all(&bin).unwrap();
+    fake_root(&root);
+    let marker = dir.join("ran");
+    // On PATH, but not given with --commands
+    script(
+        &bin.join("modprobe"),
+        &format!("#!/bin/sh\ntouch {}\n", marker.display()),
+    );
+    let env = vec![
+        ("PATH", format!("{}:/usr/bin:/bin", bin.display())),
+        ("HOME", dir.display().to_string()),
+        ("XDG_CONFIG_HOME", dir.join("config").display().to_string()),
+    ];
+    let (code, text) = tune_with(&root, None, &env, &["--apply", "--yes"]);
+    assert_eq!(code, 1, "{text}");
+    assert!(text.contains("modprobe cannot be run"), "{text}");
+    assert!(!marker.exists(), "a command of the host ran: {text}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Review H3: what a record under a stand-in root names cannot reach outside it: a path with
+/// `..` is refused with the record, and a symbolic link (here a sysctl file that points at a
+/// file outside) is never followed, neither to read nor to write.
+#[test]
+fn a_planted_record_cannot_reach_outside_the_stand_in_root() {
+    let dir = PathBuf::from(format!("/tmp/qsht-{}-tune-planted", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let (root, bin) = (dir.join("root"), dir.join("bin"));
+    fs::create_dir_all(&bin).unwrap();
+    fake_root(&root);
+    stubs(&bin);
+    let victim = dir.join("victim.txt");
+    fs::write(&victim, "precious\n").unwrap();
+    let sha = |t: &str| qsh_core::crypto::hex(&qsh_core::crypto::sha256(t.as_bytes()));
+    let record_dir = root.join("var/lib/qsh");
+    fs::create_dir_all(&record_dir).unwrap();
+    fs::set_permissions(&record_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let plant = |changes: serde_json::Value| {
+        let record = serde_json::json!({"qsh_tune": 1, "version": "0.0.1", "created_dirs": [], "changes": changes});
+        let path = record_dir.join("tune.json");
+        fs::write(&path, record.to_string()).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    };
+    let env = vec![
+        ("PATH", format!("{}:/usr/bin:/bin", bin.display())),
+        ("FAKE_ROOT", root.display().to_string()),
+        ("FW_STATE", dir.display().to_string()),
+        ("HOME", dir.display().to_string()),
+        ("XDG_CONFIG_HOME", dir.join("config").display().to_string()),
+    ];
+    // A path that escapes: refused with the whole record
+    plant(
+        serde_json::json!([{"kind": "file", "path": "/../victim.txt", "before": null,
+        "sha256": sha("precious\n"), "fixes": ["udp-buffers"], "created_dirs": []}]),
+    );
+    let (code, text) = tune(&root, &env, &["--revert", "--yes"]);
+    assert_eq!(code, 1, "{text}");
+    assert!(text.contains("did not write"), "{text}");
+    assert_eq!(fs::read_to_string(&victim).unwrap(), "precious\n");
+    // A sysctl file that is a link to the victim, recorded as tune left it
+    let sysctl = root.join("proc/sys/net/core/rmem_max");
+    fs::remove_file(&sysctl).unwrap();
+    std::os::unix::fs::symlink(&victim, &sysctl).unwrap();
+    plant(
+        serde_json::json!([{"kind": "sysctl", "fix": "udp-buffers", "key": "net.core.rmem_max",
+        "before": "212992", "after": "precious"}]),
+    );
+    let (code, text) = tune(&root, &env, &["--revert", "--yes"]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("left alone"), "{text}");
+    assert_eq!(fs::read_to_string(&victim).unwrap(), "precious\n");
+    // The record itself as a link: refused
+    let elsewhere = dir.join("record.json");
+    fs::write(&elsewhere, "{}").unwrap();
+    let _ = fs::remove_file(record_dir.join("tune.json"));
+    std::os::unix::fs::symlink(&elsewhere, record_dir.join("tune.json")).unwrap();
+    let (code, text) = tune(&root, &env, &["--revert", "--yes"]);
+    assert_eq!(code, 1, "{text}");
+    assert!(text.contains("symbolic link"), "{text}");
+    let _ = fs::remove_dir_all(&dir);
 }

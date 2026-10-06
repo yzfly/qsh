@@ -287,6 +287,12 @@ fn malformed_payloads_are_frame_errors() {
     let mut p = u64::MAX.to_be_bytes().to_vec();
     p.extend_from_slice(b"ab");
     assert!(Message::decode(types::OUTPUT, &p).is_err());
+    // OUTPUT_ZSTD at 2^64 - 1: its content (at least a byte) would run past it
+    let mut p = u64::MAX.to_be_bytes().to_vec();
+    p.extend_from_slice(&[0x28, 0xb5, 0x2f, 0xfd]);
+    assert!(Message::decode(types::OUTPUT_ZSTD, &p).is_err());
+    p[7] = 0xfe;
+    assert!(Message::decode(types::OUTPUT_ZSTD, &p).is_ok());
     // Strings over their maximum
     let mut p = vec![0x01];
     varint::encode(257, &mut p);

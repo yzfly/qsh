@@ -25,6 +25,7 @@ pub mod fault;
 #[cfg(feature = "hub")]
 pub mod hub;
 pub mod log;
+pub mod minisign;
 pub mod mux;
 pub mod netwatch;
 pub mod paths;
@@ -33,6 +34,7 @@ pub mod screen;
 pub mod server;
 pub mod session;
 pub mod sys;
+pub mod text;
 pub mod transport;
 
 #[cfg(test)]

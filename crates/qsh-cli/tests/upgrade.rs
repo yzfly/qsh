@@ -18,10 +18,16 @@ use serde_json::Value;
 
 /// A copy of qsh-server in the world's `bin`, first in its PATH: the bootstrap and the daemon
 /// run it. Mode 0755: a daemon only executes a program its user controls and nobody else can
-/// change, and the build's own binary may be group-writable (umask 002).
-fn install_server(world: &World) -> PathBuf {
+/// change, and the build's own binary may be group-writable (umask 002). The world lives in
+/// /tmp, which every user can write: the daemon is told not to check the directories above
+/// the world (test hook; the check itself is a unit test of `handoff`).
+fn install_server(world: &mut World) -> PathBuf {
     let path = world.dir.join("bin/qsh-server");
     copy_executable(Path::new(QSH_SERVER), &path);
+    fs::set_permissions(&world.dir, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(world.dir.join("bin"), fs::Permissions::from_mode(0o755)).unwrap();
+    let dir = world.dir.display().to_string();
+    world.set("QSH_TEST_TRUSTED_DIR", dir);
     path
 }
 
@@ -120,7 +126,7 @@ fn spawn_pipe_session(world: &World, command: &str, transcript: &Path) -> Child 
 #[test]
 fn an_upgrade_in_place_keeps_the_pid_the_sessions_and_their_exit_codes() {
     let mut world = World::new("upgrade");
-    let server = install_server(&world);
+    let server = install_server(&mut world);
     let transcript = world.dir.join("transcript");
     world.set("QSH_TRANSCRIPT", transcript.display().to_string());
     let stop = world.dir.join("stop");
@@ -185,8 +191,8 @@ fn an_upgrade_in_place_keeps_the_pid_the_sessions_and_their_exit_codes() {
 /// served, and the sessions of the older one are still there.
 #[test]
 fn a_newer_bootstrap_upgrades_an_older_daemon() {
-    let world = World::new("upnewer");
-    let server = install_server(&world);
+    let mut world = World::new("upnewer");
+    let server = install_server(&mut world);
     let old = "0.0.1";
     // The daemon looks old, and so do the commands of the first session
     let out = world
@@ -228,9 +234,13 @@ fn a_newer_bootstrap_upgrades_an_older_daemon() {
 #[test]
 fn failed_upgrades_leave_the_daemon_and_its_sessions_as_they_were() {
     let mut world = World::new("upfault");
-    let server = install_server(&world);
+    let server = install_server(&mut world);
     let faults: &[&str] = if cfg!(any(target_os = "linux", target_os = "android")) {
-        &["stop", "serialize", "exec", "restore"]
+        // start: the new image panics right after it started (review M3: before it parses
+        // anything, as a later version that renamed an option would fail); commit: the last
+        // step before its session threads start fails (review M3: a failure after the
+        // state was checked falls back too)
+        &["stop", "serialize", "exec", "restore", "start", "commit"]
     } else {
         // macOS cannot execute the old image again: the probe is the protection there
         &["stop", "serialize", "exec"]
@@ -278,8 +288,8 @@ fn failed_upgrades_leave_the_daemon_and_its_sessions_as_they_were() {
 /// session is attached, keeping the detached ones.
 #[test]
 fn a_daemon_upgrades_by_itself_when_its_program_was_replaced() {
-    let world = World::new("upidle");
-    let server = install_server(&world);
+    let mut world = World::new("upidle");
+    let server = install_server(&mut world);
     let old = "0.0.1";
     let out = world
         .command(server.to_str().unwrap(), &["daemon"])
@@ -316,4 +326,71 @@ fn a_daemon_upgrades_by_itself_when_its_program_was_replaced() {
         "{now}"
     );
     assert_eq!(now["session_count"], 1, "the detached session is kept: {now}");
+}
+
+/// Review H1: a newer program that cannot take over is tried once, not at every login. Before,
+/// every bootstrap, pipe and doctor of the newer qsh-server started the upgrade again, each
+/// attempt ended every connection, and the requesters that waited for it got
+/// `{"restarting":true}` as their reply. Here every attempt fails: `execve` (the old image goes
+/// on), and on Linux the new image too (the old one takes over again from the state, and must
+/// remember the program across that).
+#[test]
+fn a_program_an_upgrade_to_failed_is_not_tried_again() {
+    let kinds: &[&str] = if cfg!(any(target_os = "linux", target_os = "android")) {
+        &["exec", "restore"]
+    } else {
+        &["exec"]
+    };
+    for kind in kinds {
+        let mut world = World::new(&format!("uponce-{kind}"));
+        let server = install_server(&mut world);
+        let old = "0.0.1";
+        world.set("QSH_TEST_HANDOFF_FAULT", [*kind; 4].join(","));
+        let out = world
+            .command(server.to_str().unwrap(), &["daemon"])
+            .env("QSH_TEST_VERSION", old)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let pid = status(&world)["pid"].clone();
+        let stop = world.dir.join("stop");
+        let mut session = world.qsh(&["-vv", "srv", &ticker(&stop)]);
+        session.env("QSH_TEST_VERSION", old);
+        let mut tty = Tty::spawn_logged(session, world.dir.join("qsh.log"));
+        tty.wait_for("tick-5\r", Duration::from_secs(20));
+
+        // Requests of a newer qsh-server: the first one tries, every one is served
+        for i in 0..3 {
+            let (code, stdout, stderr) = world.run(&["ls", "--json", "srv"]);
+            assert_eq!(code, 0, "{kind} {i}: {stdout} {stderr}");
+            let listed: Value = serde_json::from_str(&stdout).unwrap();
+            assert_eq!(listed["sessions"].as_array().unwrap().len(), 1, "{kind} {i}: {stdout}");
+        }
+        // A login, too
+        let out = world
+            .qsh(&["srv", "--", "echo logged-in"])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{kind}: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "logged-in");
+
+        let now = status(&world);
+        assert_eq!(now["pid"], pid, "{kind}: {now}");
+        assert_eq!(now["version"], old, "{kind}: the old program serves: {now}");
+        assert_eq!(now["upgrade_failures"], 1, "{kind}: exactly one attempt: {now}");
+        assert_eq!(now["restarts"], 0, "{kind}: {now}");
+        ticks_go_on(&tty, 10);
+
+        // Not by itself, but on request with --force
+        let out = world.command(server.to_str().unwrap(), &["upgrade"]).output().unwrap();
+        assert_eq!(out.status.code(), Some(1), "{kind}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("--force"),
+            "{kind}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(status(&world)["upgrade_failures"], 1, "{kind}");
+        ticker_ends(&mut tty, &stop);
+    }
 }

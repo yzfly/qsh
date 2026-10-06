@@ -510,12 +510,14 @@ pub fn parse_reply(output: &[u8], op: Op) -> Result<Reply, ReplyError> {
         )));
     }
     if value.get("error").is_some() {
-        let e: ErrorReply = serde_json::from_value(value.clone()).unwrap_or_else(|_| {
+        let mut e: ErrorReply = serde_json::from_value(value.clone()).unwrap_or_else(|_| {
             ErrorReply::new(
                 ErrorKind::Internal,
                 value["message"].as_str().unwrap_or("unknown error").to_string(),
             )
         });
+        // Shown to the user ("bootstrap failed: …"): as text only (security.md 4.6)
+        e.message = crate::text::sanitize(&e.message, 512);
         return Ok(Reply::Error(e));
     }
     match op {
@@ -547,6 +549,18 @@ pub fn parse_reply(output: &[u8], op: Op) -> Result<Reply, ReplyError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review L3: a server's error message is shown to the user ("bootstrap failed: …"): no
+    /// escape sequence of it reaches the terminal.
+    #[test]
+    fn error_messages_are_text_only() {
+        let line =
+            b"{\"qsh\":1,\"error\":\"internal\",\"message\":\"oops\\u001b]52;c;cm0gLXJmIH4=\\u0007\\u001b[2J done\"}\n";
+        let Ok(Reply::Error(e)) = parse_reply(line, Op::New) else {
+            panic!("an error reply")
+        };
+        assert_eq!(e.message, "oops done");
+    }
 
     #[test]
     fn request_validation() {
