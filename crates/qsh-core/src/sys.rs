@@ -73,7 +73,8 @@ pub fn openpty(cols: u16, rows: u16) -> io::Result<(OwnedFd, OwnedFd)> {
             &mut master,
             &mut slave,
             std::ptr::null_mut(),
-            std::ptr::null(),
+            // null_mut: macOS declares termp mutable, Linux const (mut coerces to const)
+            std::ptr::null_mut(),
             &ws as *const libc::winsize as *mut libc::winsize,
         )
     };
@@ -139,7 +140,7 @@ pub fn spawn_on_pty(command: &mut Command) {
             if libc::setsid() < 0 {
                 return Err(io::Error::last_os_error());
             }
-            if libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
+            if libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
                 return Err(io::Error::last_os_error());
             }
             for fd in 3..max {
@@ -349,9 +350,19 @@ pub fn udp_any(port: u16) -> io::Result<std::net::UdpSocket> {
 
 fn udp_dual_stack(port: u16) -> io::Result<std::net::UdpSocket> {
     // SAFETY: socket has no memory effects; the result is checked below.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     let fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+    // SAFETY: as above. No SOCK_CLOEXEC on macOS: close-on-exec is set right after, before the
+    // daemon (single threaded at bind time) can spawn a session.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_DGRAM, 0) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    // SAFETY: fd is the descriptor just created; F_SETFD has no memory effects.
+    unsafe {
+        libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
     }
     // SAFETY: fd is a new descriptor this process owns; the socket closes it on drop.
     let socket = unsafe { std::net::UdpSocket::from_raw_fd(fd) };

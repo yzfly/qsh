@@ -52,7 +52,7 @@ pub struct QshArgs {
     /// Verbose: qsh's own messages, and ssh -v; may be repeated
     #[arg(short = 'v', action = ArgAction::Count)]
     pub verbose: u8,
-    /// [user@]host, or a host alias from ~/.ssh/config
+    /// `[user@]host`, or a host alias from ~/.ssh/config
     #[arg(value_name = "DESTINATION")]
     pub destination: String,
     /// Command to run instead of a login shell

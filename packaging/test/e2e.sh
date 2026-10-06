@@ -9,7 +9,9 @@
 #
 #   plain        qsh -p 2222 test@IP -- echo qsh-ok         QUIC should win
 #   stdin        printf hello | qsh ... -- cat              stdin reaches the remote command
-#   exit-code    qsh ... -- sh -c 'exit 7'                  qsh exits with the remote code
+#   exit-code    qsh ... -- 'exit 7'                         qsh exits with the remote code
+#                (like ssh, the words are joined and run by the login shell: `-- sh -c 'exit 7'`
+#                would run `sh -c exit 7`, which exits 0, with ssh as with qsh)
 #   udp-blocked  the same, UDP to the container dropped    TLS over TCP must win
 #   ssh-pipe     UDP dropped and TCP rejected except 2222  the ssh pipe must win
 #
@@ -120,7 +122,7 @@ check() {
 
 check plain 0 qsh-ok '' -- -- echo qsh-ok
 check stdin 0 hello hello -- -- cat
-check exit-code 7 '' '' -- -- sh -c 'exit 7'
+check exit-code 7 '' '' -- -- 'exit 7'
 
 block "-d $ip -p udp -j DROP"
 check udp-blocked 0 qsh-ok '' -- -- echo qsh-ok
