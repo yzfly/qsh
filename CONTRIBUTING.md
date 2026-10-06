@@ -47,6 +47,42 @@ cargo build --release --target x86_64-unknown-linux-musl -p qsh-cli --bins
 QSH_BIN_DIR=target/x86_64-unknown-linux-musl/release packaging/test/e2e.sh debian:12
 ```
 
+### Local testing
+
+While the repository is private, CI runs the Linux checks only; macOS, fuzzing, the distribution
+matrix, packaging and the chaos tests run by hand before a release. Before a milestone or a
+release, run the local test rig:
+
+```sh
+scripts/local-test.sh                 # steps 1 and 2
+scripts/local-test.sh --chaos         # and step 3, the chaos tests (needs passwordless sudo)
+scripts/local-test.sh --fuzz 60       # and step 4, 60 s per fuzz target (nightly, cargo-fuzz)
+scripts/local-test.sh --help          # every option: scenario and profile selection, sizes
+```
+
+1. **Static, unit and end-to-end tests**: rustfmt, clippy and rustdoc with `-D warnings`, `cargo
+   test --workspace --all-features`, `cargo xtask gen --check`, `cargo deny check`, shellcheck.
+2. **Real sshd, no root**: a private, unprivileged `sshd` on 127.0.0.1 and a free high port, with
+   its own host key and a fresh client key, and `SetEnv` giving every login a temporary HOME and
+   XDG directories; the client has its own ones and an `ssh -F` configuration. It checks exit
+   statuses, byte-exact stdin/stdout/stderr, a 50 MiB `cat` round trip 20 times (a stall fails),
+   each transport forced with `QSH_TRANSPORTS`, terminal sessions on a pseudo terminal (resize,
+   Ctrl-C, the login shell), `~d`, `qsh attach`, `qsh ls`, `qsh kill`, `qsh install --from`,
+   the daemon's upgrade in place and `qsh-server stop`. Your `~/.ssh`, `~/.config/qsh`,
+   `~/.local` and your sshd are never touched.
+3. **Chaos** (`--chaos`, off by default): the scenarios of `crates/qsh-cli/tests/chaos.rs` in the
+   local mode of `tests/chaos/netns.sh`: three namespaces with a unique prefix (`qshl-<pid>`),
+   veth pairs only between them, netem and nftables only inside them, the server side as you
+   through an unprivileged sshd in the server namespace. No user is created and nothing is
+   installed. The rig refuses to start when its namespaces exist, always deletes them, and
+   compares the host's links, addresses, routes, rules, qdiscs, nftables ruleset and forwarding
+   sysctls before and after.
+4. **Fuzzing** (`--fuzz SECONDS`), when a nightly toolchain and cargo-fuzz are installed.
+
+Builds are queued on `/tmp/heavy.lock` with `nice`, `-j 2` and `CARGO_INCREMENTAL=0` after a
+check for 3 GiB of free disk space. The summary table at the end has a row per check; the exit
+status is non-zero when one failed. Logs are in `target/local-test/<date>/`.
+
 ### Fuzzing
 
 Every parser has a [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) target in `fuzz/`, which

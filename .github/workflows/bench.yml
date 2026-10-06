@@ -1,0 +1,84 @@
+# The benchmark of docs/m2.md section 12.4: qsh, OpenSSH and mosh (both from Ubuntu's packages)
+# in the chaos topology under one netem profile. On demand only. The Markdown table is a workflow
+# artifact and the job summary; it goes into the README only once the maintainer has approved
+# its wording and method (m2.md section 14, Q4).
+name: Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: netem profile
+        type: choice
+        options: [crossborder, lossy, terrible, clean]
+        default: crossborder
+      tools:
+        description: Tools, comma-separated
+        type: string
+        default: ssh,mosh,qsh
+      runs:
+        description: Ctrl-C runs per tool
+        type: string
+        default: "5"
+      seq:
+        description: Lines of the seq row
+        type: string
+        default: "10000000"
+      outage:
+        description: Outage, seconds
+        type: string
+        default: "60"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_RELEASE_LTO: "false"
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+
+jobs:
+  bench:
+    name: bench (${{ inputs.profile }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: chaos
+      # test-hooks: QSH_TEST_VERSION etc.; these binaries are for the benchmark only
+      - name: Build qsh, qsh-server and the harness
+        run: |
+          cargo test --release --locked -p qsh-cli --features test-hooks --test chaos --no-run \
+            --message-format=json-render-diagnostics > build.jsonl
+          exe=$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "chaos"
+                        and .profile.test == true) | .executable' build.jsonl | tail -n 1)
+          cp "$exe" chaos-bin
+      - name: Prepare the runner
+        run: sudo tests/chaos/ci-setup.sh --mosh
+      - name: Benchmark
+        env:
+          QSH_BENCH_PROFILE: ${{ inputs.profile }}
+          QSH_BENCH_TOOLS: ${{ inputs.tools }}
+          QSH_BENCH_RUNS: ${{ inputs.runs }}
+          QSH_BENCH_SEQ: ${{ inputs.seq }}
+          QSH_BENCH_OUTAGE: ${{ inputs.outage }}
+        run: sudo -E tests/chaos/bench.sh ./chaos-bin out
+      - name: Summary
+        if: always()
+        run: |
+          [ -f out/bench.md ] && cat out/bench.md >> "$GITHUB_STEP_SUMMARY"
+          sudo tests/chaos/collect-logs.sh out
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: bench-${{ inputs.profile }}
+          path: out/
+          retention-days: 30

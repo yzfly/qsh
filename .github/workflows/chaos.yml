@@ -1,0 +1,111 @@
+# Chaos tests (docs/m2.md section 12.2): qsh in network namespaces behind netem and nftables, as
+# root on a disposable runner. One build, then the scenario groups in parallel. Criteria whose
+# feature has not landed are report-only (they print their numbers and fail nothing); the
+# `strict` input makes every check hard.
+name: Chaos
+
+on:
+  # Manual only while the repository is private (Actions minutes); run before every release
+  workflow_dispatch:
+    inputs:
+      strict:
+        description: Every check hard (QSH_CHAOS_STRICT=1)
+        type: boolean
+        default: false
+      profiles:
+        description: Comma-separated netem profiles (empty for each scenario's own)
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: chaos-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # Optimized like a release, without fat LTO: the speed users get, minutes less to build
+  CARGO_PROFILE_RELEASE_LTO: "false"
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: chaos
+      # test-hooks: QSH_TEST_VERSION, for the upgrade scenario. Never in a shipped build
+      - name: Build qsh, qsh-server and the chaos test
+        run: |
+          cargo test --release --locked -p qsh-cli --features test-hooks --test chaos --no-run \
+            --message-format=json-render-diagnostics > build.jsonl
+          exe=$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "chaos"
+                        and .profile.test == true) | .executable' build.jsonl | tail -n 1)
+          mkdir -p dist
+          cp "$exe" dist/chaos
+          cp target/release/qsh target/release/qsh-server dist/
+      - uses: actions/upload-artifact@v7
+        with:
+          name: chaos-bin
+          path: dist/
+          if-no-files-found: error
+          retention-days: 3
+
+  scenarios:
+    name: ${{ matrix.group }}
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - group: bytes-exact
+            tests: bytes_exact
+          - group: flood-interrupt
+            tests: flood_interrupt
+          - group: network-events
+            tests: udp_block address_change nat_rebinding port_fallback
+          - group: lifecycle
+            tests: compression upgrade throughput tick_parser coverage_accounts
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: chaos-bin
+          path: dist
+      - run: chmod +x dist/*
+      - name: Prepare the runner
+        run: sudo tests/chaos/ci-setup.sh
+      - name: Run ${{ matrix.tests }}
+        env:
+          QSH_CHAOS_STRICT: ${{ inputs.strict && '1' || '' }}
+          QSH_CHAOS_PROFILES: ${{ inputs.profiles }}
+        run: |
+          mkdir -p out
+          sudo -E env QSH_CHAOS=1 \
+            QSH_CHAOS_QSH="$PWD/dist/qsh" QSH_CHAOS_SERVER="$PWD/dist/qsh-server" \
+            QSH_CHAOS_NETNS="$PWD/tests/chaos/netns.sh" QSH_CHAOS_OUT="$PWD/out/results.jsonl" \
+            dist/chaos --test-threads=1 --nocapture ${{ matrix.tests }}
+      - name: Report
+        if: always()
+        run: |
+          if [ -f out/results.jsonl ]; then
+            python3 tests/chaos/report.py out/results.jsonl | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+          sudo tests/chaos/collect-logs.sh out
+          sudo tests/chaos/netns.sh down || true
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: chaos-${{ matrix.group }}
+          path: out/
+          retention-days: 14
