@@ -79,6 +79,10 @@ milestones and were not released; their changes are listed here.
   connections stayed on TLS (which stalls badly under loss): a hello timeout now counts as
   blocked only when the server's packets stop arriving.
 - Compression starts with the first output instead of after the first rate sample.
+- When the path dies mid-session (UDP blocked, a NAT that drops the flow), typing gets an answer
+  over another transport within about 4.5 s at 270 ms RTT instead of 11 s: unanswered input
+  makes qsh race the other transports in the background, keeping the current connection until
+  one of them answers.
 - `qsh install` no longer falls back to plain http, and it checks the release signature.
 
 ### Security

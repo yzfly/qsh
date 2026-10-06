@@ -155,7 +155,7 @@ wire formats in protocol.md.
 | Mechanism | What it does | Milestone |
 |---|---|---|
 | Transport race | QUIC, TLS and ssh pipe with staggered starts; the first to answer the hello wins, then one ATTACH on it | M0 |
-| Dead path detection | no frame for 45 s, or typed input unanswered for 8 s → race again | M0 |
+| Dead path detection | typed input unanswered and nothing received for max(2 s, 4·SRTT + 4·RTTVAR) → race the other transports in the background while keeping the connection; whichever answers first carries the session (M2). Fallback: no frame for 45 s, or input unanswered for 8 s → race again | M0, M2 |
 | Network change | watch default route and addresses (netlink on Linux, route socket on macOS), migrate the QUIC connection at once | M1 |
 | Path memory | per destination and network (keyed hashes; interfaces, gateways, source prefixes): remember which transport and port worked and which were blocked; start with the winner, leave out known-blocked transports and re-probe them in the background, move to a better transport when it comes back; a miss or a wrong memory falls back to the full race at once | M2 (0.3) |
 | NAT keepalive learning | QUIC keep-alive starts at 20 s; when PATH_INFO shows the client's address changed without a migration while it was idle, the NAT timed out: halve it for that network (floor 5 s), grow back × 1.25 after 30 quiet minutes (ceiling 25 s); no extra application PING on idle QUIC, so a phone's radio wakes once per interval | M2 (0.3) |

@@ -8,6 +8,13 @@
 //! keep-alive holds the NAT mapping), unless the network's learned interval fell below the
 //! one the connection was created with, and "dead" means no UDP datagram for
 //! max(45 s, 3 × the keepalive interval).
+//!
+//! Before a path is dead it can be *suspected* (m2.md 3.8): typed input unanswered and nothing
+//! at all received (no message, no UDP datagram) for [`Conn::suspect_after`], which scales
+//! with the path's round-trip time. A session that suspects its connection says so
+//! ([`Conn::suspect`]); the pool then races the transports in the background without giving
+//! the connection up, and when another connection answers first it moves the sessions there
+//! ([`Conn::abandon`]).
 
 use std::fmt;
 use std::io;
@@ -17,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::io::BufReader;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::proto::message::{MAX_CONTROL, MAX_HELLO};
 use crate::proto::{read_message, write_message, ErrorCode, FramingError, Message};
@@ -35,6 +42,46 @@ const BURST_GAP: Duration = Duration::from_secs(1);
 const REBIND_SLACK: Duration = Duration::from_secs(2);
 /// PONGs waiting to be written, at most: beyond, a PING is not answered.
 const PENDING_PONGS: usize = 16;
+/// Typed input unanswered, and nothing at all received, for at least this long before a
+/// connection is suspected, however short its round trip (m2.md 3.8): below it a phone's radio
+/// waking up, a Wi-Fi scan or a burst of losses would start races for nothing.
+pub(crate) const SUSPECT_MIN: Duration = Duration::from_secs(2);
+/// A false alarm (the path answered while the other transports were raced) raises the
+/// connection's threshold to this many times the silence it showed …
+const FALSE_ALARM_FACTOR: f64 = 1.5;
+/// … but not beyond this: the hard limit for typed input is 8 s (protocol.md 12.3).
+const SUSPECT_MAX: Duration = Duration::from_secs(6);
+
+/// A point in a connection's life: when, how many messages and how many UDP datagrams it had
+/// received by then ([`Conn::mark`], [`Conn::heard_since`]).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Mark {
+    pub(crate) at: tokio::time::Instant,
+    messages: u64,
+    datagrams: u64,
+}
+
+/// The round-trip time from the connection's own exchanges (the hello, PING / PONG), smoothed
+/// as TCP and QUIC do (RFC 6298 section 2, RFC 9002 section 5.3).
+#[derive(Debug, Clone, Copy)]
+struct RttEstimate {
+    srtt: Duration,
+    rttvar: Duration,
+}
+
+impl RttEstimate {
+    fn first(sample: Duration) -> RttEstimate {
+        RttEstimate {
+            srtt: sample,
+            rttvar: sample / 2,
+        }
+    }
+
+    fn update(&mut self, sample: Duration) {
+        self.rttvar = (self.rttvar * 3 + self.srtt.abs_diff(sample)) / 4;
+        self.srtt = (self.srtt * 7 + sample) / 8;
+    }
+}
 
 /// When the client sent something other than a keepalive (m2.md 4.2, condition 3), on
 /// tokio's clock.
@@ -151,6 +198,18 @@ pub struct Conn {
     network_keepalive: Mutex<Option<Duration>>,
     /// UDP datagrams received, and when that count last grew (QUIC liveness).
     udp_rx: Mutex<(u64, tokio::time::Instant)>,
+    /// The round-trip time from the hello and the PONGs.
+    estimate: Mutex<Option<RttEstimate>>,
+    /// Raised by false alarms: the connection is suspected only after this much silence.
+    suspect_floor: Mutex<Duration>,
+    /// A background race for this connection is running, or failed (m2.md 3.8).
+    rescuing: AtomicBool,
+    /// Where suspicions go (the pool's monitor of this connection).
+    suspicions: Mutex<Option<mpsc::UnboundedSender<Mark>>>,
+    /// The pool moved the sessions to another connection because this one stopped answering.
+    abandoned: AtomicBool,
+    /// Tells the sessions attached here at once when the connection is abandoned.
+    moved: watch::Sender<bool>,
     /// Where changes of the observed address go.
     path_changes: Mutex<Option<mpsc::UnboundedSender<PathChange>>>,
     started: Instant,
@@ -188,6 +247,7 @@ impl Conn {
     /// [`Conn::hello`], offering the capabilities of `offer`.
     pub async fn hello_offering(connection: Connection, offer: Offer) -> io::Result<Arc<Conn>> {
         let (_, mut send, recv) = connection.open().await?;
+        let asked = tokio::time::Instant::now();
         let hello = Message::ClientHello {
             versions: vec![u64::from(proto::VERSION)],
             capabilities: offer.names(),
@@ -231,6 +291,8 @@ impl Conn {
             }
             Err(e) => return Err(e.into()),
         };
+        // The hello exchange is the first sample of the round trip
+        let hello_rtt = asked.elapsed();
         let (control, mut rx) = mpsc::unbounded_channel::<Message>();
         let pongs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let started = Instant::now();
@@ -252,6 +314,12 @@ impl Conn {
             quic_keepalive: Mutex::new(None),
             network_keepalive: Mutex::new(None),
             udp_rx: Mutex::new((0, tokio::time::Instant::now())),
+            estimate: Mutex::new(Some(RttEstimate::first(hello_rtt))),
+            suspect_floor: Mutex::new(SUSPECT_MIN),
+            rescuing: AtomicBool::new(false),
+            suspicions: Mutex::new(None),
+            abandoned: AtomicBool::new(false),
+            moved: watch::channel(false).0,
             path_changes: Mutex::new(None),
             started,
             tasks: Mutex::new(Vec::new()),
@@ -342,7 +410,7 @@ impl Conn {
     /// (protocol.md 12.3, m2.md 4.4): every 15 s over TLS and the pipe; over QUIC only while
     /// the network's keepalive interval is below the one the connection was created with,
     /// every that interval while the client sends nothing else.
-    pub(crate) fn ping_due(&self, last_ping: Instant) -> bool {
+    pub(crate) fn ping_due(&self, last_ping: tokio::time::Instant) -> bool {
         let Some(quic) = *self.quic_keepalive.lock().unwrap() else {
             return last_ping.elapsed() >= PING_INTERVAL;
         };
@@ -425,8 +493,127 @@ impl Conn {
         self.rx_count.fetch_add(1, Ordering::SeqCst);
     }
 
-    pub(crate) fn last_received(&self) -> Instant {
-        self.last_rx.lock().unwrap().into_std()
+    /// When a message last arrived, on tokio's clock.
+    pub(crate) fn last_received(&self) -> tokio::time::Instant {
+        *self.last_rx.lock().unwrap()
+    }
+
+    /// UDP datagrams received so far (QUIC; 0 on the other transports).
+    fn datagrams(&self) -> u64 {
+        self.connection
+            .quic_connection()
+            .map_or(0, |c| c.stats().udp_rx.datagrams)
+    }
+
+    /// Now, for [`Conn::heard_since`].
+    pub(crate) fn mark(&self) -> Mark {
+        Mark {
+            at: tokio::time::Instant::now(),
+            messages: self.rx_count.load(Ordering::SeqCst),
+            datagrams: self.datagrams(),
+        }
+    }
+
+    /// Whether anything at all arrived since `mark`: a message, or over QUIC a UDP datagram
+    /// (an acknowledgement of a keep-alive or of a tail probe proves the path as well).
+    pub(crate) fn heard_since(&self, mark: &Mark) -> bool {
+        self.rx_count.load(Ordering::SeqCst) > mark.messages || self.datagrams() > mark.datagrams
+    }
+
+    /// How long typed input may go unanswered, with nothing at all received, before the
+    /// connection is suspected (m2.md 3.8): `max(2 s, 4 × SRTT + 4 × RTTVAR)`, the smoothed
+    /// round trip QUIC's own on QUIC, the variation from the hello, the handshake and the
+    /// PONGs (half the round trip before a second sample), and at least what false alarms on this connection
+    /// showed. Four times the round trip covers a lost packet and its retransmission, the
+    /// variation a path whose delay jumps (a phone's radio, queues).
+    pub(crate) fn suspect_after(&self) -> Duration {
+        let estimate = *self.estimate.lock().unwrap();
+        let srtt = self.connection.rtt().or(estimate.map(|e| e.srtt));
+        let rttvar = estimate.map(|e| e.rttvar).or(srtt.map(|s| s / 2));
+        let threshold = match (srtt, rttvar) {
+            (Some(s), Some(v)) => s * 4 + v * 4,
+            _ => Duration::ZERO,
+        };
+        threshold.max(*self.suspect_floor.lock().unwrap())
+    }
+
+    /// A round-trip sample from outside the connection's own exchanges: the handshake that
+    /// made it (the pool, [`Conn::handshake_took`]).
+    fn rtt_sample(&self, sample: Duration) {
+        let mut estimate = self.estimate.lock().unwrap();
+        match estimate.as_mut() {
+            Some(e) => e.update(sample),
+            None => *estimate = Some(RttEstimate::first(sample)),
+        }
+    }
+
+    /// The transport handshake that made this connection took `took`: a second sample of the
+    /// round trip besides the hello (m2.md 3.8), so that one lucky sample (a packet that a
+    /// queue let through early) does not make the threshold short. QUIC's handshake is one
+    /// round trip, TCP's and TLS 1.3's two; the ssh pipe's says nothing (many round trips and
+    /// a process start).
+    pub(crate) fn handshake_took(&self, took: Duration) {
+        match self.transport() {
+            Transport::Quic => self.rtt_sample(took),
+            Transport::Tls => self.rtt_sample(took / 2),
+            Transport::Ssh => {}
+        }
+    }
+
+    /// Typed input since `mark` was not answered, and nothing at all arrived, for
+    /// [`Conn::suspect_after`]: ask the pool to race the transports in the background (m2.md
+    /// 3.8). Once per connection while that race runs, and not again after it failed (the
+    /// dead path timers decide then). False when nobody was asked.
+    pub(crate) fn suspect(&self, mark: Mark) -> bool {
+        let suspicions = self.suspicions.lock().unwrap();
+        let Some(tx) = suspicions.as_ref() else {
+            return false;
+        };
+        if self.rescuing.swap(true, Ordering::SeqCst) {
+            return false;
+        }
+        if tx.send(mark).is_err() {
+            self.rescuing.store(false, Ordering::SeqCst);
+            return false;
+        }
+        true
+    }
+
+    /// Suspicions of this connection go to `tx` from now on (the pool's monitor).
+    pub(crate) fn watch_suspicions(&self, tx: mpsc::UnboundedSender<Mark>) {
+        *self.suspicions.lock().unwrap() = Some(tx);
+    }
+
+    /// The background race for this connection ended without moving its sessions. `silence`:
+    /// the path answered after this long without anything (a false alarm), which raises the
+    /// threshold of this connection; None: the race failed, and the connection is not
+    /// suspected again.
+    pub(crate) fn rescue_over(&self, silence: Option<Duration>) {
+        if let Some(silence) = silence {
+            let mut floor = self.suspect_floor.lock().unwrap();
+            *floor = (*floor).max(silence.mul_f64(FALSE_ALARM_FACTOR)).min(SUSPECT_MAX);
+            self.rescuing.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// The path stopped answering and the pool moved this connection's sessions to another
+    /// one (m2.md 3.8): unlike [`Conn::retire`], each session leaves at once, with its
+    /// unacknowledged input, which it resends after the next ATTACHED from the offset the
+    /// server reports (protocol.md 7.3), so nothing is lost or repeated.
+    pub(crate) fn abandon(&self) {
+        self.retiring.store(true, Ordering::SeqCst);
+        self.abandoned.store(true, Ordering::SeqCst);
+        self.moved.send_replace(true);
+    }
+
+    /// True after [`Conn::abandon`].
+    pub(crate) fn abandoned(&self) -> bool {
+        self.abandoned.load(Ordering::SeqCst)
+    }
+
+    /// Changes to true when the connection is abandoned.
+    pub(crate) fn moved(&self) -> watch::Receiver<bool> {
+        self.moved.subscribe()
     }
 
     pub(crate) fn ping(&self) {
@@ -493,7 +680,9 @@ async fn control_reader(conn: std::sync::Weak<Conn>, mut recv: BufReader<RecvStr
             Message::Pong { data } => {
                 let now = micros(started);
                 if data <= now {
-                    *conn.rtt.lock().unwrap() = Some(Duration::from_micros(now - data));
+                    let sample = Duration::from_micros(now - data);
+                    *conn.rtt.lock().unwrap() = Some(sample);
+                    conn.rtt_sample(sample);
                 }
             }
             Message::Ping { data } => {
@@ -579,7 +768,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(!conn.usable() && !conn.server_stopping());
-        assert!(conn.dead().is_none() && !conn.ping_due(Instant::now()));
+        assert!(conn.dead().is_none() && !conn.ping_due(tokio::time::Instant::now()));
         conn.retire();
         assert!(conn.retiring());
         far.abort();

@@ -14,14 +14,21 @@
 //! - while a connection is up, a monitor task learns the NAT keepalive interval from PATH_INFO
 //!   (m2.md 4.2, 4.3), records the path's round-trip time and loss, writes path memory, and
 //!   probes transports that were blocked once their retry time comes; a probe that finds a
-//!   better transport moves the sessions to it (a transport upgrade, m2.md 3.6).
+//!   better transport moves the sessions to it (a transport upgrade, m2.md 3.6);
+//! - when a session suspects its connection (typed input unanswered, nothing received for
+//!   `max(2 s, 4 × SRTT + 4 × RTTVAR)`, [`Conn::suspect_after`]), the monitor races the
+//!   transports in the background while the connection is kept and PINGed; the first to answer
+//!   carries the sessions: the old path (the race is dropped and nothing is recorded), or a
+//!   new connection, to which the sessions move at once (m2.md 3.8).
 //!
 //! # Transcript events (`QSH_TRANSCRIPT`, unstable)
 //!
 //! Besides `attempt` (one per finished attempt: `won`, `ok` for a late success or a probe, or
 //! the failure kind), the pool records `plan` (`attempts`: `transport`, `port` and `delay_ms`
 //! of each; `remembered`; `skipped`; `keepalive_ms`), `keepalive` (`k_ms`, `why`:
-//! `nat-timeout` or `quiet`), `probe` (`transport`, `outcome`) and `upgrade` (`from`, `to`).
+//! `nat-timeout` or `quiet`), `probe` (`transport`, `outcome`), `upgrade` (`from`, `to`),
+//! `suspect` (`transport`, `silent_ms`, `after_ms`) and `rescue` (`from`, `outcome`: `moved`
+//! with `to`, `answered`, `failed` or `gone`; `ms` since the suspicion).
 
 use std::collections::HashMap;
 use std::fmt;
@@ -35,7 +42,7 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
-use super::conn::{Conn, PathChange};
+use super::conn::{Conn, Mark, PathChange};
 use super::paths::{self, Learner, PathMemory, Planned, Rebinding};
 use super::transcript::{self, Record};
 use super::ClientConfig;
@@ -65,6 +72,31 @@ const MONITOR_TICK: Duration = Duration::from_secs(1);
 const MEASURE_EVERY: Duration = Duration::from_secs(300);
 /// A retired connection is closed once its sessions moved, or after this long.
 const RETIRE_PATIENCE: Duration = Duration::from_secs(30);
+/// How often a background race for a suspected connection looks whether the connection
+/// answered after all (m2.md 3.8): a QUIC datagram has no event of its own.
+const RESCUE_POLL: Duration = Duration::from_millis(50);
+
+/// Stops a race: a suspected connection answered after all, or is gone.
+type Abort = dyn Fn() -> bool + Send + Sync;
+
+/// Wait for `fut`, unless `abort` says to stop first (checked every [`RESCUE_POLL`]).
+async fn unless<F: std::future::Future>(abort: Option<&Abort>, fut: F) -> Option<F::Output> {
+    let Some(abort) = abort else {
+        return Some(fut.await);
+    };
+    tokio::pin!(fut);
+    let mut poll = tokio::time::interval(RESCUE_POLL);
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            biased;
+            out = &mut fut => return Some(out),
+            _ = poll.tick() => if abort() {
+                return None;
+            },
+        }
+    }
+}
 
 /// Which daemon a connection goes to.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -449,7 +481,7 @@ impl Pool {
             keepalive,
             offer,
         };
-        match self.race(&planned, &ctx).await {
+        match self.race(&planned, &ctx, None).await {
             Ok(c) => Ok((c, ctx)),
             Err(first) if !planned.skipped.is_empty() => {
                 log::info(format_args!(
@@ -462,7 +494,7 @@ impl Pool {
                     skipped: Vec::new(),
                     remembered: false,
                 };
-                match self.race(&full, &ctx).await {
+                match self.race(&full, &ctx, None).await {
                     Ok(c) => Ok((c, ctx)),
                     Err(mut e) => {
                         let mut errors = first.errors;
@@ -476,14 +508,20 @@ impl Pool {
     }
 
     /// Run one race and keep the first connection whose hello succeeds within 5 s
-    /// (protocol.md 12.1); record what each attempt showed.
-    async fn race(&self, planned: &Planned, ctx: &Ctx) -> Result<Arc<Conn>, RaceError> {
+    /// (protocol.md 12.1); record what each attempt showed. When `abort` says so (a suspected
+    /// connection answered after all, m2.md 3.8), the race is dropped with its attempts, and
+    /// nothing is recorded: the error is empty then.
+    async fn race(&self, planned: &Planned, ctx: &Ctx, abort: Option<&Abort>) -> Result<Arc<Conn>, RaceError> {
         let mut plan = planned.plan.clone();
         plan.quic = quic::Options::with_keepalive(ctx.keepalive);
         record_plan(&plan, planned, ctx.keepalive);
         let mut race = Race::with_connector(&ctx.target, &plan, self.connector.clone());
         let mut failures: Vec<(Transport, FailureKind)> = Vec::new();
-        while let Some(event) = race.next_event().await {
+        loop {
+            let Some(event) = unless(abort, race.next_event()).await else {
+                return Err(RaceError::default());
+            };
+            let Some(event) = event else { break };
             let won = match event {
                 RaceEvent::Failed { attempt, error } => {
                     let kind = FailureKind::of(&error);
@@ -499,7 +537,16 @@ impl Pool {
             };
             let (attempt, handshake) = (won.attempt, won.handshake);
             let answers = Answers::of(&won.connection);
-            match tokio::time::timeout(ATTACH_TIMEOUT, Conn::hello_offering(won.connection, ctx.offer)).await {
+            let hello = tokio::time::timeout(ATTACH_TIMEOUT, Conn::hello_offering(won.connection, ctx.offer));
+            let Some(hello) = unless(abort, hello).await else {
+                return Err(RaceError::default());
+            };
+            match hello {
+                Ok(Ok(conn)) if abort.is_some_and(|abort| abort()) => {
+                    // The suspected connection answered first after all
+                    tokio::spawn(async move { goodbye(&conn, "").await });
+                    return Err(RaceError::default());
+                }
                 Ok(Ok(conn)) => {
                     log::debug(format_args!(
                         "connected over {} port {} in {} ms",
@@ -527,6 +574,7 @@ impl Pool {
                     self.won(ctx, attempt, handshake, &failures);
                     let quic_keepalive = (conn.transport() == Transport::Quic).then_some(plan.quic.keep_alive);
                     conn.set_keepalive(quic_keepalive, ctx.keepalive);
+                    conn.handshake_took(handshake);
                     *conn.attempts.lock().unwrap() = attempts(ctx, planned, attempt.transport, race.errors());
                     self.conclude(race, ctx, &conn, unanswered);
                     return Ok(conn);
@@ -696,6 +744,7 @@ impl Pool {
     ) {
         let quic_keepalive = (conn.transport() == Transport::Quic).then_some(ctx.keepalive);
         conn.set_keepalive(quic_keepalive, ctx.keepalive);
+        conn.handshake_took(handshake);
         let (t, unix) = (attempt.transport, paths::now());
         match self.upgrade(slot, old, conn, ctx) {
             // The sessions use it now: the one to start with next time
@@ -711,6 +760,8 @@ impl Pool {
     fn watch(&self, slot: &Arc<tokio::sync::Mutex<Slot>>, conn: &Arc<Conn>, ctx: Ctx) {
         let (tx, rx) = mpsc::unbounded_channel();
         conn.watch_path(tx);
+        let (tx, suspicions) = mpsc::unbounded_channel();
+        conn.watch_suspicions(tx);
         let last_step = self.last_step(&ctx);
         let monitor = Monitor {
             pool: self.me.clone(),
@@ -721,7 +772,7 @@ impl Pool {
             probing: Arc::new(AtomicBool::new(false)),
             ctx,
         };
-        tokio::spawn(monitor.run(rx));
+        tokio::spawn(monitor.run(rx, suspicions));
     }
 
     fn last_step(&self, ctx: &Ctx) -> Option<Instant> {
@@ -781,15 +832,174 @@ impl Pool {
         self.watch(&slot_ref, &new, ctx.clone());
         // The sessions move once their input is acknowledged; then the old one goes
         old.retire();
-        tokio::spawn(async move {
-            let deadline = Instant::now() + RETIRE_PATIENCE;
-            while Arc::strong_count(&old) > 1 && Instant::now() < deadline {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            goodbye(&old, "moved").await;
-        });
+        dismiss(old);
         Ok(())
     }
+
+    /// A background race for `old`, suspected since `mark`, produced `new` before `old`
+    /// answered (m2.md 3.8): make it the slot's connection and move the sessions over at once
+    /// ([`Conn::abandon`]). Unlike an upgrade, the transport may be any (the path is what
+    /// failed) and no interval applies. Gives `new` back when `old` answered after all or is no
+    /// longer the slot's connection (its sessions found it dead meanwhile and race on their
+    /// own). Nothing awaits between the last look at `old` and the move.
+    fn take_over(
+        &self,
+        slot: &Weak<tokio::sync::Mutex<Slot>>,
+        old: &Arc<Conn>,
+        mark: &Mark,
+        new: Arc<Conn>,
+        ctx: &Ctx,
+    ) -> Result<(), Arc<Conn>> {
+        let Some(slot_ref) = slot.upgrade() else {
+            return Err(new);
+        };
+        let Ok(mut s) = slot_ref.try_lock() else {
+            return Err(new);
+        };
+        let current = s.current.as_ref().is_some_and(|c| Arc::ptr_eq(c, old));
+        if !current || !old.usable() || old.heard_since(mark) {
+            return Err(new);
+        }
+        s.current = Some(new.clone());
+        drop(s);
+        self.watch(&slot_ref, &new, ctx.clone());
+        old.abandon();
+        dismiss(old.clone());
+        Ok(())
+    }
+
+    /// The background race for a suspected connection (m2.md 3.8): the plan path memory gives,
+    /// with every direct transport at once (the one in use has had its chance), the old
+    /// connection kept and PINGed meanwhile. The first to answer carries the sessions: the old
+    /// connection (the race is dropped, nothing is recorded, and the connection's threshold
+    /// grows), or a connection of the race, to which they move.
+    async fn rescue(self: Arc<Pool>, slot: Weak<tokio::sync::Mutex<Slot>>, old: Weak<Conn>, ctx: Ctx, mark: Mark) {
+        let Some(conn) = old.upgrade() else { return };
+        let from = conn.transport();
+        let silent = mark.at.elapsed();
+        log::info(format_args!(
+            "no answer over {from} for {:.1} s; trying the transports again while waiting",
+            silent.as_secs_f64()
+        ));
+        record_event(
+            "suspect",
+            json!({
+                "transport": from.to_string(),
+                "silent_ms": silent.as_millis() as u64,
+                "after_ms": conn.suspect_after().as_millis() as u64,
+            }),
+        );
+        conn.ping();
+        drop(conn);
+        let started = Instant::now();
+        let outcome = |outcome: &str, to: Option<Transport>| {
+            let mut fields = json!({
+                "from": from.to_string(),
+                "outcome": outcome,
+                "ms": started.elapsed().as_millis() as u64,
+            });
+            if let Some(to) = to {
+                fields["to"] = to.to_string().into();
+            }
+            record_event("rescue", fields);
+        };
+        let answered = {
+            let old = old.clone();
+            move || old.upgrade().is_none_or(|c| c.heard_since(&mark) || !c.usable())
+        };
+        let planned = rescue_plan(&ctx);
+        let raced = self.race(&planned, &ctx, Some(&answered)).await;
+        let Some(conn) = old.upgrade() else {
+            if let Ok(new) = raced {
+                goodbye(&new, "").await;
+            }
+            return outcome("gone", None);
+        };
+        match raced {
+            Ok(new) => {
+                let to = new.transport();
+                match self.take_over(&slot, &conn, &mark, new, &ctx) {
+                    Ok(()) => {
+                        log::info(format_args!("{to} answered first; the sessions move off {from}"));
+                        outcome("moved", Some(to));
+                    }
+                    Err(new) => {
+                        goodbye(&new, "").await;
+                        self.rescued_by_itself(&conn, &mark, &outcome);
+                    }
+                }
+            }
+            Err(_) if conn.heard_since(&mark) || !conn.usable() => self.rescued_by_itself(&conn, &mark, &outcome),
+            Err(e) => {
+                log::debug(format_args!("nothing else answered either: {e}"));
+                conn.rescue_over(None);
+                outcome("failed", None);
+            }
+        }
+    }
+
+    /// The suspected connection answered before anything of the race (or is no longer in
+    /// use): a false alarm, as far as a race can tell.
+    fn rescued_by_itself(&self, conn: &Conn, mark: &Mark, outcome: &dyn Fn(&str, Option<Transport>)) {
+        if conn.heard_since(mark) {
+            // The silence lasted until the first answer: a message's arrival is known (the
+            // last one, often the only one by now), a datagram's only as "by now"
+            let answered = conn.last_received();
+            let until = if answered > mark.at { answered } else { Instant::now() };
+            conn.rescue_over(Some(until.duration_since(mark.at)));
+            outcome("answered", None);
+        } else {
+            conn.rescue_over(None);
+            outcome("gone", None);
+        }
+    }
+}
+
+/// The plan of a background race for a suspected connection (m2.md 3.8): what path memory
+/// plans for a reconnect (its order, its skipped transports, its remembered ports), but every
+/// direct transport at once, a new connection of the suspected one's transport too (its path
+/// may be fine, the connection not: a TCP connection in exponential back-off, lost server
+/// state); the ssh pipe at its planned start.
+fn rescue_plan(ctx: &Ctx) -> Planned {
+    let now = paths::now();
+    let entry = ctx.memory.entry_at(&ctx.host, &ctx.network, now);
+    let planned = paths::plan(entry.as_ref(), &ctx.target, &ctx.race, now);
+    let mut order: Vec<Transport> = Vec::new();
+    for a in &planned.plan.attempts {
+        if !order.contains(&a.transport) {
+            order.push(a.transport);
+        }
+    }
+    let port = |t: Transport| {
+        entry
+            .as_ref()
+            .filter(|_| planned.remembered)
+            .and_then(|e| e.transport(t))
+            .and_then(|r| r.port)
+    };
+    let starts = order.into_iter().map(|t| {
+        let start = match t {
+            Transport::Ssh => planned.plan.start_of(t),
+            _ => Some(Duration::ZERO),
+        };
+        (t, start, port(t))
+    });
+    Planned {
+        plan: Plan::build(&ctx.target, starts),
+        skipped: planned.skipped,
+        remembered: planned.remembered,
+    }
+}
+
+/// Close `old` once the sessions left it, or after [`RETIRE_PATIENCE`].
+fn dismiss(old: Arc<Conn>) {
+    tokio::spawn(async move {
+        let deadline = Instant::now() + RETIRE_PATIENCE;
+        while Arc::strong_count(&old) > 1 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        goodbye(&old, "moved").await;
+    });
 }
 
 /// Close a connection on purpose: GOAWAY (NO_ERROR), then close (protocol.md 5.7).
@@ -917,7 +1127,11 @@ struct Monitor {
 }
 
 impl Monitor {
-    async fn run(mut self, mut changes: mpsc::UnboundedReceiver<PathChange>) {
+    async fn run(
+        mut self,
+        mut changes: mpsc::UnboundedReceiver<PathChange>,
+        mut suspicions: mpsc::UnboundedReceiver<Mark>,
+    ) {
         let mut tick = tokio::time::interval(MONITOR_TICK);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut last_tick = Instant::now();
@@ -930,6 +1144,7 @@ impl Monitor {
                     Some(change) => self.path_changed(change),
                     None => break,
                 },
+                Some(mark) = suspicions.recv() => self.rescue(mark),
                 _ = tick.tick() => {
                     let now = Instant::now();
                     let elapsed = now.duration_since(last_tick);
@@ -1060,6 +1275,13 @@ impl Monitor {
         // Written at once (Ctx::update)
         self.ctx.update(|e| e.set_keepalive(k));
         record_event("keepalive", json!({"k_ms": k.as_millis() as u64, "why": why}));
+    }
+
+    /// A session suspects the connection since `mark`: race the transports in the background
+    /// (m2.md 3.8).
+    fn rescue(&self, mark: Mark) {
+        let Some(pool) = self.pool.upgrade() else { return };
+        tokio::spawn(pool.rescue(self.slot.clone(), self.conn.clone(), self.ctx.clone(), mark));
     }
 
     /// Probe one transport that failed here and whose retry time came (m2.md 3.6).

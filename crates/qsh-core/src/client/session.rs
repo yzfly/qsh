@@ -17,10 +17,12 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
+// The channel's timing runs on tokio's clock, so that tests can run it on paused time
+use tokio::time::Instant;
 
 use super::conn::Conn;
 use super::pool::Pool;
@@ -49,7 +51,9 @@ use crate::transport::ssh::SshCommand;
 use crate::transport::{RecvStream, SendStream, Target};
 
 /// Typed input followed by nothing received for this long: the path is dead. The user
-/// notices a dead connection when typing, so that is when to find out fast.
+/// notices a dead connection when typing, so that is when to find out fast. Long before, after
+/// [`Conn::suspect_after`] (2 s on most paths), the connection is suspected and the transports
+/// are raced in the background (m2.md 3.8); this is the fallback when nothing else answers.
 const INPUT_ANSWER_WITHIN: Duration = Duration::from_secs(8);
 /// Unacknowledged input for this long: PING, so the control stream answers even if the
 /// terminal stream is held up.
@@ -319,7 +323,8 @@ enum End {
     Fatal(ClientError),
     /// The session is gone for good: it ended, or the server does not know it.
     Gone(ClientError),
-    /// The connection is being retired ([`Conn::retire`]): attach again at once, on another.
+    /// The connection is being retired ([`Conn::retire`]) or was abandoned
+    /// ([`Conn::abandon`]): attach again at once, on another.
     Moved,
     /// The attachment was given up, not the connection (a snapshot was refused): attach again
     /// at once, without back-off.
@@ -524,9 +529,17 @@ impl Session {
                 End::Exited(status) => return Ok(Outcome::Exited(status)),
                 End::Detached => return Ok(Outcome::Detached),
                 End::Moved => {
-                    // A transport upgrade (m2.md 3.6): no disconnection, no back-off
+                    // A transport upgrade (m2.md 3.6), or the path stopped answering and another
+                    // connection answered first (3.8): no back-off, nothing to tell the user
                     log::debug(format_args!("moving the session off {}", conn.transport()));
                     backoff = BACKOFF_FIRST;
+                    if conn.abandoned() {
+                        self.status.lock().unwrap().reconnects += 1;
+                        transcript::record(Record::Disconnected {
+                            session: &state.session,
+                            why: "no answer; another connection answered first",
+                        });
+                    }
                 }
                 End::Again(why) => {
                     // Bounded: what ends an attachment this way is not repeated (State)
@@ -644,6 +657,11 @@ impl Session {
         if accept {
             flags |= ATTACH_ACCEPT_SNAPSHOT;
         }
+        // Subscribed before the ATTACH is sent, so that a move meanwhile is not missed
+        let mut moved = conn.moved();
+        if conn.abandoned() {
+            return Ok(End::Moved);
+        }
         let attach = Message::Attach {
             session: state.session,
             proof: key.proof(&cb),
@@ -656,7 +674,16 @@ impl Session {
             return Ok(End::Lost(e.to_string()));
         }
         conn.sent();
-        let reply = match tokio::time::timeout(ATTACH_TIMEOUT, read_message(&mut recv, MAX_TERMINAL)).await {
+        let answer = tokio::select! {
+            answer = tokio::time::timeout(ATTACH_TIMEOUT, read_message(&mut recv, MAX_TERMINAL)) => answer,
+            Ok(()) = moved.changed(), if !conn.abandoned() => {
+                // The pool moved the sessions to another connection meanwhile (m2.md 3.8):
+                // abandon this ATTACH first, so that only one is ever outstanding (7.2)
+                send.reset(ErrorCode::CANCELLED);
+                return Ok(End::Moved);
+            }
+        };
+        let reply = match answer {
             Ok(Ok(Some(m))) => m,
             Ok(Ok(None)) => return Ok(End::Lost("the server closed the channel".into())),
             Ok(Err(e)) => return Ok(End::Lost(e.to_string())),
@@ -758,7 +785,7 @@ impl Session {
             let mut status = self.status.lock().unwrap();
             status.transport = Some(conn.transport());
             status.remote = conn.connection.remote_address();
-            status.connected_since = Some(Instant::now());
+            status.connected_since = Some(std::time::Instant::now());
             status.bytes_out += pending.len() as u64;
             status.attempts = conn.attempts();
         }
@@ -898,6 +925,14 @@ impl Session {
         // Since when typed input waits for any answer, and whether it was PINGed already
         let mut unanswered: Option<Instant> = had_pending.then(Instant::now);
         let mut input_pinged = false;
+        // While it waits: when the connection is suspected unless something arrives since the
+        // mark (m2.md 3.8)
+        let mut quiet = had_pending.then(|| (conn.mark(), Instant::now() + conn.suspect_after()));
+        // The pool moved the sessions off this connection (3.8)
+        let mut moved = conn.moved();
+        if conn.abandoned() {
+            return Ok(End::Moved);
+        }
         let mut hangup_sent = state.hangup;
         let mut tick = tokio::time::interval(Duration::from_millis(250));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1141,6 +1176,7 @@ impl Session {
                             state.input.ack(received);
                             if received == state.input.end() {
                                 unanswered = None;
+                                quiet = None;
                                 input_pinged = false;
                             }
                         }
@@ -1175,7 +1211,10 @@ impl Session {
                         for m in &messages {
                             if let Message::Input { data, .. } = m {
                                 self.status.lock().unwrap().bytes_out += data.len() as u64;
-                                unanswered.get_or_insert_with(Instant::now);
+                                if unanswered.is_none() {
+                                    unanswered = Some(Instant::now());
+                                    quiet = Some((conn.mark(), Instant::now() + conn.suspect_after()));
+                                }
                             }
                             outbox.push(m);
                         }
@@ -1204,7 +1243,7 @@ impl Session {
                     None => state.input_closed = true,
                 },
                 // Behind input typed during a flood, until it is acknowledged
-                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(probe.map_or_else(Instant::now, |p| p.0))), if probe.is_some() => {
+                _ = tokio::time::sleep_until(probe.map_or_else(Instant::now, |p| p.0)), if probe.is_some() => {
                     probe = match probe {
                         Some((_, left)) if left > 0 && !state.input.is_empty() => {
                             conn.ping();
@@ -1213,8 +1252,24 @@ impl Session {
                         _ => None,
                     };
                 }
+                // Typed input unanswered and nothing received since the mark: suspected, the
+                // transports race in the background (m2.md 3.8); then, or when something did
+                // arrive, the same again from now while the input waits
+                _ = tokio::time::sleep_until(quiet.map_or_else(Instant::now, |q| q.1)), if quiet.is_some() => {
+                    if let Some((mark, _)) = quiet.take() {
+                        if !conn.heard_since(&mark) {
+                            conn.suspect(mark);
+                        }
+                        quiet = Some((conn.mark(), Instant::now() + conn.suspect_after()));
+                    }
+                }
+                // Another connection answered first: leave at once; the input not acknowledged
+                // here is resent after the next ATTACHED, from where the server says (7.3)
+                Ok(()) = moved.changed() => if conn.abandoned() {
+                    return Ok(End::Moved);
+                },
                 // ACKs on time (7.5): 50 ms matter on an attachment that accepts snapshots
-                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(ack_due.unwrap_or_else(Instant::now))), if ack_due.is_some() => {
+                _ = tokio::time::sleep_until(ack_due.unwrap_or_else(Instant::now)), if ack_due.is_some() => {
                     ack(&mut outbox, state, &mut acked);
                     ack_due = None;
                     last_ack = Instant::now();

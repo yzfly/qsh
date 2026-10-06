@@ -2368,6 +2368,21 @@ the ssh pipe the PING every 15 s stays.
 A connection that is dead for one session is dead for all sessions it carries: a client that
 shares a connection between sessions closes it once, and all sessions resume on the new one.
 
+**Suspected paths** (RECOMMENDED). Long before the 8 s, a client SHOULD *suspect* a connection
+when typed input is unanswered and nothing at all has been received on it (over QUIC: no UDP
+datagram) for max(2 s, 4 × SRTT + 4 × RTTVAR), the round-trip estimates of the transport (QUIC)
+or of the connection's own exchanges (the hello, PING / PONG), and race the transports again in
+the background, every direct transport at once, without closing the connection, which it PINGs
+once more. Whichever answers first carries the sessions: if anything arrives on the old
+connection before a connection of the race has completed its hello, the race is dropped and
+nothing is learned from it (path memory, section 12.1), and the client SHOULD wait longer
+before suspecting that connection again; otherwise the sessions move to the new connection at
+once, as in a reconnect: each abandons an outstanding ATTACH on the old connection first, so
+that one ATTACH per session is outstanding at a time (section 7.2), and resends its input from
+the `Input Received` of the new ATTACHED (section 7.3), so no input is lost or repeated. The old
+connection then gets GOAWAY (NO_ERROR) and is closed. If the race finds nothing, the rules above
+decide. The design and the measurements are in m2.md section 3.8.
+
 ### 12.4 Network changes and NAT keepalive
 
 - The client watches its default route and addresses (netlink on Linux, route sockets on BSD
