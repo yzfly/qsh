@@ -21,7 +21,8 @@ Please do not open public issues for security problems.
 - **Keys rotate on every attach**, so a leaked key stops working the next time the legitimate
   client connects.
 - **Nothing accepts anything before authentication** beyond a hello of at most 2 KiB, a few
-  ATTACH messages of at most 256 bytes, within 10 seconds, on a bounded number of connections.
+  ATTACH messages of at most 256 bytes, within 10 seconds of the connection being accepted, on a
+  bounded number of connections per source address and per daemon.
 - **Nothing runs as root.** `qsh-server` is a per-user program, run by the user over ssh or by
   the user's service manager. It never changes its user id and starts processes only as the
   user it runs as.
@@ -75,7 +76,7 @@ including during the bootstrap.
 - **Downgrade**: blocking UDP forces TLS over TCP, blocking that forces the ssh pipe; all three
   are fully authenticated and encrypted, so the attacker degrades performance, not security. The
   ALPN value and the protocol version are covered by the authenticated TLS handshake (the pipe:
-  by ssh).
+  by ssh), and both endpoints refuse a handshake that did not negotiate `qsh/1` (protocol §9.1).
 - **Connection migration**: QUIC path validation (RFC 9000 §8.2) prevents the attacker from
   redirecting a connection to an address it does not control; stateless resets need the reset
   token, which only the endpoints know.
@@ -101,13 +102,28 @@ but cannot see traffic between client and server.
   received from an unvalidated address, RFC 9000 §8) bounds reflection attacks; under load the
   server uses Retry to validate addresses before allocating state (protocol §9.1). An
   unauthenticated peer receives nothing but a SERVER_HELLO, a PATH_INFO and errors.
-- **Resource exhaustion** is bounded by protocol §6.6: at most 2 KiB of hello and 4 ATTACH
-  streams of 256 bytes, 16 KiB in total and 10 s per unauthenticated connection, 64
-  unauthenticated connections per daemon and 8 per source address, three failed ATTACHes per
-  connection, a delay of at least 500 ms per failure, and a per-source failure rate limit. Each
-  handshake still costs the daemon one signature (ECDSA P-256 or Ed25519) and a key exchange:
-  hosts that expose the daemon to the whole Internet should consider a firewall rule, as for
-  sshd.
+- **Resource exhaustion** is bounded by protocol §6.6, and every bound counts from the moment
+  the server accepts the connection (the TCP `accept`, or the first QUIC Initial it decides to
+  process), not from the end of the TLS handshake, so a peer that starts handshakes and never
+  finishes them is bounded like any other:
+  - at most 64 connections per daemon and 8 per source address (an IPv4 address or an IPv6 /64)
+    may be unauthenticated at the same time, handshaking ones included; further ones are
+    refused before any TLS work (QUIC: CONNECTION_CLOSE without state; TCP: the socket is
+    closed at once);
+  - above 32 unauthenticated connections, every new QUIC connection must first answer a Retry,
+    so forged source addresses cannot occupy slots;
+  - per connection: 10 s from acceptance to a complete hello and 10 s more to a successful
+    ATTACH; at most 2 KiB of hello and 4 ATTACH streams of 256 bytes; the server reads at most
+    16 KiB of stream data and the QUIC stack buffers at most 64 KiB (the connection flow control
+    window, not raised before authentication);
+  - three wrong proofs (AUTH_FAILED) per connection that carries no attachment, a delay of at
+    least 500 ms per failure, and a per-source token bucket of 10 failures per minute, beyond
+    which the source's new connections are refused.
+
+  Each handshake still costs the daemon one signature (ECDSA P-256 or Ed25519) and a key
+  exchange: hosts that expose the daemon to the whole Internet should consider a firewall rule,
+  as for sshd. The daemon raises its soft file descriptor limit so that these limits, not
+  descriptor exhaustion, decide when connections are refused.
 - **Guessing** is not a practical attack: with a 256-bit key, the rate limits matter for CPU,
   not for the key's strength.
 
@@ -128,38 +144,75 @@ Have accounts on the same host and can run arbitrary programs, bind free ports, 
   free one, and the bootstrap reports the real port. A process of another user listening on a
   port the client remembers cannot impersonate the daemon, because of pinning. Another user can
   occupy all hundred ports and deny the direct transports; the ssh pipe still works (section 9).
-- **Local files and sockets**, all created by `qsh-server` with a umask of 077:
+- **Local files and sockets**, all created by `qsh-server` with explicit modes:
 
   | Path | Mode | Contents |
   |---|---|---|
   | `$XDG_RUNTIME_DIR/qsh/` | 0700 directory | runtime state |
-  | `$XDG_RUNTIME_DIR/qsh/control.sock` (name implementation-defined) | 0600 socket | control socket for `bootstrap` and `pipe` |
+  | `$XDG_RUNTIME_DIR/qsh/control.sock` (name implementation-defined) | 0600 socket | control socket for `bootstrap`, `pipe`, `status` and `stop` |
   | `$XDG_STATE_HOME/qsh/` (default `~/.local/state/qsh/`) | 0700 directory | persistent state |
   | `$XDG_STATE_HOME/qsh/identity.*` (names implementation-defined) | 0600 files | the daemon's private key and certificate |
 
-  The daemon MUST verify the peer of every control socket connection with the operating
-  system's peer credentials (`SO_PEERCRED` on Linux, `getpeereid` on BSD and macOS) and accept
-  only its own user id. Session keys exist on the server only in the daemon's memory; they are
-  never written to disk.
-- **When `XDG_RUNTIME_DIR` is not set** (common for ssh logins on hosts without
-  systemd-logind), the runtime directory falls back to `/tmp/qsh-<uid>/`. Because another user
-  can pre-create that name, the daemon MUST create it with `mkdir` mode 0700 and, whether it
-  created it or found it, verify with `lstat` that it is a directory (not a symlink), owned by
-  its own user id, with no group or other permissions; otherwise it MUST refuse to use it and
-  report the problem.
+  Every directory, file and socket is created with its mode given explicitly (`mkdir` and
+  `open` with the mode, a socket bound inside the 0700 directory and then set to 0600), and a
+  file holding a secret is written to a temporary name with mode 0600 and renamed into place.
+  The daemon does **not** change its process umask to get there: the programs of every session
+  inherit the daemon's umask, and a user whose files suddenly came out 0600 because they were
+  created in a qsh session would rightly call that a bug. The daemon keeps the umask it was
+  started with (from the ssh login or the service manager).
+
+  Session keys exist on the server only in the daemon's memory; they are never written to disk.
+- **The runtime directory is checked, by everyone who uses it.** When `XDG_RUNTIME_DIR` is not
+  set (common for ssh logins on hosts without systemd-logind), the runtime directory falls back
+  to `/tmp/qsh-<uid>/`, a name another user can pre-create, and even under `XDG_RUNTIME_DIR` a
+  misconfiguration can leave it wrong. So:
+  - the daemon creates the directory with `mkdir` mode 0700 if it does not exist;
+  - **every** process that uses it, the daemon and each control-socket client alike
+    (`qsh-server bootstrap`, `pipe`, `status`, `stop`, and the client hub's own clients),
+    verifies with `lstat`, before it binds or connects to anything inside, that the path is a
+    directory (not a symlink), owned by its effective user id, with no group or other
+    permission bits. If any check fails it MUST refuse to use the directory and report the
+    problem; it MUST NOT "repair" it with `chmod` or `chown`, which would make a directory
+    someone else controls look trustworthy.
+- **Control-socket trust is mutual.** The control socket carries session keys (in bootstrap
+  replies) and whole sessions (the pipe), so both ends authenticate each other with the
+  operating system's peer credentials (`SO_PEERCRED` on Linux, `getpeereid` on BSD and macOS):
+  - the daemon accepts a control connection only from a peer whose user id equals its own
+    effective user id;
+  - every client of the socket MUST check, right after connecting and before it sends anything,
+    that the peer's user id equals its own effective user id. Otherwise another user who managed
+    to put a socket in its place (a race on `/tmp`, a wrong `XDG_RUNTIME_DIR`) would receive the
+    bootstrap request and could answer it with credentials and a pin of its own choosing.
+  - Every exchange on the socket has a deadline (protocol §6.6), so a local client that connects
+    and stalls cannot pin the daemon's resources.
+
+  The same rules apply to the client hub's socket (section 4.4).
 - **Inherited file descriptors**: the daemon opens every file and socket close-on-exec, so the
   programs of a session do not inherit its listening sockets, the control socket, other
-  sessions' pseudo-terminals or the identity files.
+  sessions' pseudo-terminals or pipes, or the identity files.
+- **Session environment**: the daemon builds each session's environment from a fixed list
+  (protocol §10.3) and passes on nothing of its own environment, so nothing of the ssh login
+  that happened to start the daemon (`SSH_AUTH_SOCK`, `SSH_CONNECTION`, …) leaks into later
+  sessions.
+- **Sessions end completely**: hanging a session up signals its process group and closes its
+  terminal, and the session's id, key and buffers are removed at once (protocol §7.11); a
+  session that was ended can no longer be attached by anyone, whatever its processes do.
 
 ### 4.4 Other local users on the client
 
-- Session state files live in `$XDG_STATE_HOME/qsh/sessions/` (directory 0700, files 0600). A
-  state file holds the host, ports, certificate fingerprint, session id and session key. The
-  client writes them atomically (write a temporary file in the same directory, then rename) so a
-  crash never leaves a truncated key.
+- **Session state files (milestone M1, `qsh attach`).** They live in
+  `$XDG_STATE_HOME/qsh/sessions/` (directory 0700, files 0600, both created with explicit
+  modes). A state file holds the host, ports, certificate fingerprint, session id, session kind
+  and session key. The client writes them atomically (a temporary file with mode 0600 in the same
+  directory, then rename) so a crash never leaves a truncated key. Until state files exist, and
+  for embedders that keep none, credentials live only in the client's memory and are confirmed
+  at once (protocol §6.5); losing the process then means re-issuing the key over ssh (bootstrap
+  op `attach`).
 - The client passes nothing secret to ssh on its command line; the request goes to ssh's stdin.
 - A resident client process shared by embedders (the hub, DESIGN §4) listens on a unix socket
-  of mode 0600 in a 0700 directory and verifies the peer's user id like the daemon.
+  of mode 0600 in a 0700 directory. Trust is mutual, as for the daemon's control socket
+  (section 4.3): the hub accepts only peers with its own user id, and every hub client checks
+  the directory with `lstat` and the hub's peer user id before it sends anything.
 - The client MUST NOT print keys or proofs in verbose or debug output.
 
 ### 4.5 A stolen state file
@@ -197,8 +250,11 @@ already has what qsh protects there. What matters is what it can do to the clien
   per connection by the client (capabilities) and per use by the user.
 - **Robust parsing.** Every client parser is bounded and fuzzed: message lengths are checked
   before allocation (protocol §3.2), snapshots are limited to 1 MiB and compressed frames to
-  64 KiB of declared, checked output (protocol §7.8, §7.12), and the bootstrap reply is read up
-  to 1 MiB.
+  64 KiB of declared, checked output (protocol §7.8, §7.12). The client keeps at most 1 MiB of
+  the bootstrap's output while it keeps draining ssh's stdout to the end (protocol §10.4), does
+  all offset arithmetic checked and rejects attach offsets beyond what it sent (protocol §7.3),
+  and resets with UNKNOWN_CHANNEL any stream the server opens without a negotiated reason
+  (protocol §4.3).
 - **ssh credentials**: the bootstrap and pipe ssh invocations disable agent and X11 forwarding
   and clear configured port forwardings (protocol §10.1), so the server gets no access to the
   user's agent through qsh even if the user's ssh configuration forwards it for interactive
@@ -231,7 +287,9 @@ through ssh, the old identity becomes useless at once.
 | Server proof in ATTACHED | §6.3, §7.3 | impersonation of a session by a holder of a stolen daemon key |
 | Server nonce binding on the pipe | §6.2 | replay of pipe proofs |
 | Key rotation with confirmation | §6.5 | long-lived use of leaked keys, without lockouts |
-| Pre-authentication limits | §6.6 | memory and CPU exhaustion by unauthenticated peers |
+| Pre-authentication limits, counted from accept | §6.6 | memory, descriptor and CPU exhaustion by unauthenticated peers, including ones that never finish a handshake |
+| ALPN required and checked on both sides | §9.1 | a qsh endpoint talking to a non-qsh TLS peer, cross-protocol confusion |
+| Key ID in KEY_CONFIRM | §6.5 | a delayed confirmation promoting a key the client never received |
 | QUIC address validation, Retry | §9.1 | amplification and reflection |
 | Message size limits, strict parsing | §3 | memory exhaustion, parser exploits |
 | Strict sequence rules | §7.4–7.5 | silent corruption of terminal streams |
@@ -239,7 +297,8 @@ through ssh, the old identity becomes useless at once.
 | One attachment per session, no automatic retake | §7.3, §11.2 | two clients fighting over a session; silent hijack |
 | Session TTLs | §7.13 | abandoned sessions and keys living forever |
 | Per-user daemon, no root | §4.3 here | privilege escalation; cross-user access |
-| Socket peer credential checks, 0700/0600 | §4.3 here | other local users reaching the daemon |
+| Socket peer credential checks on both ends, `lstat` of the runtime directory by every user of it, explicit 0700/0600 modes | §4.3 here | other local users reaching the daemon, or posing as it to local clients |
+| Session environment built from a fixed list | protocol §10.3 | stale ssh agent sockets and connection variables leaking into sessions |
 
 ## 6. Cryptography
 
@@ -256,8 +315,22 @@ through ssh, the old identity becomes useless at once.
 | Random numbers | the operating system CSPRNG via ring (`getrandom`) |
 | Secret comparison | constant time |
 
-Implementations SHOULD overwrite session keys in memory when they are replaced or the session
-ends, and MUST NOT write them to logs, core dumps they control, or crash reports.
+Handling of secrets in memory (session keys, the bootstrap reply that carries one, the
+daemon's private key):
+
+- Implementations SHOULD zeroize a session key when it is dropped: when it is replaced by
+  rotation, when a pending key is discarded, and when the session ends (in Rust, a key type that
+  overwrites itself on `Drop`, for example with the `zeroize` crate). This limits what a later
+  memory disclosure (a core dump, swap, a heap read bug) can reveal; it is defence in depth, not
+  a boundary, since the same user can read the daemon's memory anyway (section 9).
+- Credentials MUST never appear in logs, debug output, error messages or crash reports, of the
+  daemon or the client, at any verbosity: types holding keys or proofs implement their debug
+  formatting (`Debug` in Rust) to print a placeholder such as `SessionKey(..)`, and the
+  bootstrap reply is never logged as received. Session ids, key IDs (protocol §6.5) and
+  certificate fingerprints are not secret and may be logged.
+- Implementations MUST NOT write keys to core dumps or crash reports they control (the daemon
+  MAY lower its own `RLIMIT_CORE` soft limit to 0, provided it restores the original limit in
+  the programs it starts, so that sessions keep the user's own setting).
 
 ### Key and credential lifetimes
 
@@ -265,7 +338,7 @@ ends, and MUST NOT write them to logs, core dumps they control, or crash reports
 |---|---|---|
 | TLS traffic keys | each handshake | connection close (QUIC key updates rotate them within a connection) |
 | Server nonce | each connection | connection close |
-| Session key | bootstrap, then each attach | confirmed replacement (one round trip after the next attach), `bootstrap attach`, or session end |
+| Session key | bootstrap, then each attach | confirmed replacement (one round trip after the next attach; KEY_CONFIRM names the key it confirms), `bootstrap attach`, or session end; zeroized when dropped |
 | Session id | bootstrap | session end: 6 h detached, 1 h after exit, HANGUP, `qsh kill` |
 | Daemon identity (key, certificate) | first daemon start | deleted or rotated by the user or administrator; implementations SHOULD offer a rotation command |
 | Client state file | bootstrap | the client deletes it when the session ends or is unknown to the server |
@@ -275,16 +348,22 @@ ends, and MUST NOT write them to logs, core dumps they control, or crash reports
 - **Amplification**: QUIC's 3× limit before address validation, Retry under load; TCP has its
   own handshake; the pipe needs an ssh login. An unauthenticated peer gets nothing larger than a
   SERVER_HELLO.
-- **State exhaustion**: bounded per unauthenticated connection (16 KiB, 10 s), per source
-  address (8 connections) and per daemon (64 unauthenticated connections). Authenticated
-  connections can only be opened by holders of a session key.
-- **CPU**: one TLS handshake per connection; failed attaches are delayed and rate limited per
-  source address.
+- **State exhaustion**: bounded per unauthenticated connection (16 KiB read, 64 KiB buffered,
+  10 s to the hello), per source address (8 connections) and per daemon (64 unauthenticated
+  connections), all counted from the moment a connection is accepted, handshakes included (section
+  4.2). Authenticated connections can only be opened by holders of a session key; idle mux
+  connections are closed after 90 s without traffic.
+- **CPU**: one TLS handshake per connection, behind Retry under load; failed attaches are
+  delayed and rate limited per source address.
+- **Local clients**: every control-socket request has a deadline; a stalled local process
+  cannot hold the daemon.
 - **Authenticated peers** are the user (or someone holding a session key). Memory per connection
   is still bounded: stream windows, `MAX_STREAMS`, message size limits, and the replay buffers
   (default 8 MiB of output per session, bounded input on the client).
-- **A slow or absent client never blocks a session's program**: the daemon keeps reading the
-  pseudo-terminal and discards the oldest output instead (protocol §7.6).
+- **A slow or absent client never blocks a tty session's program**: the daemon keeps reading the
+  pseudo-terminal and discards the oldest output instead (protocol §7.6). A pipe session is
+  data and is never truncated: there the program is blocked, as with ssh, until the client
+  acknowledges its output, and memory stays bounded by the replay buffers (protocol §7.14.5).
 - **Sessions per user** are limited by the daemon (bootstrap error `limit`); one user cannot use
   qsh to exhaust the host beyond what their account can do anyway.
 

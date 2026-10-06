@@ -61,7 +61,8 @@ client                                        server (one daemon per user)
   │◀──── ATTACHED, then everything the client missed, then live output
 ```
 
-A **session** is a pseudo-terminal running a login shell or a command on the server. It is
+A **session** is a pseudo-terminal running a login shell or a command on the server (or, for a
+*pipe session*, a command connected by pipes, section 7.14). It is
 identified by a 128-bit session id and authenticated by a 256-bit session key, both issued by
 the bootstrap. Each direction of a session's terminal is a byte stream with 64-bit offsets;
 the sender keeps unacknowledged bytes in a replay buffer, so a new connection resumes exactly
@@ -201,8 +202,13 @@ messages interleave better with other channels and with control traffic.
 - A payload shorter than the fields its type requires is a FRAME_ERROR.
 - A payload longer than the fields the receiver knows for its type: the receiver MUST ignore
   the extra bytes. This lets a later revision append fields to a message; a sender MUST NOT
-  append bytes unless a negotiated capability defines them. This rule does not apply to
+  append bytes unless a negotiated capability or the session kind (section 7.14) defines them.
+  This rule does not apply to
   messages whose last field is `data…`, which by definition use the whole payload.
+- Some layouts depend on the kind of the attached session: on a pipe session (section 7.14)
+  ATTACH, ATTACHED, ACK sent by the client, and EXIT carry an appended field that is
+  REQUIRED. For those messages "the fields its type requires" includes the appended field, so
+  a pipe-session message without it is a FRAME_ERROR.
 - Flag fields: senders MUST set undefined bits to zero; receivers MUST ignore undefined bits.
 - Values that a field defines as invalid are a FRAME_ERROR unless the field says otherwise.
 
@@ -256,6 +262,8 @@ reserved ranges, is in section 14.1.
 | 0x1a | DETACH | terminal | C→S | | 7.11 |
 | 0x1b | HANGUP | terminal | C→S | | 7.11 |
 | 0x1c | OUTPUT_ZSTD | terminal | S→C | `zstd` | 7.12 |
+| 0x1d | INPUT_EOF | terminal, pipe sessions | C→S | | 7.14.4 |
+| 0x1e | ERROR_OUTPUT | terminal, pipe sessions | S→C | | 7.14.3 |
 | 0x20–0x27 | reserved: port forwarding | | | `forward` | 14.1 |
 | 0x28–0x2f | reserved: file copy | | | `copy` | 14.1 |
 | 0x30–0x37 | reserved: agent forwarding | | | `agent` | 14.1 |
@@ -294,7 +302,11 @@ first message it sends on the stream:
 
 - qsh/1 defines only client-initiated channels. A server MUST NOT open a stream unless a
   negotiated capability defines a server-initiated channel. A client receiving a stream it did
-  not expect MUST end it with UNKNOWN_CHANNEL.
+  not expect MUST end it with UNKNOWN_CHANNEL: over the mux layer it sends RESET with
+  UNKNOWN_CHANNEL for the stream (and credits the stream's data back to the connection window,
+  section 8.3), so that the stream is closed for both endpoints and counts no longer against
+  `MUX_MAX_STREAMS`; it MUST NOT silently ignore it. (Over QUIC the client's
+  `initial_max_streams_bidi` of 0 makes such a stream a QUIC STREAM_LIMIT_ERROR.)
 - Streams are independent: there is no ordering between messages on different streams. A
   client MAY open channel streams before it has received SERVER_HELLO (pipelining, section
   5.1), except over the ssh pipe, where ATTACH needs the server nonce (section 6.2).
@@ -323,8 +335,9 @@ first message it sends on the stream:
 ### 5.1 The hello exchange
 
 1. When the transport is established and the client decides to use the connection (section
-   12.1), it opens stream 0 and sends CLIENT_HELLO. It MAY immediately open channel streams and
-   send ATTACH on them (over QUIC and TLS), without waiting for SERVER_HELLO. Because streams are
+   12.1), it opens stream 0 and sends CLIENT_HELLO. When the connection is not one of several
+   candidates of a race (section 12.1), it MAY immediately open channel streams and send ATTACH
+   on them (over QUIC and TLS), without waiting for SERVER_HELLO. Because streams are
    not ordered with respect to each other, ATTACHED or OUTPUT may then arrive before
    SERVER_HELLO; the client MUST buffer messages of channel streams (bounded by the stream flow
    control) until it has processed SERVER_HELLO, and MUST NOT treat their early arrival as an
@@ -335,7 +348,8 @@ first message it sends on the stream:
 3. The server then sends PATH_INFO (section 5.6).
 
 The server MUST close a connection that has not delivered a complete CLIENT_HELLO within
-`HELLO_TIMEOUT` = 10 s of the transport being established (TIMEOUT).
+`HELLO_TIMEOUT` = 10 s of the server accepting it (TIMEOUT); the time of the TLS handshake
+counts (section 6.6).
 
 ### 5.2 CLIENT_HELLO (0x01)
 
@@ -464,11 +478,15 @@ The sender will open no new streams on this connection, and will refuse new stre
 the peer after the peer received GOAWAY (with SHUTDOWN or IDLE as the stream error). Existing
 channels continue; the sender closes the connection when they are done or when it has to.
 
-- A server sends GOAWAY with SHUTDOWN before it stops (`qsh-server stop`, upgrade, system
-  shutdown) and with IDLE before closing an idle connection (section 12.5).
+- A server sends GOAWAY with SHUTDOWN when it stops (`qsh-server stop`, SIGTERM, system
+  shutdown), after it has ended every session and delivered each attachment's final EXIT or
+  ERROR (SESSION_ENDED) (section 7.13), and GOAWAY with IDLE before closing an idle connection
+  (section 12.5).
 - A client MAY send GOAWAY with NO_ERROR before it closes a connection on purpose.
-- A client receiving GOAWAY SHOULD move its sessions to a new connection; after SHUTDOWN, the
-  sessions themselves usually end too (they live in the daemon's memory, section 7.13).
+- A client receiving GOAWAY with IDLE moves its sessions to a new connection when it needs to.
+  A client receiving GOAWAY with SHUTDOWN follows section 7.13: if none of its sessions on that
+  connection is left, it MUST NOT reconnect, and in particular MUST NOT start the ssh pipe
+  transport, which would start a new daemon.
 
 ### 5.8 ERROR (0x07)
 
@@ -563,11 +581,18 @@ When the server receives ATTACH (after it has accepted CLIENT_HELLO):
    the channel fails with AUTH_FAILED.
 3. Otherwise the attach is authenticated; it continues with section 7.3.
 
-On a failure the server SHOULD wait at least 500 ms before sending the ERROR, MUST close the
-connection after three failed ATTACH messages on it (LIMIT_EXCEEDED), and SHOULD limit failures
-per source address (section 6.6). A client receiving SESSION_UNKNOWN or AUTH_FAILED MUST NOT
-retry the same credentials on a new connection; it bootstraps again over ssh (op `attach` for an
-existing session, section 10.3), or tells the user the session is gone.
+On a failure the server SHOULD wait at least 500 ms before sending the ERROR; the delay holds
+back only that stream, never the connection's other streams. Only AUTH_FAILED (a wrong proof)
+counts as a **failed ATTACH**: SESSION_UNKNOWN is a normal outcome for a client that holds
+several sessions (a hub) when one of them has ended, and does not count. While a connection
+carries no attachment (no ATTACH on it has succeeded yet, or all its attachments have ended),
+the server MUST close it after three failed ATTACHes on it (LIMIT_EXCEEDED); a connection that
+carries an attachment is never closed for failed ATTACHes of other sessions, which just fail
+their streams. The server also limits failures per source address (section 6.6).
+
+A client receiving SESSION_UNKNOWN or AUTH_FAILED MUST NOT retry the same credentials on a new
+connection; it bootstraps again over ssh (op `attach` for an existing session, section 10.3), or
+tells the user the session is gone.
 
 ### 6.5 Key rotation
 
@@ -582,23 +607,42 @@ The server keeps, per session, a **current** key and at most one **pending** key
 3. The server generates a new random 32-byte key, stores it as the pending key, replacing any
    previous pending key, and sends it as `Next Key` in ATTACHED. At this point both the
    current key and the new pending key are valid.
-4. When the client sends KEY_CONFIRM on that terminal channel, the pending key becomes the
+4. When the client confirms the pending key with KEY_CONFIRM, the pending key becomes the
    current key and the previous current key is discarded. From then on only the new key is
    valid.
 
 ```
 KEY_CONFIRM Payload {
+  Key ID (bytes[8]),            // the first 8 bytes of SHA-256(Next Key)
 }
 ```
 
+`Key ID` names the key being confirmed: the first 8 bytes of the SHA-256 digest of the
+`Next Key` of the ATTACHED that the client confirms. The payload is exactly 8 bytes at offset
+0 (a shorter payload is a FRAME_ERROR). The ID is not secret (it travels inside the encrypted
+transport and reveals nothing useful about a 256-bit key), but it makes the confirmation
+unambiguous: a KEY_CONFIRM delayed behind a later attach can never promote a key it did not
+see.
+
+On receiving KEY_CONFIRM on the session's current attachment, the server computes the key ID
+of its pending key and compares it with `Key ID` in constant time. If they are equal, it
+promotes the pending key to current as in step 4. Otherwise (no pending key, a different
+pending key, a repeated confirmation) it ignores the message; this is not an error. A
+KEY_CONFIRM on a stream that is no longer the session's attachment is never processed (the
+server stopped reading that stream, section 7.3).
+
 The client, on receiving ATTACHED (and verifying its server proof), MUST first store `Next Key`
 durably where its credentials live (replacing the old key; for `qsh`, the session's state file,
-written atomically), then send KEY_CONFIRM, and from then on use only `Next Key`. If it cannot
-store the key durably, it MUST NOT send KEY_CONFIRM: it keeps the attachment, keeps both keys in
-memory and uses `Next Key` for its next ATTACH; the old key stays valid on the server, so a
-client restarted from its stored state can still attach. The server acts on KEY_CONFIRM only on
-the attachment whose ATTACHED carried the current pending key; a KEY_CONFIRM anywhere else, or a
-second one, is ignored.
+written atomically), then send KEY_CONFIRM with its key ID, and from then on use only `Next
+Key`. If it cannot store the key durably, it MUST NOT send KEY_CONFIRM: it keeps the
+attachment, keeps both keys in memory and uses `Next Key` for its next ATTACH; the old key stays
+valid on the server, so a client restarted from its stored state can still attach.
+
+A client that keeps credentials only in memory, by design (an embedder or a hub without a state
+file, or `qsh` run with state files disabled), has no durable store to fall behind: its memory
+*is* its store. It stores `Next Key` in memory, replacing the old key, and sends KEY_CONFIRM at
+once. When such a client exits, the session can be reached again only through a bootstrap op
+`attach` (section 10.3).
 
 This rule guarantees that a connection lost at any moment never locks the client out: if
 ATTACHED did not arrive, the old key is still valid; if it arrived but KEY_CONFIRM did not, the
@@ -607,18 +651,46 @@ TCP, ssh on the pipe.
 
 ### 6.6 Unauthenticated connections
 
-Anyone can reach the daemon's UDP and TCP ports. A connection is **authenticated** from the
-moment the server accepts its first ATTACH (section 6.4) until it closes; before that it is
-**unauthenticated**. For unauthenticated connections the server MUST enforce:
+Anyone can reach the daemon's UDP and TCP ports. A connection is **pending** from the moment the
+server accepts it, before any handshake: a TCP connection when `accept` returns it, a QUIC
+connection when the server receives its first Initial packet and decides to process it (the
+"incoming connection" of QUIC libraries, before the server commits any connection state). It
+is **authenticated** from the moment the server accepts its first ATTACH (section 6.4) until it
+closes; before that, including during the TLS handshake, it is **unauthenticated**. Every
+limit below counts from acceptance, so a peer that opens connections and never finishes a
+handshake is bounded exactly like one that finishes it and then idles.
+
+For unauthenticated connections the server MUST enforce:
 
 | Limit | Value | Action when exceeded |
 |---|---|---|
-| Complete CLIENT_HELLO received after transport establishment | 10 s (`HELLO_TIMEOUT`) | close, TIMEOUT |
+| Complete CLIENT_HELLO received after the connection was accepted (this includes the TLS handshake) | 10 s (`HELLO_TIMEOUT`) | close, TIMEOUT |
 | First ATTACH accepted after CLIENT_HELLO was received | 10 s (`AUTH_TIMEOUT`) | close, TIMEOUT |
-| Bytes received before authentication: QUIC stream data on all streams; over the mux layer every byte of every frame | 16 384 (`MAX_PREAUTH_BYTES`) | close, LIMIT_EXCEEDED |
+| Stream bytes read before authentication: QUIC stream data on all streams; over the mux layer every byte of every frame | 16 384 (`MAX_PREAUTH_BYTES`) | close, LIMIT_EXCEEDED |
 | Channel streams opened before authentication | 4 | close, LIMIT_EXCEEDED |
-| Failed ATTACH messages per connection | 3 | close, LIMIT_EXCEEDED |
+| Failed ATTACHes (AUTH_FAILED) per connection without an attachment (section 6.4) | 3 | close, LIMIT_EXCEEDED |
 | Message sizes | `MAX_HELLO`, `MAX_ATTACH` (section 3.2) | MESSAGE_TOO_LARGE |
+| Concurrent unauthenticated connections per daemon, counted from acceptance | 64 (`MAX_PREAUTH_CONNS`) | refuse new ones, below |
+| Concurrent unauthenticated connections per source address (an IPv4 address; IPv6 addresses aggregated by /64 prefix; an IPv4-mapped IPv6 address counts as IPv4) | 8 (`MAX_PREAUTH_PER_SOURCE`) | refuse new ones, below |
+| AUTH_FAILED per source address | token bucket, 10 per minute (burst 10) | refuse new connections from it until the bucket refills |
+
+The values of the last three rows MAY be configurable; the others are fixed. **Refusing** a
+connection costs the server nothing beyond the refusal: over QUIC it answers the Initial with
+CONNECTION_CLOSE (CONNECTION_REFUSED) without creating connection state, over TCP it closes the
+accepted socket at once, before any TLS. Over QUIC the server MUST send a Retry (validating the
+client's address before it keeps any state, RFC 9000 section 8.1.2) for every new incoming
+connection while more than half of `MAX_PREAUTH_CONNS` connections are unauthenticated, and
+MAY always do so. The per-source counts use the validated address when a Retry was used.
+
+**QUIC flow control before authentication.** A QUIC stack buffers stream data up to the flow
+control limits it advertised, whether or not the application reads it. The server therefore
+MUST advertise an `initial_max_data` (the connection-level window) of at most 65 536 bytes, MUST
+NOT raise it with MAX_DATA before the connection is authenticated, and raises it afterwards
+(section 9.1). Separately, it counts the stream bytes it reads before authentication: when they
+exceed `MAX_PREAUTH_BYTES`, it stops reading and closes the connection with LIMIT_EXCEEDED. The
+first rule bounds memory (64 KiB per connection, whatever the stream windows), the second
+bounds the work an unauthenticated peer can make the server do. A correct client needs far less
+than either: a CLIENT_HELLO and a few ATTACHes.
 
 Before authentication the server MUST accept only CLIENT_HELLO on the control stream and only
 ATTACH as the first message of channel streams; any other message, including an unknown one,
@@ -628,16 +700,15 @@ there, and, for a session id it already knows, whether that session exists (SESS
 AUTH_FAILED). Session ids are 128-bit random values that never appear outside encrypted
 channels, so the latter reveals nothing to anyone who does not already hold one.
 
-The server SHOULD also limit, with configurable values:
-
-- concurrent unauthenticated connections: 64 per daemon and 8 per source address (an IPv4
-  address, or an IPv6 /64 prefix); beyond that it refuses new connections (QUIC: CONNECTION_CLOSE
-  with CONNECTION_REFUSED, or Retry, section 9.1; TCP: close immediately);
-- failed ATTACH messages per source address, for example 10 per minute with a token bucket;
-  beyond that it closes new connections from that address at once.
-
-Over QUIC the server SHOULD keep its connection-level flow control window small (for example
-64 KiB) until the connection is authenticated.
+**Process limits.** Each pending connection costs the daemon a file descriptor over TCP. A daemon
+SHOULD raise its soft `RLIMIT_NOFILE` to the hard limit at start, so that the limits above,
+and not the descriptor table, decide when connections are refused. Every request on the
+daemon's local control socket (bootstrap, pipe, status, stop; section 10.4) MUST have a
+deadline (for example 10 s to receive the complete request and 10 s to deliver the answer), so
+that a stuck local client cannot hold a descriptor or a task forever. Once a `pipe` request has
+been answered, the socket carries a qsh connection over the ssh pipe transport, which is subject
+to this section like any other connection, except for the per-source rows (it has no network
+source address).
 
 ### 6.7 What authentication does not cover
 
@@ -652,7 +723,10 @@ session's processes run as the daemon's user, which is that same user. See
 ### 7.1 Model
 
 A session is a pseudo-terminal whose child process is the user's login shell or a command
-(section 10.3). It has two byte streams:
+(section 10.3). (A *pipe session* has pipes instead of a pseudo-terminal and a third stream for
+standard error; section 7.14 describes how it differs. Sections 7.1 to 7.13 describe tty
+sessions and apply to pipe sessions except where section 7.14 says otherwise.) It has two byte
+streams:
 
 - **output**: everything the program writes to the terminal, server to client;
 - **input**: everything the user types or pastes, client to server.
@@ -700,7 +774,7 @@ without stream state sets FRESH and chooses where output starts: `Output Receive
 everything the server still buffers (the default; it restores the scrollback), and
 `Output Received` = `LATEST` (2^64 − 1) starts at the current end, skipping the backlog. LATEST
 without FRESH is a FRAME_ERROR. The terminal size has the same meaning as in RESIZE (section
-7.9).
+7.9). On a pipe session ATTACH carries one more field, `Error Received` (section 7.14.2).
 
 After ATTACH the client MUST NOT send anything on the stream until it has received ATTACHED (or
 ERROR).
@@ -725,8 +799,11 @@ ATTACHED Payload {
 }
 ```
 
+On a pipe session ATTACHED carries one more field, `Error Start` (section 7.14.2).
+
 The server processes an authenticated ATTACH as follows; the steps are atomic with respect to
-other attaches of the same session:
+other attaches of the same session (a pipe session applies them to both output streams, with
+the differences of section 7.14.5):
 
 1. It computes the start offset `S`: `Output Received`, or the output `end` if it is LATEST.
    If `S` is greater than `end`, the channel fails with SEQUENCE_ERROR (the key is not rotated).
@@ -751,9 +828,13 @@ The client, on ATTACHED:
    inconsistent: the client fails the channel with SEQUENCE_ERROR and treats the session as lost.
    With FRESH: it sets its input `base` and `end` to `Input Received` (input the user typed while
    attaching follows from there), and its output `received` to `Output Start`.
+   In both cases the client MUST reject (SEQUENCE_ERROR, session lost) values it cannot use
+   safely: an `Output Start` or `Input Received` of LATEST (2^64 − 1), and any value from which
+   its offset arithmetic could overflow 2^64 − 1. Clients MUST do all offset arithmetic checked
+   (an overflow is an error, never a wrap) and MUST NOT trust a server's offset as a buffer size.
 3. Discards input below `Input Received` and resends the input from `Input Received` to `end`
    as INPUT messages, in order, each with at most 16 384 bytes of data.
-4. Stores `Next Key` and sends KEY_CONFIRM (section 6.5).
+4. Stores `Next Key` and sends KEY_CONFIRM with its key ID (section 6.5).
 5. Continues with live input, RESIZE and ACK.
 
 ### 7.4 INPUT (0x13) and OUTPUT (0x14)
@@ -801,12 +882,33 @@ ACK Payload {
 ```
 
 The client acknowledges output, the server acknowledges input. `Received` is cumulative: every
-byte before it has been received in the sense of section 7.4. A sender of ACK MUST NOT decrease
-`Received` within an attachment and MUST NOT acknowledge bytes it has not received; the receiver
-of a violating ACK fails the channel with SEQUENCE_ERROR. `Output Received` in ATTACH (unless
-LATEST) and `Input Received` in ATTACHED act as acknowledgements too.
+byte before it has been received in the sense of section 7.4. (On a pipe session the client's
+ACK has a second field, `Error Received`, for the error output stream; section 7.14.2.)
 
-On receiving ACK, the data sender MAY discard bytes below `Received` from its replay buffer.
+**Validity.** For each stream it sends, a data sender keeps, per attachment:
+
+- `last_ack`: the highest `Received` it has accepted from the peer on this attachment. It
+  starts at the attachment's start offset: `Output Start` of ATTACHED for output (the server),
+  `Input Received` of ATTACHED for input (the client). It only ever moves when an ACK is
+  accepted. In particular, sending OUTPUT_GAP or SNAPSHOT never moves `last_ack`: the bytes
+  they skip were never sent, so they cannot have been acknowledged.
+- `sent_end`: the offset just after the last byte it has sent or skipped on this attachment
+  (an OUTPUT_GAP or SNAPSHOT moves `sent_end` to its `To` or `Offset`).
+
+An ACK is valid if `last_ack` ≤ `Received` ≤ `sent_end`; the sender then sets `last_ack` =
+`Received` and MAY discard bytes below `Received` from its replay buffer. An ACK with
+`Received` > `sent_end` acknowledges bytes that were never sent: the receiver fails the channel
+with SEQUENCE_ERROR. An ACK with `Received` < `last_ack` is stale and MUST be ignored; it is not
+an error. (A correct peer never sends one: ACKs on a stream are not reordered and `Received`
+never decreases. But a stale ACK does no harm, while failing the channel on it would end an
+attachment over a difference in bookkeeping, for example in how a peer counts a GAP.)
+
+The rule matters around OUTPUT_GAP: a client may send ACK with a `Received` below the gap's
+`To` before the OUTPUT_GAP reaches it. That ACK is valid (it lies between `last_ack` and
+`sent_end`) even though the bytes it covers have already left the replay buffer.
+
+A sender of ACK MUST NOT acknowledge bytes it has not received. `Output Received` in ATTACH
+(unless LATEST) and `Input Received` in ATTACHED act as acknowledgements too.
 
 Cadence: a receiver SHOULD send ACK when 32 768 bytes or more are unacknowledged, or 200 ms after
 the oldest unacknowledged byte arrived, whichever comes first, and MUST send it within 1 s of
@@ -821,7 +923,11 @@ server MUST keep reading the pseudo-terminal whether or not a client is attached
 a slow or absent client never blocks the program.
 
 The server SHOULD NOT keep more than about two bandwidth-delay products of output (at least
-256 KiB) sent but unacknowledged on an attachment; the rest waits in the replay buffer. This
+256 KiB) sent but unacknowledged on an attachment; the rest waits in the replay buffer. The
+amount in flight is `sent_end − max(last_ack, gap_to)` (section 7.5), where `gap_to` is the `To`
+of the latest OUTPUT_GAP (or the `Offset` of the latest SNAPSHOT) sent on the attachment, 0 if
+none: skipped bytes are not in flight, and the server MUST NOT wait for an acknowledgement of
+them before it sends more. This
 keeps the transport's buffers short, so that output can still be skipped (section 7.8) and an
 interrupt typed by the user is followed quickly by the program's reaction.
 
@@ -844,6 +950,8 @@ or slow and the bytes fell out of the replay buffer), it sends OUTPUT_GAP with `
 offset it should have sent and `To` = `base`, and continues with OUTPUT at `base`. This can
 happen at attach (step 6 of section 7.3) and during an attachment.
 
+- OUTPUT_GAP is not an acknowledgement: the server's `last_ack` stays where the client's
+  ACKs put it (section 7.5), and ACKs the client sent before it processed the gap remain valid.
 - The client sets its output `received` to `To`. It SHOULD tell the user that `To − From`
   bytes of output were skipped (for example in its status line), and MAY reset terminal state
   that a cut-off escape sequence could have left behind.
@@ -851,6 +959,9 @@ happen at attach (step 6 of section 7.3) and during an attachment.
   changing the pseudo-terminal's window size and changing it back, which delivers SIGWINCH;
   full-screen programs repaint, a shell's prompt is unaffected.
 - `From ≥ To`, or a `From` that is not the expected offset (section 7.4), is a SEQUENCE_ERROR.
+- OUTPUT_GAP is also how the server announces output it will never send because the session is
+  ending (section 7.11): it then carries `To` = the output end, and EXIT follows.
+- OUTPUT_GAP is never sent on a pipe session (section 7.14.5).
 
 ### 7.8 SNAPSHOT (0x18) — capability `snapshot` (semantics: M2)
 
@@ -897,6 +1008,7 @@ RESIZE Payload {
 The client sends RESIZE when its terminal's size changes. The server sets the
 pseudo-terminal's window size (`TIOCSWINSZ`), which delivers SIGWINCH to the foreground process
 group. A size with 0 columns or 0 rows MUST be ignored. Servers MAY clamp very large sizes.
+On a pipe session, which has no terminal, the server ignores RESIZE (section 7.14.5).
 
 ### 7.10 EXIT (0x19)
 
@@ -910,16 +1022,31 @@ EXIT Payload {
 }
 ```
 
-When the session's program has ended (the child process was reaped) and the server has read
-the pseudo-terminal to its end, the server sends all remaining output and then EXIT. Signal
-names are those of RFC 4254, section 6.10 ("ABRT", "HUP", "INT", "KILL", "TERM", …), or the
-name without "SIG" of a signal not listed there. Any other Kind is a FRAME_ERROR.
+On a pipe session EXIT has an appended field, `Error End (u64)`, the total length of the error
+output stream (section 7.14.2).
 
-After EXIT the server sends nothing on the channel except ACK and, finally, its FIN. The client,
-once its output `received` equals `Output End`, sends ACK with that value and finishes the
-stream. The server MAY then discard the session immediately; otherwise the session is kept for
-`EXITED_TTL` (section 7.13), so a client that was away when the program ended can still attach
-and receive the last output and the EXIT.
+When the session's program has ended (the child process was reaped) and the server has read
+the pseudo-terminal to its end (on a pipe session: both the stdout and the stderr pipe to end
+of file), the server sends all remaining output and then EXIT. Signal names are those of RFC
+4254, section 6.10 ("ABRT", "HUP", "INT", "KILL", "TERM", …), or the name without "SIG" of a
+signal not listed there. Any other Kind is a FRAME_ERROR.
+
+**EXIT comes after all output**: the server sends it only once every byte of output up to
+`Output End` has been either sent or announced as skipped with OUTPUT_GAP (section 7.11 says
+when the server may skip), and sends no output message after it. When the client processes EXIT, its output `received`
+therefore equals `Output End` (and, on a pipe session, its error `received` equals `Error
+End`); any other value is a SEQUENCE_ERROR.
+
+After EXIT the server sends nothing on the channel except ACK and, finally, its FIN. The client
+sends ACK with `Output End` (and `Error End`) and finishes the stream. The server MAY then
+discard the session immediately; otherwise the session is kept for `EXITED_TTL` (section 7.13),
+so a client that was away when the program ended can still attach and receive the last output
+and the EXIT.
+
+A command-line client exits with `Status` for Kind 0, and with 128 + N for Kind 1, where N is
+the number of the named signal on the client's own system (so "TERM" gives 143 on Linux), as
+shells report a child killed by a signal; for a signal name it does not know, it exits with
+255.
 
 ### 7.11 DETACH (0x1a) and HANGUP (0x1b)
 
@@ -937,21 +1064,47 @@ HANGUP Payload {
   a final ACK covering all input received before DETACH, and finishes its direction. The client
   SHOULD wait for the server's FIN (up to 2 s) before it exits, so that typed input is not lost.
   The client's output `received` is whatever it had received when the FIN arrived.
-- **HANGUP** ends the session (`~.`). The server closes the pseudo-terminal's master side,
-  which sends SIGHUP to the session's processes, as when an ssh connection closes. If the
-  program ends within 2 s, the server sends the remaining output and EXIT; otherwise it sends
-  ERROR (SESSION_ENDED). It then finishes the stream and removes the session; later ATTACHes
-  get SESSION_UNKNOWN. HANGUP is queued behind INPUT on the stream; if the session's input queue
-  is full (section 7.4) it takes effect only when the program reads, and `qsh kill` over ssh is
-  the way to end such a session at once.
+- **HANGUP** ends the session (`~.`). The server *hangs the session up*, below.
+  HANGUP is queued behind INPUT on the stream; if the session's input queue is full (section
+  7.4) it takes effect only when the program reads, and `qsh kill` over ssh is the way to end
+  such a session at once.
+
+**Hanging up a session** is what HANGUP, bootstrap op `kill`, `DETACHED_TTL` and daemon shutdown
+(section 7.13) do. The session's program runs as the leader of its own process group and
+session (`setsid`); on a tty session the pseudo-terminal is its controlling terminal. The
+server:
+
+1. sends SIGHUP to the session's process group **and** closes its side of the session's
+   terminal: the pseudo-terminal's master (which is what hangs up the tty: the kernel sends
+   SIGHUP to the terminal's session and further reads and writes fail), or, on a pipe session,
+   the stdin, stdout and stderr pipes. Closing alone is not enough on every system, and the
+   signal alone leaves a program that ignores SIGHUP holding the terminal; it does both, as an
+   sshd does when a connection closes;
+2. waits up to 2 s for the program to end, reaping it;
+3. ends the attachment, if there is one, with exactly one final message: if the program ended
+   in time, EXIT, preceded by the output that is still to be sent; otherwise ERROR
+   (SESSION_ENDED). The server MAY truncate the remaining output (for example when the client
+   is not reading); on a tty session it then sends OUTPUT_GAP up to the output end before EXIT,
+   on a pipe session (which has no gaps, section 7.14.5) it sends ERROR (SESSION_ENDED) instead
+   of EXIT. Output the program writes after step 1 is lost, as with ssh: the `Output End` of
+   such an EXIT is the end of the output the server had read when it closed the terminal. It
+   then finishes the stream;
+4. removes the session at once, whether or not the program has ended: its id becomes unknown
+   (later ATTACHes get SESSION_UNKNOWN), its key and replay buffers are erased, and no part of
+   it is kept waiting for the program. A session never outlives its removal;
+5. MAY, if the process group still exists 5 s after the SIGHUP, send it SIGKILL. Processes that
+   left the group (a job an interactive shell put in its own process group, a program that
+   called `setsid`) are not signalled, as with ssh. The server keeps reaping its children after the session is
+   gone.
 
 A terminal stream that ends without DETACH or HANGUP (finished, reset, or the connection lost)
 ends the attachment the same way as DETACH: the session keeps running.
 
 **How an attachment ends, seen from the client.** Every attachment the server ends ends with
 exactly one of: EXIT (the program ended), ERROR with SESSION_ENDED (the session was ended
-without an exit status to report: HANGUP timeout, `qsh kill`, TTL, daemon shutdown),
-ERROR with SESSION_TAKEN_OVER, another ERROR, or the server's FIN after DETACH.
+without an exit status to report, or its output was truncated: HANGUP timeout, `qsh kill`, TTL,
+daemon shutdown), ERROR with SESSION_TAKEN_OVER, another ERROR, or the server's FIN after
+DETACH. No output follows EXIT or the ERROR (section 7.10); after EXIT only ACKs may follow.
 
 ### 7.12 OUTPUT_ZSTD (0x1c) — capability `zstd` (reserved, M2)
 
@@ -974,17 +1127,202 @@ offered.
 
 - A session exists from its bootstrap until it is removed. It does not depend on any
   connection.
-- A session with no attachment for `DETACHED_TTL` = 6 hours is ended by the server as by HANGUP
-  (there is no attachment to notify).
+- A session with no attachment for `DETACHED_TTL` = 6 hours is hung up by the server (section
+  7.11; there is no attachment to notify).
 - A session whose program has exited is removed `EXITED_TTL` = 1 hour after the exit, or
   earlier as described in section 7.10.
-- HANGUP and `qsh kill` (bootstrap op `kill`) remove a session at once; an attached client
-  receives EXIT or ERROR (SESSION_ENDED) as in section 7.11.
-- Sessions live in the daemon's memory: when the daemon stops, all its sessions end; attached
-  clients receive GOAWAY (SHUTDOWN) and then EXIT or ERROR (SESSION_ENDED). A client that
-  reconnects to a restarted daemon receives SESSION_UNKNOWN.
+- HANGUP and `qsh kill` (bootstrap op `kill`) hang a session up and remove it at once; an
+  attached client receives EXIT or ERROR (SESSION_ENDED) as in section 7.11.
+- Sessions live in the daemon's memory: when the daemon stops, all its sessions end. On a
+  request to stop (SIGTERM, `qsh-server stop`, a service manager stopping the unit) the daemon:
+  1. stops accepting connections and bootstrap requests;
+  2. hangs up every session (section 7.11, all at once, so the 2 s waits overlap);
+  3. on every attachment, sends the final EXIT or ERROR (SESSION_ENDED) of section 7.11;
+  4. then sends GOAWAY (SHUTDOWN) on every connection;
+  5. then closes the connections (allowing about 1 s for the messages above to be delivered)
+     and exits.
+- A client that receives GOAWAY (SHUTDOWN) and has no session left on that connection (each
+  ended with EXIT or SESSION_ENDED) MUST NOT reconnect to that server, and in particular MUST
+  NOT open the ssh pipe transport, whose `qsh-server pipe` would start a new daemon. A client
+  that still has sessions it did not see end MAY reconnect (with back-off); a daemon that was
+  restarted answers SESSION_UNKNOWN.
 
 Servers MAY make the TTLs configurable and MUST document their values.
+
+### 7.14 Pipe sessions
+
+#### 7.14.1 Model
+
+A session is of one of two **kinds**, fixed when the bootstrap creates it (member `tty`, section
+10.3) and reported in the bootstrap reply:
+
+- a **tty session** (the default): the program runs on a pseudo-terminal, as described in
+  sections 7.1 to 7.13;
+- a **pipe session** (`"tty": false`): the program runs with three pipes as its standard input,
+  output and error. There is no pseudo-terminal, no line discipline, no echo, no `\n` to
+  `\r\n` translation and no controlling terminal: the bytes are delivered exactly, in both
+  directions, as `ssh host command` without a pseudo-terminal delivers them. This is what
+  scripts, `qsh host cmd < file`, `qsh host tar c dir > dir.tar` and programs that use qsh as a
+  transport need.
+
+A pipe session has three byte streams, each with its own offsets starting at 0, its own replay
+buffer and its own acknowledgements:
+
+| Stream | Direction | Carried by | Acknowledged by |
+|---|---|---|---|
+| input (the program's stdin) | C→S | INPUT, then INPUT_EOF | ACK from the server |
+| output (stdout) | S→C | OUTPUT | ACK from the client, `Received` |
+| error output (stderr) | S→C | ERROR_OUTPUT | ACK from the client, `Error Received` |
+
+Everything in sections 7.1 to 7.13 applies to pipe sessions except as stated here. Both kinds use
+the same terminal channel (the channel opened by ATTACH); the session kind decides which of the
+layouts and messages below apply. A tty session's encodings are unaffected by this section.
+
+#### 7.14.2 Layouts on a pipe session
+
+On a pipe session four messages carry one appended, REQUIRED field (section 3.3). Offsets are
+from the start of the payload.
+
+```
+ATTACH Payload (pipe session) {
+  Session ID (bytes[16]),       // offset 0
+  Proof (bytes[32]),            // offset 16
+  Output Received (u64),        // offset 48, stdout; or LATEST
+  Columns (u16),                // offset 56, ignored
+  Rows (u16),                   // offset 58, ignored
+  Width Pixels (u16),           // offset 60, ignored
+  Height Pixels (u16),          // offset 62, ignored
+  Flags (varint),               // offset 64, F bytes (F = 1 for the flags of qsh/1)
+  Error Received (u64),         // offset 64 + F, stderr; or LATEST
+}                               // 73 bytes when F = 1
+
+ATTACHED Payload (pipe session) {
+  Input Received (u64),         // offset 0
+  Output Start (u64),           // offset 8, stdout
+  Next Key (bytes[32]),         // offset 16
+  Server Proof (bytes[32]),     // offset 48
+  Error Start (u64),            // offset 80, stderr
+}                               // 88 bytes
+
+ACK Payload (pipe session, client to server) {
+  Received (u64),               // offset 0, stdout
+  Error Received (u64),         // offset 8, stderr
+}                               // 16 bytes
+
+EXIT Payload (pipe session) {
+  Output End (u64),             // offset 0, total length of stdout
+  Kind (u8),                    // offset 8
+  Status (u32),                 // offset 9
+  Flags (u8),                   // offset 13
+  Signal (string, max 32),      // offset 14, a varint length L (V bytes) then L bytes
+  Error End (u64),              // offset 14 + V + L (15 + L with the shortest varint)
+}
+```
+
+The server's ACK (acknowledging input) has the single `Received` field on both kinds. The
+server checks the two fields of the client's ACK separately, each against its own stream's
+`last_ack` and `sent_end` (section 7.5): one field may be stale, and is then ignored, while the
+other advances; either one above its `sent_end` is a SEQUENCE_ERROR. The cadence rules of
+section 7.5 apply to each output stream; one ACK always carries both values.
+
+A pipe-session message without its appended field is a FRAME_ERROR (an ATTACH without
+`Error Received` fails the channel before the key is rotated). A server receiving an ATTACH
+with the extra field for a tty session ignores it (section 3.3). A client that expected a pipe
+session and receives an ATTACHED without `Error Start` has a wrong idea of the session's kind:
+it fails the channel with SEQUENCE_ERROR and treats the session as lost.
+
+`Error Received` in ATTACH follows the rules of `Output Received` (section 7.2): LATEST is
+allowed only with FRESH.
+
+#### 7.14.3 ERROR_OUTPUT (0x1e)
+
+```
+ERROR_OUTPUT Payload {
+  Offset (u64),                 // offset of the first byte of Data in the error output stream
+  Data (..),                    // data…, at least 1 byte
+}
+```
+
+ERROR_OUTPUT carries what the program writes to its standard error, exactly as OUTPUT carries
+its standard output (section 7.4), with its own offsets: the first ERROR_OUTPUT after ATTACHED
+starts at `Error Start`, every later one where the previous one ended; any other offset, or
+empty `Data`, is a SEQUENCE_ERROR. A client writes it to its own standard error. The ordering
+between OUTPUT and ERROR_OUTPUT is the order in which the server read the two pipes; as with
+ssh, it is not a promise about the order in which the program wrote them. ERROR_OUTPUT on a tty
+session is a PROTOCOL_VIOLATION.
+
+#### 7.14.4 INPUT_EOF (0x1d)
+
+```
+INPUT_EOF Payload {
+  Offset (u64),                 // the input end: offset just after the last byte of input
+}
+```
+
+INPUT_EOF closes the program's standard input after all input before `Offset` (the client's
+input end of file: its local standard input reached end of file). `Offset` MUST equal the
+offset at which the next INPUT would start (section 7.4); any other value is a SEQUENCE_ERROR.
+After sending INPUT_EOF the client sends no more INPUT for the session, on any attachment.
+
+- The server accepts INPUT_EOF into the session's input queue (section 7.4), behind the input
+  before it; from then on the input stream is **closed at `Offset`** for the rest of the
+  session, whatever happens to the connection. When the server has written all input before
+  `Offset` to the stdin pipe, it closes the pipe, so the program reads end of file.
+- On a later attachment, after resending its unacknowledged input (section 7.3), a client that
+  has sent INPUT_EOF sends it again with the same `Offset`. INPUT_EOF does not consume an
+  offset and is not acknowledged; repeating it is how it survives a lost connection. A server
+  whose input stream is already closed at `Offset` ignores a repeated INPUT_EOF with that
+  `Offset`; INPUT, or INPUT_EOF with another `Offset`, after the input stream was closed is a
+  SEQUENCE_ERROR.
+- If the program closes its standard input first, input that arrives later is accepted,
+  acknowledged and discarded, as after a pseudo-terminal closed (section 7.4).
+- INPUT_EOF on a tty session is a PROTOCOL_VIOLATION; a client signals end of input there as a
+  terminal does, by sending the terminal's EOF character (normally `^D`) as INPUT.
+
+#### 7.14.5 Replay buffers and flow: no gaps
+
+A pipe session's output is data, not a screen, and must arrive exactly: a dropped byte would
+corrupt a file or a protocol run over qsh. So the server never discards unacknowledged output
+of a pipe session and never sends OUTPUT_GAP (or SNAPSHOT) for it. Instead it applies
+**back-pressure**, like a pipe and like ssh:
+
+- The server keeps each of the two output streams in its own replay buffer (stdout: at least
+  1 MiB, default 8 MiB; stderr: at least 64 KiB, default 1 MiB). When a buffer is full of
+  unacknowledged bytes, the server stops reading that pipe until ACKs free space; the program
+  then blocks when it writes to it. The rule of section 7.6 that a slow client never blocks
+  the program applies to tty sessions only.
+- Output pacing (section 7.6) applies to each stream separately.
+- `Columns`, `Rows` and pixel sizes in ATTACH are ignored, the server MUST ignore RESIZE, and a
+  client SHOULD NOT send RESIZE on a pipe session.
+
+Attach offsets: the server computes the start offsets `S` (stdout) and `E` (stderr) from
+`Output Received` and `Error Received` as in step 1 of section 7.3, and fails the channel with
+SEQUENCE_ERROR, before rotating the key, if either is above its stream's end. If a start offset
+is below its stream's `base` (bytes that an earlier attachment acknowledged):
+
+- with FRESH, the stream starts at `base` instead (`Output Start` = max(`S`, `base`), likewise
+  `Error Start`): the new client process gets everything that has not been delivered yet;
+- without FRESH, the client claims not to have bytes it (or a client sharing its state)
+  acknowledged, which is impossible for a correct client: SEQUENCE_ERROR, before rotating the
+  key.
+
+#### 7.14.6 Resume
+
+Resume works for each stream as in section 7.3: the client sends `Output Received` and
+`Error Received` in ATTACH; the server answers with `Input Received`, `Output Start` and
+`Error Start`, then sends the output from `Output Start` and the error output from `Error
+Start`, interleaved as it likes; the client resends its input from `Input Received`, followed
+by INPUT_EOF if it had sent one. Without FRESH, the client checks `Error Start` = `Error
+Received` as it checks `Output Start` (section 7.3, client step 2). With FRESH it sets its error
+`received` to `Error Start`.
+
+#### 7.14.7 End
+
+When the program has been reaped and both the stdout and the stderr pipe have reached end of
+file (as with ssh, a background process that keeps either open delays the end), the server
+sends the remaining output of both streams, then EXIT with `Output End` and `Error End`
+(section 7.10). When a pipe session is hung up (section 7.11) and the server will not deliver
+all remaining output, it ends the attachment with ERROR (SESSION_ENDED) instead of EXIT.
 
 ## 8. Stream multiplexing over byte streams
 
@@ -1129,7 +1467,7 @@ frame) means the connection was lost; sessions are not affected (section 7.11).
 ## 9. Transports
 
 A client may use any of three transports to reach the same daemon and the same sessions. It
-races them (section 12.1); the first one on which an ATTACH succeeds wins.
+races them (section 12.1); the first one to answer the hello wins.
 
 | Transport | Underlay | Streams | Channel binding (section 6.2) | Version from |
 |---|---|---|---|---|
@@ -1143,8 +1481,12 @@ QUIC version 1 [RFC 9000] secured with TLS 1.3 [RFC 9001], loss recovery and con
 per [RFC 9002] or any congestion controller that is safe for the Internet.
 
 - **ALPN**: the client MUST offer `qsh/1` (the 5 ASCII bytes) and the server MUST select it or
-  fail the handshake with the `no_application_protocol` alert. A client that supports later
-  versions offers their ALPN ids too (section 13.1).
+  fail the handshake with the `no_application_protocol` alert. A client that offers no ALPN
+  extension at all MUST be refused the same way (some TLS libraries accept such clients by
+  default; a qsh server must not). After the handshake, both endpoints MUST check that the
+  negotiated protocol is exactly `qsh/1` (or another version this endpoint supports, section
+  13.1) and close the connection otherwise, before sending any qsh message. A client that
+  supports later versions offers their ALPN ids too.
 - **Certificate**: verified by pinning, section 9.4. Clients connect by address, SHOULD NOT send
   the Server Name Indication extension, and servers MUST NOT require it.
 - **Streams**: qsh streams are QUIC bidirectional streams with the same ids; stream 0 is the
@@ -1163,8 +1505,8 @@ per [RFC 9002] or any congestion controller that is safe for the Internet.
   session's connection alive across Wi-Fi and cellular. Clients migrate when their network
   changes (section 12.4).
 - **Address validation**: the server MUST respect the anti-amplification limit of RFC 9000,
-  section 8. It SHOULD send Retry packets while the number of unauthenticated connections is
-  above half its limit (section 6.6).
+  section 8. It MUST send Retry packets while more than half of `MAX_PREAUTH_CONNS` connections
+  are unauthenticated (section 6.6).
 - **Recommended transport parameters and settings**:
 
   | Setting | Recommended value | Why |
@@ -1173,7 +1515,7 @@ per [RFC 9002] or any congestion controller that is safe for the Internet.
   | client keep-alive (QUIC PING) | 20 s without packets, adapted per network (section 12.4) | keeps NAT mappings |
   | `initial_max_streams_bidi` | server 128, client 0 | sessions per connection |
   | `initial_max_stream_data_bidi_*` | ≥ 256 KiB | throughput at high RTT |
-  | `initial_max_data` | server 64 KiB, raised with MAX_DATA to ≥ 1 MiB once authenticated | pre-auth memory |
+  | `initial_max_data` | server ≤ 64 KiB (REQUIRED, section 6.6), raised with MAX_DATA to ≥ 1 MiB once authenticated | pre-auth memory |
   | `max_datagram_frame_size` | absent | datagrams are not used |
   | congestion control | BBR | long, lossy paths |
 
@@ -1218,7 +1560,9 @@ The client MUST:
 
 1. compute SHA-256 of the end-entity certificate's DER encoding and compare it, in constant
    time, with the fingerprint from the bootstrap reply; any difference MUST abort the handshake
-   (alert `bad_certificate`);
+   with the TLS alert `bad_certificate` (not some other alert, and not a later close: the
+   client sends nothing to a server whose certificate it rejected, and reports the failure as a
+   pin mismatch, distinct from a network failure);
 2. verify the handshake's CertificateVerify signature with the public key of that certificate,
    as TLS 1.3 requires (a fingerprint match alone proves nothing: anyone can send the
    certificate);
@@ -1292,8 +1636,9 @@ reads stdin up to the first `\n` or end of file and MUST reject a longer request
 | `op` | string | all | `new` (default), `attach`, `list`, `kill` |
 | `versions` | array of integers | `new`, `attach`, REQUIRED | protocol versions the client supports |
 | `command` | string or null | `new` | the remote command, as ssh would pass it to the shell; absent or null: a login shell |
-| `cols`, `rows` | integers, 1–65 535 | `new`, REQUIRED | initial terminal size |
-| `term` | string, ≤ 64 bytes | `new` | value of `TERM` |
+| `tty` | boolean | `new` | `false`: create a pipe session (section 7.14); absent or `true`: a tty session |
+| `cols`, `rows` | integers, 1–65 535 | `new`, REQUIRED for a tty session | initial terminal size; ignored for a pipe session |
+| `term` | string, ≤ 64 bytes | `new` | value of `TERM`; ignored for a pipe session |
 | `env` | object of strings | `new` | locale and color variables, see below |
 | `name` | string, ≤ 64 bytes | `new` | optional session name, shown by `qsh ls` |
 | `session` | string, 32 hex digits | `attach`, `kill`, REQUIRED | session id |
@@ -1312,15 +1657,34 @@ Operations:
 `env`: the server MUST ignore every name except `LANG`, `LANGUAGE`, `COLORTERM` and names
 starting with `LC_`, and MUST ignore values longer than 256 bytes or containing a NUL byte.
 
+`tty`: a value other than a boolean is `bad-request`. When to ask for a pipe session is the
+client's choice; `qsh` asks for one when its standard input is not a terminal (ssh does not
+allocate a pseudo-terminal then either). A server conforming to this document MUST support both
+kinds.
+
 The new session runs the user's login shell (from the user database) as a login shell, or
-`<login shell> -c <command>`, in the user's home directory, on a new pseudo-terminal of the
-requested size. Its environment SHOULD contain `HOME`, `USER`, `LOGNAME`, `SHELL`, a default
-`PATH`, `TERM` (from `term`; a server MAY fall back to `xterm-256color` when the requested type
-has no terminfo entry on the host), the accepted `env` members, and `QSH_SESSION` set to the
-session id in hex; also `XDG_RUNTIME_DIR` when the daemon knows it, and MAY contain what the
-system configures for logins (for example `/etc/environment`, `TZ`, `MAIL`). It MUST NOT carry
-the ssh variables of the ssh login that started the daemon (`SSH_CONNECTION`, `SSH_CLIENT`,
-`SSH_TTY`, `SSH_AUTH_SOCK`), which describe another, possibly closed, connection.
+`<login shell> -c <command>`, in the user's home directory: a tty session on a new
+pseudo-terminal of the requested size, a pipe session with pipes (section 7.14). Either way the
+program is the leader of a new session and process group (section 7.11).
+
+The daemon builds the session's environment from scratch; it does not pass on its own. The
+environment contains exactly:
+
+- `HOME`, `USER`, `LOGNAME` and `SHELL`, from the user database;
+- `PATH`, set to a default (for example `/usr/local/bin:/usr/bin:/bin`);
+- for a tty session, `TERM` (from `term`; a server MAY fall back to `xterm-256color` when the
+  requested type has no terminfo entry on the host, and uses `xterm-256color` when `term` is
+  absent); a pipe session has no `TERM`, as with ssh;
+- the accepted `env` members;
+- `QSH_SESSION`, the session id in lowercase hex;
+- `XDG_RUNTIME_DIR`, when the daemon knows it.
+
+Nothing else: not the daemon's own environment, not `/etc/environment` or other system login
+configuration, and in particular not the ssh variables of the ssh login that started the
+daemon (`SSH_CONNECTION`, `SSH_CLIENT`, `SSH_TTY`, `SSH_AUTH_SOCK`), which describe another,
+possibly closed, connection. The rest of a login environment comes from the shell itself: a
+login shell reads its own profile files (`/etc/profile`, `~/.profile`, …), which is where
+systems configure `PATH`, `TZ`, `MAIL` and the like.
 
 ### 10.4 The reply
 
@@ -1341,6 +1705,7 @@ Reply to `new` and `attach`:
 | `tcp` | integer | TLS port, 0 if the daemon does not listen on TCP |
 | `caps` | array of strings | capabilities the server supports (informative; negotiation is in the hello exchange) |
 | `server` | string | server implementation, informative |
+| `tty` | boolean | `false` for a pipe session (section 7.14), REQUIRED then; absent or `true` for a tty session |
 | `ssh_addr` | string, optional | the server address of the ssh connection (from `SSH_CONNECTION`); the client MAY try it as an additional address for QUIC and TLS |
 
 Example (one line, wrapped here):
@@ -1359,7 +1724,14 @@ Reply to `list`:
   "attached":false,"exited":false}]}
 ```
 
-(`created` is seconds since the Unix epoch; `command` is null for a login shell.)
+(`created` is seconds since the Unix epoch; `command` is null for a login shell; an entry for a
+pipe session has `"tty":false`, an entry without `tty` is a tty session.)
+
+The session kind in a reply is authoritative: the client uses the layouts of section 7.14.2 if
+and only if the reply to `new` or `attach` said `"tty":false`, and records the kind with the
+credentials. A client that asked for a pipe session and gets a reply without `"tty":false` is
+talking to a server that ignored the member; it MUST treat the session as a tty session, and MAY
+end it with op `kill` and report that the server does not support pipe sessions.
 
 Reply to `kill`: `{"qsh":1,"ok":true}`.
 
@@ -1381,9 +1753,13 @@ Error reply, for every op:
 Exit status of `qsh-server bootstrap`: 0 after a success reply, 1 after an error reply, 2 when it
 was invoked wrongly (it still writes an error reply if it can). 42 is reserved (section 10.2).
 
-**Client processing.** The client reads stdout to its end (at most 1 MiB) and uses the **last**
-line that parses as a JSON object with a member `qsh`; it ignores other lines, which shell
-start-up files sometimes print. It then checks `qsh` = 1, the lengths and hex syntax of
+**Client processing.** The client reads stdout to its end and uses the **last** line that
+parses as a JSON object with a member `qsh`; it ignores other lines, which shell start-up files
+sometimes print. Its memory for this is bounded: it MUST NOT buffer more than 1 MiB of ssh's
+stdout (it can process lines as they arrive, keeping only the latest candidate, and ignore
+lines longer than 65 536 bytes), but it MUST keep reading and discarding until end of file or
+until ssh exits, never stop reading early, because ssh blocks, and the bootstrap never
+finishes, when its stdout pipe is full. It then checks `qsh` = 1, the lengths and hex syntax of
 `session`, `key` and `cert_sha256`, chooses the highest version in both its own and the server's
 `versions`, and treats any failure as an error. It stores the credentials (in `qsh`,
 `$XDG_STATE_HOME/qsh/sessions/`, mode 0600) and connects.
@@ -1452,7 +1828,7 @@ version 1:     "\nQSH-PIPE/1\n"   (12 bytes: 0a 51 53 48 2d 50 49 50 45 2f 31 0a
 | 0x04 | UNSUPPORTED_VERSION | connection | no common protocol version | bootstrap again; tell the user to upgrade |
 | 0x05 | FLOW_CONTROL_ERROR | connection | mux credit exceeded (section 8.3) | report a bug, reconnect |
 | 0x06 | STREAM_LIMIT | connection | too many streams | as above |
-| 0x07 | TIMEOUT | connection | hello or authentication deadline missed (section 6.6) | reconnect |
+| 0x07 | TIMEOUT | connection | hello or authentication deadline missed (section 6.6), or nothing received for too long (section 12.5) | reconnect |
 | 0x08 | LIMIT_EXCEEDED | connection | pre-authentication or rate limit | back off, reconnect later |
 | 0x09 | INTERNAL_ERROR | any | the sender failed | reconnect with back-off |
 | 0x0a | SHUTDOWN | any | the server is stopping | reconnect later; sessions may be gone |
@@ -1462,7 +1838,7 @@ version 1:     "\nQSH-PIPE/1\n"   (12 bytes: 0a 51 53 48 2d 50 49 50 45 2f 31 0a
 | 0x10 | SESSION_UNKNOWN | stream | no such session (ended, or the daemon restarted) | bootstrap a new session |
 | 0x11 | AUTH_FAILED | stream | the proof matches no valid key | bootstrap op `attach` |
 | 0x12 | SESSION_TAKEN_OVER | stream | a newer attachment took the session | stop; do not re-attach automatically |
-| 0x13 | SESSION_ENDED | stream | the session was ended (HANGUP, `kill`, TTL) | exit |
+| 0x13 | SESSION_ENDED | stream | the session was ended (HANGUP, `kill`, TTL, daemon shutdown) without an exit status to report, or with its output truncated | exit |
 | 0x14 | SEQUENCE_ERROR | stream | offsets or acknowledgements inconsistent (section 7) | attach once more; then give up on the session |
 
 A client receiving SESSION_TAKEN_OVER MUST NOT re-attach automatically: two clients doing so
@@ -1477,15 +1853,22 @@ Link) learned on phones. Values are RECOMMENDED defaults.
 
 ### 12.1 Racing transports
 
-The client starts the transports' handshakes with staggered delays. The first connection that
-completes its handshake (the TLS handshake for QUIC and TLS, the preface for the pipe) is used:
-the client sends CLIENT_HELLO and its ATTACHes on it. Connections that complete later are kept
-as standby without sending anything on them. If the hello or an ATTACH on the first one fails or
-gets no answer within 5 s, the client abandons that ATTACH (resetting its stream with CANCELLED,
-section 7.2) and moves to the next connection, where it now sends CLIENT_HELLO and ATTACH. Once
-the sessions are attached, the client closes the other connections. The connection that wins is
-thus the first one that is both reachable and authenticated. (A standby connection that stays
-unused for 10 s is closed by the server's `HELLO_TIMEOUT`; the client simply drops it.)
+The client starts the transports' handshakes with staggered delays and takes the connections
+in the order in which their handshakes complete (the TLS handshake for QUIC and TLS, the
+preface for the pipe). On the first one it sends CLIENT_HELLO and waits up to 5 s for
+SERVER_HELLO. If SERVER_HELLO arrives and is acceptable, **the race ends**: that connection is
+used, and the client drops every other connection and attempt. If the hello fails or times out,
+the client closes that connection and moves to the next one to complete its handshake, with
+its own 5 s. Connections that complete while the client is waiting are kept as standby without
+sending anything on them. (A standby connection that stays unused for 10 s is closed by the
+server's `HELLO_TIMEOUT`; the client simply drops it.) The race fails when every transport has
+failed or timed out.
+
+The client then sends its ATTACHes on the winning connection only. An ATTACH that gets neither
+ATTACHED nor ERROR within 5 s is abandoned (its stream reset with CANCELLED, section 7.2); the
+client then treats the connection as failed and reconnects (section 12.2), racing again. The
+race thus decides only which path answers; authentication is never raced, which keeps the rule
+of one outstanding ATTACH per session (section 7.2) trivially true.
 
 | Transport | Start | Attempt timeout |
 |---|---|---|
@@ -1538,9 +1921,14 @@ shares a connection between sessions closes it once, and all sessions resume on 
 - The server closes a connection that carries no attachment for 60 s (GOAWAY with IDLE). A
   client that keeps a connection per server for several sessions (a hub) reopens it when
   needed.
+- Over the mux layer (TLS and the ssh pipe), which has no transport idle timeout of its own, the
+  server closes a connection on which it has received nothing for 90 s (ERROR with TIMEOUT, or
+  simply closing it). Clients send PING every 15 s when idle (section 12.3), so this only
+  removes connections whose peer is gone. Over QUIC, `max_idle_timeout` does the same.
 - The server applies the session TTLs of section 7.13 and the limits of section 6.6.
-- The daemon MAY exit when it has had no sessions for some time; the next bootstrap or pipe
-  starts it again.
+- A daemon started on demand (by `bootstrap` or `pipe`) SHOULD exit after 1 hour with no
+  sessions; the next bootstrap or pipe starts it again. A daemon run by a service manager MAY
+  stay running.
 
 ### 12.6 Ports
 
@@ -1595,7 +1983,7 @@ ranges need no registration and MUST only be used after a private capability (a 
 |---|---|
 | 0x00 | reserved, never sent |
 | 0x01 – 0x0f | connection-level messages (control stream), section 3.5 |
-| 0x10 – 0x1f | terminal channel, section 3.5 (0x1d – 0x1f unassigned) |
+| 0x10 – 0x1f | terminal channel, section 3.5 (0x1f unassigned) |
 | 0x20 – 0x27 | port forwarding, capability `forward` (M3) |
 | 0x28 – 0x2f | file copy, capability `copy` (M3) |
 | 0x30 – 0x37 | agent forwarding, capability `agent` |
@@ -1648,6 +2036,7 @@ Not extensible within a protocol version (section 8.1).
 | Pipe version argument | `qsh-server pipe --version N` |
 | Bootstrap format version | 1 |
 | Bootstrap ops | `new`, `attach`, `list`, `kill` |
+| Session kinds (bootstrap member `tty`) | `true` (default): tty session; `false`: pipe session |
 | Bootstrap error codes | `bad-request`, `unsupported`, `no-session`, `limit`, `daemon`, `internal` |
 | Exit status "no qsh-server" | 42 |
 | Default port range | 60443 – 60542, UDP and TCP |
@@ -1663,8 +2052,12 @@ The threat model, the assets and adversaries, and the reasoning behind each mech
 - Every connection authenticates the server by its pinned certificate (section 9.4) and the
   session by a proof bound to the connection's TLS exporter (section 6); the session key never
   crosses the wire and rotates on every attach (section 6.5).
-- Unauthenticated peers are confined to a few hundred bytes, a few seconds and a handful of
-  connections (section 6.6), and receive nothing but a hello.
+- Unauthenticated peers are confined, from the moment their connection is accepted, to 16 KiB
+  read, 64 KiB buffered, a few seconds and a handful of connections per address and per daemon
+  (section 6.6), and receive nothing but a hello.
+- Control-socket trust is mutual: the daemon checks its local clients' user id, and every local
+  client checks the runtime directory and the daemon's user id before it talks to it
+  (security.md, section 4.3).
 - Nothing runs as root; the daemon runs as the user and only ever starts processes as that user.
 - Implementations MUST parse every message defensively: check `Length` before allocating, check
   every offset and count, and never trust a peer's value as a size without a bound. Every parser
@@ -1779,7 +2172,7 @@ C → S  ATTACH      Output Received = 6000
 S → C  ATTACHED    Input Received = 250, Output Start = 6000, Next Key = K2, Server Proof
 S → C  OUTPUT      Offset = 6000, 4000 bytes (in several messages)
 C → S  INPUT       Offset = 250, 50 bytes (resent)
-C → S  KEY_CONFIRM
+C → S  KEY_CONFIRM Key ID = first 8 bytes of SHA-256(K2)
 C → S  ACK         Received = 10000
 S → C  ACK         Received = 300
 ```
@@ -1787,7 +2180,78 @@ S → C  ACK         Received = 300
 Had the replay buffer instead held only 7 000 – 9 999 (8 MiB is the default; small numbers keep
 the example readable), the server would have sent `OUTPUT_GAP From = 6000, To = 7000` before
 `OUTPUT Offset = 7000`, and resized the pseudo-terminal back and forth to make the program
-redraw.
+redraw. Its `last_ack` would have stayed at 6 000 (section 7.5): an `ACK Received = 6500` that
+the client might have sent before processing the gap would still be valid, and output pacing
+would count only the bytes from 7 000 on as in flight.
+
+### A.6 KEY_CONFIRM
+
+With `Next Key` = `K2`:
+
+```
+K2          = 202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f
+SHA-256(K2) = 72dbb7336c767800…  (Key ID = the first 8 bytes)
+
+12                         Type = KEY_CONFIRM
+08                         Length = 8
+72 db b7 33 6c 76 78 00    Key ID
+```
+
+On stream 4 over the mux layer: `00 04 0a 12 08 72 db b7 33 6c 76 78 00`.
+
+### A.7 A pipe session
+
+`qsh host 'sort'` with standard input from a file: the bootstrap request has `"tty":false` and
+the reply `"tty":false`. The client re-attaches session `00112233445566778899aabbccddeeff`
+after receiving 4 096 bytes of stdout and 100 bytes of stderr, with the proof of A.4:
+
+```
+10                         Type = ATTACH
+40 49                      Length = 73
+00 11 22 … ee ff           Session ID (16 bytes, as in A.2)
+0c 95 bd … fe 93           Proof (32 bytes, as in A.2)
+00 00 00 00 00 00 10 00    Output Received = 4096
+00 00 00 00 00 00 00 00    Columns, Rows, Width Pixels, Height Pixels (ignored)
+00                         Flags = 0
+00 00 00 00 00 00 00 64    Error Received = 100
+```
+
+The server had received 250 bytes of input:
+
+```
+11                         Type = ATTACHED
+40 58                      Length = 88
+00 00 00 00 00 00 00 fa    Input Received = 250
+00 00 00 00 00 00 10 00    Output Start = 4096
+20 21 22 … 3e 3f           Next Key = K2 (32 bytes, A.6)
+8f f9 d4 … 26 06           Server Proof (32 bytes, A.4)
+00 00 00 00 00 00 00 64    Error Start = 100
+```
+
+The program writes `oops\n` to stderr:
+
+```
+1e 0d 00 00 00 00 00 00 00 64 6f 6f 70 73 0a
+                           ERROR_OUTPUT, Offset = 100, Data = "oops\n"
+```
+
+The client resends its input from 250 and reaches the end of its file at 300:
+
+```
+1d 08 00 00 00 00 00 00 01 2c
+                           INPUT_EOF, Offset = 300
+```
+
+The program ends with status 0 after 8 192 bytes of stdout and 105 of stderr. The server's
+EXIT, after all output, and the client's final ACK:
+
+```
+19 17 00 00 00 00 00 00 20 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 69
+                           EXIT, Output End = 8192, Kind = 0, Status = 0, Flags = 0,
+                           Signal = "" (00), Error End = 105
+15 10 00 00 00 00 00 00 20 00 00 00 00 00 00 00 00 69
+                           ACK, Received = 8192, Error Received = 105
+```
 
 ## Appendix B. Design rationale
 
@@ -1865,6 +2329,63 @@ the transport, so the server knows exactly what the client has. Requiring contig
 an explicit OUTPUT_GAP) turns every bookkeeping bug into an immediate, reported error instead of
 silently duplicated or missing terminal bytes.
 
+**Why pipe sessions, and why back-pressure for them.** A tty session is lossy by design for
+data: the line discipline echoes input, turns `\n` into `\r\n`, interprets control characters,
+merges stdout and stderr, and a slow client loses old output to a gap. That is right for a
+screen and wrong for `qsh host cmd < in > out`, which must behave like `ssh host cmd`. An
+earlier draft kept a pseudo-terminal with echo and output processing turned off; that still
+merged the streams, still interpreted `^C`, `^D` and `^Z` in the input, and could still drop
+output under a gap. Pipe sessions use real pipes and treat output as data: the server never
+discards unacknowledged output and pushes back on the program instead, as ssh's channel windows
+do, so the bytes arrive exactly and the session can still be resumed.
+
+**Why stderr's acknowledgement rides in ACK.** The error output stream needs a sequence space,
+a message for its data, acknowledgements and resume offsets. A separate ERROR_ACK message, and
+separate messages for stderr's attach offsets, would each have needed a type and their own
+ordering rules against ACK and ATTACHED. Appending one field to ATTACH, ATTACHED, the client's
+ACK and EXIT, for pipe sessions only, uses the extension mechanism the format already has
+(section 3.3), leaves every tty-session encoding unchanged byte for byte, keeps one ACK as the
+complete statement of what the client has received, and needs no gap message for stderr,
+because pipe sessions have no gaps. The price is that these four layouts depend on the session
+kind, which both sides learn from the bootstrap and never from the connection.
+
+**Why INPUT_EOF is repeated instead of acknowledged.** End of input is one bit at a known
+offset. Making it idempotent (the same `Offset` again is a no-op) and resending it after every
+resume costs a few bytes per reconnect and needs no acknowledgement state on either side.
+
+**Why ACKs are checked against what was acknowledged, not what was sent.** The first qsh
+implementation moved its acknowledgement baseline to the end of an OUTPUT_GAP when it sent the
+gap; an ACK that the client had sent just before it saw the gap then looked like a decrease and
+ended the attachment. A gap skips bytes, it does not acknowledge them. Keeping `last_ack` as the
+highest value actually received, accepting anything between it and `sent_end`, and ignoring
+stale values removes the race; pacing subtracts the skipped bytes separately.
+
+**Why KEY_CONFIRM names the key.** A bare confirmation applies to "whatever key is pending".
+If a later attach replaced the pending key before an older confirmation was processed, the
+older confirmation would promote a key its sender never received, and lock out the client that
+did. Eight bytes of the key's hash make the confirmation refer to exactly the key the client
+stored.
+
+**Why the race ends at the hello.** Racing ATTACHes on several connections would either send
+the same session's ATTACH more than once (forbidden: concurrent attaches rotate the key under
+each other) or serialize them through timeouts. SERVER_HELLO already proves that the path works
+and that a qsh server answers; authenticating once, on that connection, is simpler and keeps one
+outstanding ATTACH per session.
+
+**Why pre-authentication accounting starts at accept.** A limit that starts after the TLS
+handshake does not count peers that never finish it, which are exactly the cheap ones to send.
+Counting from the TCP accept or the QUIC Initial bounds descriptors, handshake state and timers
+too, and QUIC Retry under load makes forged source addresses pay a round trip before any state
+exists. Only wrong proofs count as failures, because SESSION_UNKNOWN is what a hub legitimately
+sees for every session that ended while it was away.
+
+**Why the session environment is built from scratch.** The daemon was started by some earlier
+ssh login and has that login's environment: its `SSH_AUTH_SOCK` points to an agent that may be
+gone, its `DISPLAY` and `SSH_CONNECTION` describe a connection that no longer exists. Passing the
+daemon's environment on would make each session depend on how the daemon happened to be
+started. A fixed, minimal set plus what the login shell's own profile files set gives the same
+environment every time.
+
 **Lessons from TokenSSH Link.** The first implementation (TokenSSH Link, not wire compatible)
 shaped several rules: the pre-authentication size limit (a 1 MiB frame limit let any
 unauthenticated peer make the daemon allocate a megabyte), the idle-connection limit (QUIC
@@ -1882,28 +2403,41 @@ detached-daemon requirement of section 10.4.
 | `MAX_ATTACH` | 256 bytes | 3.2 |
 | `MAX_TERMINAL` | 65 536 bytes | 3.2 |
 | `MAX_STREAMS` / `MUX_MAX_STREAMS` | 128 per initiator | 4.5, 8.5 |
-| `HELLO_TIMEOUT` | 10 s | 5.1, 6.6 |
+| `HELLO_TIMEOUT` | 10 s from acceptance, handshake included | 5.1, 6.6 |
 | `AUTH_TIMEOUT` | 10 s | 6.6 |
 | `MAX_PREAUTH_BYTES` | 16 384 bytes | 6.6 |
 | Channel streams before authentication | 4 | 6.6 |
-| Failed ATTACH per connection | 3 | 6.4, 6.6 |
+| QUIC `initial_max_data` before authentication | ≤ 65 536 bytes | 6.6, 9.1 |
+| `MAX_PREAUTH_CONNS` (unauthenticated connections per daemon) | 64 | 6.6 |
+| `MAX_PREAUTH_PER_SOURCE` (per IPv4 address or IPv6 /64) | 8 | 6.6 |
+| QUIC Retry threshold | more than 32 unauthenticated connections | 6.6, 9.1 |
+| AUTH_FAILED per source address | 10 per minute, burst 10 | 6.6 |
+| Failed ATTACH (AUTH_FAILED) per connection without an attachment | 3 | 6.4, 6.6 |
 | Failure delay | ≥ 500 ms | 6.4 |
 | Output replay buffer | ≥ 1 MiB, default 8 MiB | 7.6 |
+| Error output replay buffer (pipe sessions) | ≥ 64 KiB, default 1 MiB | 7.14.5 |
 | Input replay buffer | ≥ 64 KiB, default 1 MiB | 7.6 |
 | ACK after | 32 768 bytes or 200 ms; at most 1 s | 7.5 |
 | Resend chunk | ≤ 16 384 bytes | 7.3 |
 | Server input queue per session | ≥ 64 KiB, default 1 MiB | 7.4 |
 | `LATEST` (`Output Received`) | 2^64 − 1 | 7.2 |
-| Standby / ATTACH answer timeout (client) | 5 s | 12.1 |
+| SERVER_HELLO wait per race candidate; ATTACH answer timeout (client) | 5 s | 12.1 |
 | Snapshot size | ≤ 1 MiB | 7.8 |
 | `DETACHED_TTL` | 6 h | 7.13 |
 | `EXITED_TTL` | 1 h | 7.13 |
+| Hangup: wait for the program | 2 s | 7.11 |
+| Hangup: SIGKILL to the process group (MAY) | 5 s after SIGHUP | 7.11 |
+| Key ID | first 8 bytes of SHA-256(Next Key) | 6.5 |
 | `MUX_MAX_DATA` | 16 384 bytes | 8.1 |
 | `MUX_STREAM_WINDOW` | 262 144 bytes | 8.3 |
 | `MUX_CONN_WINDOW` | 1 048 576 bytes | 8.3 |
 | Bootstrap request | ≤ 65 536 bytes | 10.3 |
-| Bootstrap stdout read limit | 1 MiB | 10.4 |
+| Bootstrap stdout memory bound (keep draining beyond it) | 1 MiB; lines ≤ 65 536 bytes | 10.4 |
 | Pipe preface search limit | 65 536 bytes | 10.5 |
+| Connection without attachment closed (GOAWAY IDLE) | 60 s | 12.5 |
+| Mux connection with nothing received closed | 90 s | 12.5 |
+| On-demand daemon exits without sessions (SHOULD) | 1 h | 12.5 |
+| Control socket request deadline | e.g. 10 s | 6.6 |
 
 ## References
 
