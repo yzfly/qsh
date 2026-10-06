@@ -1,0 +1,51 @@
+# cargo-deny: licenses, advisories, bans and sources of every dependency.
+# `cargo deny check` must pass (docs/DESIGN.md section 3).
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+# Unmaintained crates are reported for direct and transitive dependencies alike
+unmaintained = "all"
+yanked = "deny"
+ignore = [
+    # time < 0.3.47: stack exhaustion when parsing hostile RFC 2822 dates. time is used only
+    # by rcgen to write the validity dates of the daemon's own certificate; qsh never parses
+    # dates. time 0.3.47 needs Rust 1.88, above the MSRV (1.85, Debian 13): drop this entry
+    # when the MSRV reaches 1.88.
+    { id = "RUSTSEC-2026-0009", reason = "time only formats dates for rcgen; no parsing of untrusted input" },
+]
+
+[licenses]
+version = 2
+# Compatible with distributing qsh under MIT OR Apache-2.0
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "ISC",
+    "BSD-3-Clause",
+    "Zlib",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Duplicate versions (getrandom 0.2 through ring, 0.4 through quinn-proto) cost build time,
+# not correctness: shown, not fatal
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+# No OpenSSL, no C TLS stacks: rustls with ring only
+deny = [
+    { crate = "openssl", reason = "TLS is rustls + ring" },
+    { crate = "openssl-sys", reason = "TLS is rustls + ring" },
+    { crate = "aws-lc-rs", reason = "the crypto provider is ring" },
+    { crate = "aws-lc-sys", reason = "the crypto provider is ring" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

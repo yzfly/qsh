@@ -1,0 +1,50 @@
+[workspace]
+# MSRV-aware: picks dependency versions that build with rust-version
+resolver = "3"
+members = ["crates/qsh-core", "crates/qsh-cli", "xtask"]
+# What `cargo build` builds by default: the programs, not the development tasks
+default-members = ["crates/qsh-core", "crates/qsh-cli"]
+# cargo-fuzz targets build with nightly and their own lock file
+exclude = ["fuzz"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+# quinn 0.11.11 needs 1.85; that is also the rustc of Debian 13 (trixie)
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/yzfly/qsh"
+homepage = "https://github.com/yzfly/qsh"
+authors = ["yzfly <zphyix@gmail.com>"]
+
+[workspace.dependencies]
+qsh-core = { path = "crates/qsh-core", version = "0.1.0", default-features = false }
+tokio = { version = "1.40", default-features = false }
+quinn = { version = "0.11.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rustls = { version = "0.23.20", default-features = false, features = ["ring", "std"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+rcgen = { version = "0.13", default-features = false, features = ["ring", "crypto"] }
+ring = "0.17.8"
+serde = { version = "1.0.200", features = ["derive"] }
+serde_json = "1.0.120"
+libc = "0.2.150"
+clap = { version = "4.5", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "env"] }
+
+[workspace.lints.rust]
+# deny, not forbid: qsh-core allows it in sys.rs alone; qsh-cli forbids it in its sources
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+dbg_macro = "warn"
+todo = "warn"
+undocumented_unsafe_blocks = "warn"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

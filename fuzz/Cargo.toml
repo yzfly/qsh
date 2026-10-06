@@ -1,0 +1,50 @@
+[package]
+name = "qsh-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+qsh-core = { path = "../crates/qsh-core", default-features = false }
+serde_json = "1"
+tokio = { version = "1", features = ["rt"] }
+
+# Its own workspace: cargo-fuzz builds with nightly and sanitizers, apart from the main one
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "message"
+path = "fuzz_targets/message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "message_stream"
+path = "fuzz_targets/message_stream.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mux_frame"
+path = "fuzz_targets/mux_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bootstrap"
+path = "fuzz_targets/bootstrap.rs"
+test = false
+doc = false
+bench = false

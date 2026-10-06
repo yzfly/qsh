@@ -1,0 +1,96 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH qsh 1  "qsh 0.1.0" 
+.SH NAME
+qsh \- Remote shell over QUIC: sessions survive network changes, sleep and roaming
+.SH SYNOPSIS
+\fBqsh\fR [\fB\-p \fR] [\fB\-l \fR] [\fB\-i \fR] [\fB\-J \fR] [\fB\-F \fR] [\fB\-o \fR] [\fB\-4 \fR] [\fB\-6 \fR] [\fB\-v \fR]... [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] <\fIDESTINATION\fR> [\fICOMMAND\fR] 
+.SH DESCRIPTION
+qsh starts a session on HOST through your own ssh (keys, agent, ~/.ssh/config, passwords and second factors all work), then keeps it alive over QUIC, TLS or an ssh pipe, whichever works, reconnecting and replaying missed output as the network comes and goes.
+.SH OPTIONS
+.TP
+\fB\-p\fR \fI<PORT>\fR
+Port of the ssh server (ssh \-p)
+.TP
+\fB\-l\fR \fI<USER>\fR
+User to log in as (ssh \-l)
+.TP
+\fB\-i\fR \fI<FILE>\fR
+Identity file (ssh \-i); may be repeated
+.TP
+\fB\-J\fR \fI<DESTINATION>\fR
+Jump hosts (ssh \-J)
+.TP
+\fB\-F\fR \fI<FILE>\fR
+ssh configuration file (ssh \-F)
+.TP
+\fB\-o\fR \fI<OPTION>\fR
+ssh option (ssh \-o); may be repeated
+.TP
+\fB\-4\fR
+Use IPv4 addresses only (ssh \-4)
+.TP
+\fB\-6\fR
+Use IPv6 addresses only (ssh \-6)
+.TP
+\fB\-v\fR
+Verbose: qsh\*(Aqs own messages, and ssh \-v; may be repeated
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.TP
+\fB\-V\fR, \fB\-\-version\fR
+Print version
+.TP
+<\fIDESTINATION\fR>
+[user@]host, or a host alias from ~/.ssh/config
+.TP
+[\fICOMMAND\fR]
+Command to run instead of a login shell
+.SH EXTRA
+Escapes (after Enter): ~. end the session, ~d detach, ~s status, ~? help, ~~ a literal ~.
+
+Exit status: the remote program\*(Aqs status (128 + N when it was killed by signal N); 255 when
+qsh or ssh failed; 42 when the host has no qsh\-server.
+.SH VERSION
+v0.1.0
+.SH ESCAPES
+Typed right after Enter, as with
+.BR ssh (1):
+.TP
+.B ~.
+End the session: its programs get SIGHUP.
+.TP
+.B ~d
+Detach: the session keeps running on the server.
+.TP
+.B ~s
+Show the connection: transport, round-trip time, bytes, reconnects.
+.TP
+.B ~?
+List the escapes.
+.TP
+.B ~~
+Send a literal ~.
+.SH EXIT STATUS
+The remote program's exit status, or 128 plus the signal number when a signal killed it;
+0 after detaching;
+.B 255
+when qsh or ssh failed;
+.B 42
+when the host has no
+.BR qsh\-server .
+.SH ENVIRONMENT
+.TP
+.B QSH_TRANSPORTS
+Comma-separated transports to use, of quic, tls and ssh; all when unset.
+.TP
+.B QSH_SSH
+The ssh program to run instead of ssh from PATH.
+.TP
+.BR LANG ", " LANGUAGE ", " LC_* ", " COLORTERM ", " TERM
+Passed to the session.
+.SH SEE ALSO
+.BR qsh\-server (1),
+.BR qsh_config (5),
+.BR ssh (1)

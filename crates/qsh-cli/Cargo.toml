@@ -1,0 +1,39 @@
+[package]
+name = "qsh-cli"
+description = "qsh and qsh-server: a remote shell over QUIC whose sessions survive network changes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords = ["ssh", "quic", "shell", "terminal", "mosh"]
+categories = ["network-programming", "command-line-utilities"]
+default-run = "qsh"
+
+[[bin]]
+name = "qsh"
+path = "src/bin/qsh.rs"
+
+[[bin]]
+name = "qsh-server"
+path = "src/bin/qsh-server.rs"
+
+[features]
+default = []
+# `qsh install HOST`: download release binaries (M1); distributions build without it
+self-install = []
+
+[dependencies]
+qsh-core.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-std", "io-util", "signal", "sync", "time"] }
+clap.workspace = true
+
+[dev-dependencies]
+# The hub's end-to-end test drives the library directly
+qsh-core = { workspace = true, features = ["hub"] }
+serde_json.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,63 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH qsh-server 1  "qsh-server 0.1.0" 
+.SH NAME
+qsh\-server \- Server side of qsh: the per\-user daemon, and the commands qsh runs over ssh
+.SH SYNOPSIS
+\fBqsh\-server\fR [\fB\-v \fR]... [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] <\fIsubcommands\fR>
+.SH DESCRIPTION
+qsh\-server needs no root and no configuration: `qsh HOST` runs `qsh\-server bootstrap` over ssh, which starts the per\-user daemon on demand. The daemon listens on the first port of 60443\-60542 free on both UDP and TCP.
+.SH OPTIONS
+.TP
+\fB\-v\fR
+Log more (repeat for more)
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.TP
+\fB\-V\fR, \fB\-\-version\fR
+Print version
+.SH SUBCOMMANDS
+.TP
+qsh\-server\-bootstrap(1)
+Create a session for the client (run over ssh; request on stdin, reply on stdout)
+.TP
+qsh\-server\-pipe(1)
+Carry a connection over ssh\*(Aqs stdin and stdout (run over ssh by the client)
+.TP
+qsh\-server\-daemon(1)
+Run the per\-user daemon (started on demand by bootstrap otherwise)
+.TP
+qsh\-server\-status(1)
+Show the running daemon and its sessions (JSON)
+.TP
+qsh\-server\-stop(1)
+Stop the running daemon; its sessions end
+.TP
+qsh\-server\-help(1)
+Print this message or the help of the given subcommand(s)
+.SH EXTRA
+Environment: QSH_SERVER_PORTS=FIRST\-LAST sets the port range of daemons started on demand.
+.SH VERSION
+v0.1.0
+.SH FILES
+.TP
+.I $XDG_RUNTIME_DIR/qsh/control.sock
+The daemon's control socket (directory mode 0700;
+.I /tmp/qsh\-UID
+when XDG_RUNTIME_DIR is unset).
+.TP
+.I $XDG_STATE_HOME/qsh/daemon/
+The daemon's certificate and key.
+.TP
+.I $XDG_STATE_HOME/qsh/daemon.log
+The log of a daemon started on demand.
+.SH EXIT STATUS
+.B bootstrap
+exits 0 after a success reply, 1 after an error reply, 2 when invoked wrongly.
+.B status
+exits 3 when no daemon runs. Status 42 is never used: it means
+"no qsh-server" to clients.
+.SH SEE ALSO
+.BR qsh (1),
+.BR qsh_config (5)

@@ -1,0 +1,253 @@
+//! The server side: the per-user daemon that owns the sessions, and the small commands that run
+//! over ssh (`qsh-server bootstrap`, `qsh-server pipe`).
+//!
+//! ```text
+//! sshd → qsh-server bootstrap ──unix socket──▶ daemon ── sessions ── pty ── shell
+//!                                                ▲  ▲
+//!          QUIC (UDP port) and TLS (TCP port) ───┘  └── unix socket ◀── qsh-server pipe ◀── sshd
+//! ```
+//!
+//! One daemon per user, started on demand by the first bootstrap (no init system needed) or
+//! by a service unit (`qsh-server daemon --foreground`). It listens on the first port of a range
+//! that is free on both UDP and TCP, so every user of a shared host gets one of their own.
+
+mod control;
+pub mod pty;
+mod serve;
+mod table;
+
+use std::ffi::OsString;
+use std::io;
+use std::ops::RangeInclusive;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::net::{TcpListener, UnixListener};
+use tokio::sync::Notify;
+
+use crate::crypto::{Fingerprint, Identity};
+use crate::paths::Paths;
+use crate::proto::ErrorCode;
+use crate::sys;
+
+pub use control::{bootstrap, connect_or_start, pipe, request_status, request_stop, DaemonLauncher};
+pub use table::SessionTable;
+
+/// The default port range of the daemon: the first port free on both UDP and TCP is used.
+pub const DEFAULT_PORTS: RangeInclusive<u16> = 60443..=60542;
+
+/// A session nobody was attached to for this long is closed (its programs get SIGHUP).
+pub const DETACHED_TTL: Duration = Duration::from_secs(6 * 3600);
+
+/// A session whose program exited is forgotten this long after the exit.
+pub const EXITED_TTL: Duration = Duration::from_secs(3600);
+
+/// A daemon started on demand exits after this long without sessions.
+pub const ON_DEMAND_IDLE_EXIT: Duration = Duration::from_secs(3600);
+
+/// How the daemon runs.
+#[derive(Debug, Clone)]
+pub struct ServerConfig {
+    /// Where the control socket, the lock and the identity live.
+    pub paths: Paths,
+    /// Ports to try, in order: the first one free on both UDP and TCP wins.
+    pub ports: RangeInclusive<u16>,
+    /// Exit after this long without sessions (daemons started on demand). None: run until
+    /// stopped (service units).
+    pub idle_exit: Option<Duration>,
+    /// See [`DETACHED_TTL`].
+    pub detached_ttl: Duration,
+    /// See [`EXITED_TTL`].
+    pub exited_ttl: Duration,
+    /// The shell for sessions; None: the login shell from the password database.
+    pub shell: Option<PathBuf>,
+    /// Output kept per session for clients that come back (at least 1 MiB).
+    pub output_replay: usize,
+}
+
+impl ServerConfig {
+    /// The defaults for `paths`.
+    pub fn new(paths: Paths) -> ServerConfig {
+        ServerConfig {
+            paths,
+            ports: DEFAULT_PORTS,
+            idle_exit: None,
+            detached_ttl: DETACHED_TTL,
+            exited_ttl: EXITED_TTL,
+            shell: None,
+            output_replay: crate::session::OUTPUT_REPLAY,
+        }
+    }
+}
+
+/// Counters since the daemon started, reported by `qsh-server status`.
+#[derive(Debug, Default)]
+pub(crate) struct Stats {
+    pub quic_connections: AtomicU64,
+    pub tls_connections: AtomicU64,
+    pub pipe_connections: AtomicU64,
+    pub channels: AtomicU64,
+    pub attach_failures: AtomicU64,
+}
+
+/// What every task of the daemon shares.
+#[derive(Debug)]
+pub(crate) struct Shared {
+    pub config: ServerConfig,
+    /// Control streams of open connections, for GOAWAY on shutdown.
+    pub connections: serve::Registry,
+    pub sessions: SessionTable,
+    pub port: u16,
+    pub fingerprint: Fingerprint,
+    pub account: pty::Account,
+    pub stats: Stats,
+    pub shutdown: Notify,
+    pub started: std::time::SystemTime,
+}
+
+/// The per-user daemon.
+#[derive(Debug)]
+pub struct Daemon;
+
+/// Why the daemon did not start.
+#[derive(Debug)]
+pub enum StartError {
+    /// Another daemon of this user is running (it holds the lock).
+    AlreadyRunning,
+    /// No port of the range is free on both UDP and TCP.
+    NoFreePort(RangeInclusive<u16>),
+    /// Anything else.
+    Io(io::Error),
+}
+
+impl std::fmt::Display for StartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StartError::AlreadyRunning => f.write_str("the daemon is already running"),
+            StartError::NoFreePort(range) => {
+                write!(
+                    f,
+                    "no port in {}-{} is free on both UDP and TCP",
+                    range.start(),
+                    range.end()
+                )
+            }
+            StartError::Io(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for StartError {}
+
+impl From<io::Error> for StartError {
+    fn from(e: io::Error) -> Self {
+        StartError::Io(e)
+    }
+}
+
+impl Daemon {
+    /// Run the daemon until it is stopped (`qsh-server stop`) or, with
+    /// [`ServerConfig::idle_exit`], until it had no sessions for that long. Must be called
+    /// inside a multi-threaded tokio runtime.
+    pub async fn run(config: ServerConfig) -> Result<(), StartError> {
+        let paths = config.paths.clone();
+        paths.ensure_runtime()?;
+        paths.ensure_state()?;
+
+        // One daemon per user: the lock lives as long as this process
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(paths.daemon_lock())?;
+        if !sys::try_lock(&lock)? {
+            return Err(StartError::AlreadyRunning);
+        }
+        let socket = paths.control_socket();
+        let _ = std::fs::remove_file(&socket);
+
+        let identity = Identity::load_or_create(&paths.identity_dir())?;
+        let (port, udp, tcp) = bind_ports(&config.ports).await?;
+        let account = pty::account(&paths.home, config.shell.as_deref());
+        let shared = Arc::new(Shared {
+            config,
+            connections: serve::Registry::default(),
+            sessions: SessionTable::default(),
+            port,
+            fingerprint: identity.fingerprint(),
+            account,
+            stats: Stats::default(),
+            shutdown: Notify::new(),
+            started: std::time::SystemTime::now(),
+        });
+
+        let endpoint = crate::transport::quic::server_endpoint(udp, &identity)?;
+        let acceptor = crate::transport::tls::Acceptor::new(&identity)?;
+        let control = UnixListener::bind(&socket)?;
+        std::fs::set_permissions(&socket, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+
+        eprintln!(
+            "qsh-server {}: daemon pid {} listening on udp/tcp {port}, certificate {}",
+            env!("CARGO_PKG_VERSION"),
+            std::process::id(),
+            shared.fingerprint.to_hex()
+        );
+        let tasks = [
+            tokio::spawn(serve::accept_quic(shared.clone(), endpoint.clone())),
+            tokio::spawn(serve::accept_tls(shared.clone(), tcp, acceptor)),
+            tokio::spawn(control::accept(shared.clone(), control)),
+            tokio::spawn(table::collect_garbage(shared.clone())),
+        ];
+        shared.shutdown.notified().await;
+        for task in tasks {
+            task.abort();
+        }
+        let _ = std::fs::remove_file(&socket);
+        // Tell connected clients (GOAWAY SHUTDOWN, section 5.7), end the sessions (attached
+        // clients get EXIT or SESSION_ENDED, 7.13), then close
+        serve::goaway_all(&shared).await;
+        shared.sessions.hang_up_all();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        endpoint.close(quinn::VarInt::from_u32(ErrorCode::SHUTDOWN.0 as u32), b"daemon stopped");
+        // Give QUIC a moment to send the close to connected clients
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(lock);
+        Ok(())
+    }
+}
+
+/// The first port of `range` free on both UDP and TCP, bound.
+async fn bind_ports(range: &RangeInclusive<u16>) -> Result<(u16, std::net::UdpSocket, TcpListener), StartError> {
+    for port in range.clone() {
+        let Ok(udp) = sys::udp_any(port) else { continue };
+        // Port 0 (tests): the TCP port must be the UDP one
+        let port = udp.local_addr()?.port();
+        let any6: std::net::SocketAddr = (std::net::Ipv6Addr::UNSPECIFIED, port).into();
+        let any4: std::net::SocketAddr = (std::net::Ipv4Addr::UNSPECIFIED, port).into();
+        // IPv6 and IPv4 on one socket where the host has IPv6
+        let tcp = match TcpListener::bind(any6).await {
+            Ok(tcp) => tcp,
+            Err(_) => match TcpListener::bind(any4).await {
+                Ok(tcp) => tcp,
+                Err(_) => continue,
+            },
+        };
+        return Ok((port, udp, tcp));
+    }
+    Err(StartError::NoFreePort(range.clone()))
+}
+
+/// The daemon command a bootstrap starts on demand when none runs: this executable with
+/// `daemon --foreground --on-demand`.
+pub fn default_daemon_args() -> Vec<OsString> {
+    ["daemon", "--foreground", "--on-demand"]
+        .iter()
+        .map(OsString::from)
+        .collect()
+}
+
+pub(crate) fn count(counter: &AtomicU64) {
+    counter.fetch_add(1, Ordering::Relaxed);
+}

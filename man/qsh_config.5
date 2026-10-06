@@ -1,0 +1,69 @@
+.TH QSH_CONFIG 5 "" "qsh" "File Formats Manual"
+.SH NAME
+qsh_config \- qsh configuration files
+.SH SYNOPSIS
+.I /etc/qsh/qsh_config
+.br
+.I $XDG_CONFIG_HOME/qsh/config
+.SH DESCRIPTION
+This version of
+.BR qsh (1)
+reads no configuration file. The paths above are reserved for a later version, which will
+read a TOML file with a
+.B [defaults]
+table and
+.B [host."pattern"]
+tables, the user's file overriding the system's.
+.PP
+Everything about reaching a host comes from
+.BR ssh (1)
+and its own configuration
+.RI ( ~/.ssh/config ,
+.BR ssh_config (5)):
+host aliases, users, ports, keys, agents, jump hosts and known hosts work for
+.B qsh
+exactly as for
+.BR ssh .
+.SH ENVIRONMENT
+.TP
+.B QSH_TRANSPORTS
+Comma-separated transports
+.B qsh
+may use, of
+.BR quic ,
+.B tls
+and
+.BR ssh ;
+all three when unset. For diagnosing networks.
+.TP
+.B QSH_SSH
+The ssh program
+.B qsh
+runs, instead of
+.B ssh
+from
+.BR PATH .
+.TP
+.B QSH_SERVER_PORTS
+The port range
+.RI ( FIRST\-LAST )
+of a
+.BR qsh\-server (1)
+daemon started on demand; 60443\-60542 when unset.
+.SH FILES
+.TP
+.I $XDG_STATE_HOME/qsh/
+.RI ( ~/.local/state/qsh/ )
+The daemon's certificate and key
+.RI ( daemon/ ),
+and the log of a daemon started on demand
+.RI ( daemon.log ).
+.TP
+.I $XDG_RUNTIME_DIR/qsh/
+.RI ( /tmp/qsh\- UID
+when unset)
+The daemon's control socket and lock; mode 0700, owned by the user.
+.SH SEE ALSO
+.BR qsh (1),
+.BR qsh\-server (1),
+.BR ssh_config (5)

@@ -1,0 +1,200 @@
+#compdef qsh-server
+
+autoload -U is-at-least
+
+_qsh-server() {
+    typeset -A opt_args
+    typeset -a _arguments_options
+    local ret=1
+
+    if is-at-least 5.2; then
+        _arguments_options=(-s -S -C)
+    else
+        _arguments_options=(-s -C)
+    fi
+
+    local context curcontext="$curcontext" state line
+    _arguments "${_arguments_options[@]}" : \
+'*-v[Log more (repeat for more)]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+'-V[Print version]' \
+'--version[Print version]' \
+":: :_qsh-server_commands" \
+"*::: :->qsh-server" \
+&& ret=0
+    case $state in
+    (qsh-server)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:qsh-server-command-$line[1]:"
+        case $line[1] in
+            (bootstrap)
+_arguments "${_arguments_options[@]}" : \
+'*-v[Log more (repeat for more)]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(pipe)
+_arguments "${_arguments_options[@]}" : \
+'--version=[Protocol version]:N:_default' \
+'*-v[Log more (repeat for more)]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(daemon)
+_arguments "${_arguments_options[@]}" : \
+'--ports=[Ports to try, FIRST-LAST; the first free on both UDP and TCP is used]:FIRST-LAST:_default' \
+'--foreground[Stay in the foreground (for service managers); otherwise start in the background]' \
+'--on-demand[Exit after an hour without sessions (set when started on demand)]' \
+'*-v[Log more (repeat for more)]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(status)
+_arguments "${_arguments_options[@]}" : \
+'*-v[Log more (repeat for more)]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(stop)
+_arguments "${_arguments_options[@]}" : \
+'*-v[Log more (repeat for more)]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_qsh-server__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:qsh-server-help-command-$line[1]:"
+        case $line[1] in
+            (bootstrap)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(pipe)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(daemon)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(status)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(stop)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+}
+
+(( $+functions[_qsh-server_commands] )) ||
+_qsh-server_commands() {
+    local commands; commands=(
+'bootstrap:Create a session for the client (run over ssh; request on stdin, reply on stdout)' \
+'pipe:Carry a connection over ssh'\''s stdin and stdout (run over ssh by the client)' \
+'daemon:Run the per-user daemon (started on demand by bootstrap otherwise)' \
+'status:Show the running daemon and its sessions (JSON)' \
+'stop:Stop the running daemon; its sessions end' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'qsh-server commands' commands "$@"
+}
+(( $+functions[_qsh-server__subcmd__bootstrap_commands] )) ||
+_qsh-server__subcmd__bootstrap_commands() {
+    local commands; commands=()
+    _describe -t commands 'qsh-server bootstrap commands' commands "$@"
+}
+(( $+functions[_qsh-server__subcmd__daemon_commands] )) ||
+_qsh-server__subcmd__daemon_commands() {
+    local commands; commands=()
+    _describe -t commands 'qsh-server daemon commands' commands "$@"
+}
+(( $+functions[_qsh-server__subcmd__help_commands] )) ||
+_qsh-server__subcmd__help_commands() {
+    local commands; commands=(
+'bootstrap:Create a session for the client (run over ssh; request on stdin, reply on stdout)' \
+'pipe:Carry a connection over ssh'\''s stdin and stdout (run over ssh by the client)' \
+'daemon:Run the per-user daemon (started on demand by bootstrap otherwise)' \
+'status:Show the running daemon and its sessions (JSON)' \
+'stop:Stop the running daemon; its sessions end' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'qsh-server help commands' commands "$@"
+}
+(( $+functions[_qsh-server__subcmd__help__subcmd__bootstrap_commands] )) ||
+_qsh-server__subcmd__help__subcmd__bootstrap_commands() {
+    local commands; commands=()
+    _describe -t commands 'qsh-server help bootstrap commands' commands "$@"
+}
+(( $+functions[_qsh-server__subcmd__help__subcmd__daemon_commands] )) ||
+_qsh-server__subcmd__help__subcmd__daemon_commands() {
+    local commands; commands=()
+    _describe -t commands 'qsh-server help daemon commands' commands "$@"
+}
+(( $+functions[_qsh-server__subcmd__help__subcmd__help_commands] )) ||
+_qsh-server__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'qsh-server help help commands' commands "$@"
+}
+(( $+functions[_qsh-server__subcmd__help__subcmd__pipe_commands] )) ||
+_qsh-server__subcmd__help__subcmd__pipe_commands() {
+    local commands; commands=()
+    _describe -t commands 'qsh-server help pipe commands' commands "$@"
+}
+(( $+functions[_qsh-server__subcmd__help__subcmd__status_commands] )) ||
+_qsh-server__subcmd__help__subcmd__status_commands() {
+    local commands; commands=()
+    _describe -t commands 'qsh-server help status commands' commands "$@"
+}
+(( $+functions[_qsh-server__subcmd__help__subcmd__stop_commands] )) ||
+_qsh-server__subcmd__help__subcmd__stop_commands() {
+    local commands; commands=()
+    _describe -t commands 'qsh-server help stop commands' commands "$@"
+}
+(( $+functions[_qsh-server__subcmd__pipe_commands] )) ||
+_qsh-server__subcmd__pipe_commands() {
+    local commands; commands=()
+    _describe -t commands 'qsh-server pipe commands' commands "$@"
+}
+(( $+functions[_qsh-server__subcmd__status_commands] )) ||
+_qsh-server__subcmd__status_commands() {
+    local commands; commands=()
+    _describe -t commands 'qsh-server status commands' commands "$@"
+}
+(( $+functions[_qsh-server__subcmd__stop_commands] )) ||
+_qsh-server__subcmd__stop_commands() {
+    local commands; commands=()
+    _describe -t commands 'qsh-server stop commands' commands "$@"
+}
+
+if [ "$funcstack[1]" = "_qsh-server" ]; then
+    _qsh-server "$@"
+else
+    compdef _qsh-server qsh-server
+fi

@@ -1,0 +1,46 @@
+#compdef qsh
+
+autoload -U is-at-least
+
+_qsh() {
+    typeset -A opt_args
+    typeset -a _arguments_options
+    local ret=1
+
+    if is-at-least 5.2; then
+        _arguments_options=(-s -S -C)
+    else
+        _arguments_options=(-s -C)
+    fi
+
+    local context curcontext="$curcontext" state line
+    _arguments "${_arguments_options[@]}" : \
+'-p+[Port of the ssh server (ssh -p)]:PORT:_default' \
+'-l+[User to log in as (ssh -l)]:USER:_default' \
+'*-i+[Identity file (ssh -i); may be repeated]:FILE:_files' \
+'-J+[Jump hosts (ssh -J)]:DESTINATION:_default' \
+'-F+[ssh configuration file (ssh -F)]:FILE:_files' \
+'*-o+[ssh option (ssh -o); may be repeated]:OPTION:_default' \
+'-4[Use IPv4 addresses only (ssh -4)]' \
+'-6[Use IPv6 addresses only (ssh -6)]' \
+'*-v[Verbose\: qsh'\''s own messages, and ssh -v; may be repeated]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+'-V[Print version]' \
+'--version[Print version]' \
+':destination -- \[user@\]host, or a host alias from ~/.ssh/config:_default' \
+'*::command -- Command to run instead of a login shell:_default' \
+&& ret=0
+}
+
+(( $+functions[_qsh_commands] )) ||
+_qsh_commands() {
+    local commands; commands=()
+    _describe -t commands 'qsh commands' commands "$@"
+}
+
+if [ "$funcstack[1]" = "_qsh" ]; then
+    _qsh "$@"
+else
+    compdef _qsh qsh
+fi

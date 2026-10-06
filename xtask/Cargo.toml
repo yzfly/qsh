@@ -1,0 +1,18 @@
+[package]
+name = "xtask"
+description = "Development tasks for qsh: cargo xtask gen (man pages, shell completions)"
+version = "0.0.0"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+qsh-cli = { path = "../crates/qsh-cli" }
+clap.workspace = true
+# Only here, never in the shipped programs
+clap_mangen = "0.2"
+clap_complete = "4.5"
+
+[lints]
+workspace = true
