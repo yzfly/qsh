@@ -1358,6 +1358,16 @@ mod tests {
         s.set_output_sink(Some(Box::new(Panicky(calls.clone()))));
         s.write_input(b"x\n".to_vec());
         wait_output(&s, "boom!").await;
+        // The sink is fed after the buffer's lock is released: the output can be in the buffer
+        // a moment before the sink saw it, panicked and was removed
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while s.sink.lock().unwrap().0.is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the panicking sink is not removed"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         let after_fault = calls.load(Ordering::SeqCst);
         s.write_input(b"y\n".to_vec());
         wait_output(&s, "after-y").await;
