@@ -1,0 +1,229 @@
+# Distribution packaging: build qsh from source with each distribution's own tooling and recipe in
+# packaging/ (Debian, Ubuntu, Fedora, Alpine, Arch, Homebrew), lint the result, install it and
+# smoke-test the installed programs (packaging/ci/smoke.sh: a real session over the loopback).
+# The per-distribution steps are scripts in packaging/ci/, run here in the distribution's stock
+# container exactly as packaging/README.md shows for a local build.
+name: Packaging
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly: new distribution releases and toolchains appear without a commit of ours.
+    - cron: "23 5 * * 3"
+  push:
+    branches: [main]
+    paths:
+      - "packaging/**"
+      - "Cargo.lock"
+      - ".github/workflows/packaging.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: packaging-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  source:
+    name: source tarballs
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.tarballs.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Tarballs (git archive, cargo vendor)
+        id: tarballs
+        run: |
+          packaging/ci/source.sh dist
+          echo "version=$(cat dist/VERSION)" >> "$GITHUB_OUTPUT"
+      - name: debian/copyright covers Cargo.lock
+        run: |
+          python3 -I packaging/ci/debian-copyright.py --check ||
+            echo "::warning file=packaging/debian/copyright::run packaging/ci/debian-copyright.py after changing Cargo.lock"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: source
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  debian:
+    name: ${{ matrix.image }}
+    needs: source
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # debian:13 builds with the archive's rustc and checks Build-Depends; debian:12 and
+        # ubuntu:24.04 have an older rustc and build with a newer one (see debian.sh).
+        image: ["debian:13", "debian:12", "ubuntu:24.04"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: source
+          path: dist
+      - name: Build, lint, install, smoke test
+        env:
+          IMAGE: ${{ matrix.image }}
+          VERSION: ${{ needs.source.outputs.version }}
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src "$IMAGE" packaging/ci/debian.sh \
+            "dist/qsh-$VERSION.tar.gz" "dist/qsh-$VERSION-vendor.tar.xz" out
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: debian-${{ strategy.job-index }}-${{ matrix.image == 'debian:13' && 'trixie' || matrix.image == 'debian:12' && 'bookworm' || 'noble' }}
+          path: out/
+          if-no-files-found: ignore
+
+  # The route into Debian itself: every crate from the archive (librust-*-dev), no vendor/.
+  # Informative until all of them are packaged: its archive-crates.txt lists what is missing.
+  debian-archive:
+    name: debian:unstable (archive crates)
+    needs: source
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: source
+          path: dist
+      - name: Build against librust-*-dev
+        env:
+          VERSION: ${{ needs.source.outputs.version }}
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src debian:unstable packaging/ci/debian.sh \
+            "dist/qsh-$VERSION.tar.gz" - out
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: debian-unstable-archive-crates
+          path: out/
+          if-no-files-found: ignore
+
+  # The route into Fedora itself: crates from rust-*-devel, no vendor tarball. Informative until
+  # all of them are packaged: its fedora-crates.txt lists what is missing.
+  fedora-archive:
+    name: fedora:rawhide (Fedora crates)
+    needs: source
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: source
+          path: dist
+      - name: Build against rust-*-devel
+        env:
+          VERSION: ${{ needs.source.outputs.version }}
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src fedora:rawhide packaging/ci/fedora.sh \
+            "dist/qsh-$VERSION.tar.gz" - out
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: fedora-rawhide-fedora-crates
+          path: out/
+          if-no-files-found: ignore
+
+  fedora:
+    name: fedora:latest
+    needs: source
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: source
+          path: dist
+      - name: Build, lint, install, smoke test
+        env:
+          VERSION: ${{ needs.source.outputs.version }}
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src fedora:latest packaging/ci/fedora.sh \
+            "dist/qsh-$VERSION.tar.gz" "dist/qsh-$VERSION-vendor.tar.xz" out
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: fedora
+          path: out/
+          if-no-files-found: ignore
+
+  alpine:
+    name: alpine:latest
+    needs: source
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: source
+          path: dist
+      - name: Build, lint, install, smoke test
+        env:
+          VERSION: ${{ needs.source.outputs.version }}
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src alpine:latest packaging/ci/alpine.sh \
+            "dist/qsh-$VERSION.tar.gz" out
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: alpine
+          path: out/
+          if-no-files-found: ignore
+
+  arch:
+    name: archlinux:latest
+    needs: source
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: source
+          path: dist
+      - name: Build, lint, install, smoke test
+        env:
+          VERSION: ${{ needs.source.outputs.version }}
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src archlinux:latest packaging/ci/arch.sh \
+            "dist/qsh-$VERSION.tar.gz" out
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: arch
+          path: out/
+          if-no-files-found: ignore
+
+  homebrew:
+    name: homebrew (macos-latest)
+    needs: source
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: source
+          path: dist
+      - name: Build, test, audit, smoke test
+        env:
+          VERSION: ${{ needs.source.outputs.version }}
+        run: packaging/ci/homebrew.sh "dist/qsh-$VERSION.tar.gz" out
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: homebrew
+          path: out/
+          if-no-files-found: ignore

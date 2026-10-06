@@ -3,8 +3,9 @@
 # Builds offline against the distribution's rust-*-devel crate packages; with
 # `--with vendor` it uses a `cargo vendor` tarball instead (EPEL, openSUSE, older releases).
 #
-# Placeholders to fill in when updating: Version, the changelog, and for vendored builds the
-# Source1 tarball (`cargo vendor --locked vendor && tar cJf qsh-VERSION-vendor.tar.xz vendor`).
+# On a version bump: Version, the License tag (below), and for vendored builds the Source1
+# tarball (packaging/ci/source.sh makes it: `cargo vendor --locked --versioned-dirs`, prefix
+# vendor/). The changelog and release come from rpmautospec (git history in dist-git).
 #
 # The cargo feature self-install (downloads release binaries at runtime) is off by default and
 # stays off: this build makes no network access at build time or at runtime.
@@ -13,13 +14,25 @@
 %bcond vendor 0
 
 Name:           qsh
-Version:        0.1.0
+Version:        0.2.0
 Release:        %autorelease
 Summary:        Remote shell over QUIC whose sessions survive network changes
 
 SourceLicense:  MIT OR Apache-2.0
-# Of the statically linked crates; regenerate with %%{cargo_license_summary} on every update.
-License:        MIT OR Apache-2.0
+# The crates statically linked into the programs, from %%{cargo_license_summary} (which the build
+# prints); regenerate on every update:
+# (MIT OR Apache-2.0) AND Unicode-3.0: unicode-ident
+# Apache-2.0 AND ISC: ring
+# Apache-2.0 OR ISC OR MIT: rustls
+# Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT: wasi (not linked on Linux)
+# BSD-3-Clause: subtle
+# ISC: rustls-webpki, untrusted
+# MIT: bytes, mio, slab, tokio, tracing, zmij, ...
+# MIT OR Apache-2.0 OR LGPL-2.1-or-later: r-efi (not linked on Linux)
+# MIT OR Apache-2.0 OR Zlib, Zlib OR Apache-2.0 OR MIT: lru-slab, tinyvec
+# Unlicense OR MIT: memchr
+# MIT OR Apache-2.0: the rest, and qsh itself
+License:        MIT AND Apache-2.0 AND ISC AND BSD-3-Clause AND Unicode-3.0 AND (MIT OR Apache-2.0) AND (Apache-2.0 OR ISC OR MIT) AND (MIT OR Apache-2.0 OR Zlib) AND (Unlicense OR MIT)
 URL:            https://github.com/yzfly/qsh
 Source0:        %{url}/archive/v%{version}/qsh-%{version}.tar.gz
 %if %{with vendor}
@@ -28,6 +41,18 @@ Source1:        qsh-%{version}-vendor.tar.xz
 
 BuildRequires:  cargo-rpm-macros >= 26
 BuildRequires:  systemd-rpm-macros
+# ring compiles C and assembly
+BuildRequires:  gcc
+%if %{with vendor}
+# Without vendor, %%generate_buildrequires pulls the toolchain in with the crates.
+BuildRequires:  cargo >= 1.85
+BuildRequires:  rust >= 1.85
+%endif
+%if %{with check}
+# The end-to-end tests look at processes with ps and kill
+BuildRequires:  procps-ng
+BuildRequires:  util-linux-core
+%endif
 
 Requires:       openssh-clients
 
@@ -45,7 +70,7 @@ This package contains the client, qsh.
 
 %package        server
 Summary:        Server side of qsh, a remote shell over QUIC
-License:        MIT OR Apache-2.0
+License:        MIT AND Apache-2.0 AND ISC AND BSD-3-Clause AND Unicode-3.0 AND (MIT OR Apache-2.0) AND (Apache-2.0 OR ISC OR MIT) AND (MIT OR Apache-2.0 OR Zlib) AND (Unlicense OR MIT)
 %{?systemd_requires}
 
 %description    server %{_description}
@@ -55,10 +80,11 @@ logged-in user. It needs no root and no configuration; a systemd user unit is
 included for those who want the daemon supervised.
 
 %prep
-%autosetup -n qsh-%{version} -p1 %{?with_vendor:-a1}
 %if %{with vendor}
+%autosetup -n qsh-%{version} -p1 -a1
 %cargo_prep -v vendor
 %else
+%autosetup -n qsh-%{version} -p1
 %cargo_prep
 %endif
 
@@ -114,6 +140,9 @@ install -Dpm 0644 -t %{buildroot}%{fish_completions_dir} completions/qsh.fish co
 
 %files server
 %license LICENSE-MIT LICENSE-APACHE LICENSE.dependencies
+%if %{with vendor}
+%license cargo-vendor.txt
+%endif
 %doc README.md docs/security.md
 %{_bindir}/qsh-server
 %{_userunitdir}/qsh-server.service

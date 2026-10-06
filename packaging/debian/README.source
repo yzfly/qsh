@@ -1,26 +1,38 @@
 qsh for Debian
 ==============
 
-This directory is upstream's starting point for the Debian package; it lives in the upstream
-repository as packaging/debian/ and is copied to debian/ to build:
+This directory is upstream's Debian packaging; it lives in the upstream repository as
+packaging/debian/ and is copied to debian/ to build:
 
     cp -r packaging/debian debian
     dpkg-buildpackage -us -uc                       # dependencies from librust-*-dev
-    DEB_BUILD_PROFILES=pkg.qsh.vendored \
-      dpkg-buildpackage -us -uc                     # dependencies from vendor/ (cargo vendor)
+    dpkg-buildpackage -us -uc -P pkg.qsh.vendored   # dependencies from vendor/
 
 Binary packages: qsh-client (qsh) and qsh-server (qsh-server and its systemd user unit), split
 like openssh-client / openssh-server and mosh, so servers need not carry the client.
 
 Generated files: man/*.1, man/*.5 and completions/* are generated from the command-line
-definitions upstream and committed to the repository; the release tarball contains them.
+definitions upstream (`cargo xtask gen`, checked in upstream CI) and committed to the repository;
+the release tarball contains them. The generator (the xtask crate) is not built here.
 
-Dependencies: every crate qsh uses (tokio, quinn, rustls with ring, rcgen, clap, serde,
-serde_json, libc) is packaged in Debian; the version bounds in debian/control follow the
-workspace Cargo.toml. With the pkg.qsh.vendored profile the vendored crates are built instead
-and debian/copyright must be extended to cover them (see the vendor/* stanza).
+Dependencies, default build: every crate qsh uses (tokio, quinn, rustls with ring, rcgen, clap,
+serde, serde_json, libc, zeroize, toml) through the archive's librust-*-dev packages and dh-cargo. The
+workspace also contains xtask, whose dependencies (clap_mangen, clap_complete) cargo has to
+resolve even though it is not built, hence their Build-Depends.
+
+Dependencies, pkg.qsh.vendored: the crates come from a second orig tarball,
+qsh_VERSION.orig-vendor.tar.xz (`cargo vendor --locked --versioned-dirs`, top directory vendor/),
+and plain cargo builds against it offline. debian/copyright has one Files: vendor/NAME-VERSION/*
+paragraph per crate, generated from Cargo.lock by packaging/ci/debian-copyright.py upstream.
+dh_clean is told to keep vendor/*/Cargo.toml.orig, which cargo checks against the vendored
+checksums. Upstream CI builds this way on Debian 12 and 13 and Ubuntu 24.04
+(packaging/ci/debian.sh).
+
+Rust: rust-version is 1.85 (Debian 13's rustc). On older releases (backports) the vendored
+build works with a newer toolchain on PATH and `dpkg-buildpackage -d`, or with Ubuntu's
+versioned rustc-1.NN packages.
 
 The cargo feature self-install (`qsh install HOST`, which downloads release binaries) is not
 enabled: the Debian build performs no network access at build time or at runtime.
 
- -- yzfly <zphyix@gmail.com>, placeholder date
+ -- yzfly <zphyix@gmail.com>, Mon, 05 Oct 2026 00:00:00 +0000

@@ -1,21 +1,25 @@
 # Maintainer: yzfly <zphyix@gmail.com>
 #
-# Starting point for the AUR (then extra). Placeholders: pkgver, sha256sums (updpkgsums).
+# For the AUR (then extra). On a version bump: pkgver, then `updpkgsums` and
+# `makepkg --printsrcinfo > .SRCINFO`.
 # Follows https://wiki.archlinux.org/title/Rust_package_guidelines. The cargo feature
 # self-install (downloads release binaries at runtime) is off by default and stays off.
 
 pkgname=qsh
-pkgver=0.1.0
+pkgver=0.2.0
 pkgrel=1
 pkgdesc='Remote shell over QUIC whose sessions survive network changes'
 arch=('x86_64' 'aarch64' 'armv7h' 'riscv64')
 url='https://github.com/yzfly/qsh'
 license=('MIT OR Apache-2.0')
-depends=('gcc-libs' 'glibc')
+depends=('glibc' 'libgcc')
 makedepends=('cargo')
 optdepends=('openssh: to start sessions (qsh bootstraps over ssh)')
+# makepkg's lto would build ring's C code as GCC LTO objects, which rustc's linker (lld since
+# Rust 1.90) cannot read; the Rust code gets LTO from the release profile anyway.
+options=('!lto')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
-sha256sums=('SKIP') # placeholder: run updpkgsums
+sha256sums=('48bffc66548c16c2f2c2b45c6ad2b020cbcc199d690dea73ab1df57e7bbcdca3')
 
 prepare() {
 	cd "$pkgname-$pkgver"
@@ -27,13 +31,15 @@ build() {
 	cd "$pkgname-$pkgver"
 	export RUSTUP_TOOLCHAIN=stable
 	export CARGO_TARGET_DIR=target
+	# Upstream's release profile strips; leave that to makepkg so that -debug packages work.
+	export CARGO_PROFILE_RELEASE_STRIP=false
 	cargo build --frozen --release --package qsh-cli --bins
 }
 
 check() {
 	cd "$pkgname-$pkgver"
 	export RUSTUP_TOOLCHAIN=stable
-	cargo test --frozen --workspace
+	cargo test --frozen --package qsh-core --package qsh-cli
 }
 
 package() {

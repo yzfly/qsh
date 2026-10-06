@@ -62,6 +62,9 @@ cargo install --locked qsh-cli --features self-install  # plus `qsh install HOST
 **Packages**: `.deb`, `.rpm` and `.apk` packages are attached to every
 [release](https://github.com/yzfly/qsh/releases). Native packages for Debian, Fedora, Alpine,
 Arch (AUR) and Homebrew are coming; the packaging lives in [packaging/](packaging/).
+Each of those recipes is built from source with the distribution's own tools, installed and
+smoke-tested in CI ([Packaging](https://github.com/yzfly/qsh/actions/workflows/packaging.yml));
+see [packaging/README.md](packaging/README.md) for local builds and the road into each distribution.
 
 <details>
 <summary>Verifying a download</summary>

@@ -4,8 +4,8 @@
 # librust-*-dev packages through dh-cargo's cargo wrapper, built offline.
 #
 # Build profile pkg.qsh.vendored: build with the crates in vendor/ instead (`cargo vendor --locked`,
-# shipped as the orig component tarball qsh_VERSION.orig-vendor.tar.xz). For backports and for
-# derivatives whose archive lacks some librust-*-dev versions:
+# shipped as the orig component tarball qsh_VERSION.orig-vendor.tar.xz). For backports, for
+# derivatives whose archive lacks some librust-*-dev versions, and for upstream's CI:
 #   DEB_BUILD_PROFILES=pkg.qsh.vendored dpkg-buildpackage -us -uc
 #
 # The cargo feature self-install (downloads release binaries at runtime) is off by default and
@@ -13,29 +13,39 @@
 
 include /usr/share/dpkg/pkg-info.mk
 include /usr/share/dpkg/architecture.mk
+include /usr/share/dpkg/buildopts.mk
+# From the rustc package; a vendored build with a rustup toolchain (backports to releases whose
+# rustc is older than rust-version) has to work it out itself, for native builds only.
+ifneq (,$(wildcard /usr/share/rustc/architecture.mk))
 include /usr/share/rustc/architecture.mk
+endif
+DEB_HOST_RUST_TYPE ?= $(shell rustc -vV | sed -n 's/^host: //p')
 
 export DEB_BUILD_MAINT_OPTIONS = hardening=+all
 export CARGO_HOME = $(CURDIR)/debian/cargo_home
 export DEB_CARGO_CRATE = qsh-cli_$(DEB_VERSION_UPSTREAM)
 
-# The profile directory: release, unless DEB_BUILD_OPTIONS=noopt made dh-cargo's wrapper build
-# a debug profile.
-CARGO_TARGET_OUT = $(firstword $(wildcard target/$(DEB_HOST_RUST_TYPE)/release target/$(DEB_HOST_RUST_TYPE)/debug))
+# The programs and the library they are built from; xtask (the man page generator) is not built.
+CARGO_PACKAGES = --package qsh-core --package qsh-cli
 
 ifneq (,$(filter pkg.qsh.vendored,$(DEB_BUILD_PROFILES)))
 # Plain cargo against vendor/, with the flags dh-cargo's wrapper would add.
 CARGO = cargo
 CARGO_FLAGS = --release --frozen --target $(DEB_HOST_RUST_TYPE) \
-	$(addprefix -j,$(patsubst parallel=%,%,$(filter parallel=%,$(DEB_BUILD_OPTIONS))))
-export RUSTFLAGS = -C debuginfo=2 -C strip=none --cap-lints warn \
-	-C linker=$(DEB_HOST_GNU_TYPE)-gcc \
+	$(addprefix -j,$(DEB_BUILD_OPTION_PARALLEL))
+# Debug info for the -dbgsym packages (dh_strip strips the programs), dpkg-buildflags' LDFLAGS
+# (relro, now) for the linker.
+export CARGO_PROFILE_RELEASE_STRIP = false
+export CARGO_PROFILE_RELEASE_DEBUG = 2
+export RUSTFLAGS = --cap-lints warn -C linker=$(DEB_HOST_GNU_TYPE)-gcc \
 	$(foreach f,$(shell dpkg-buildflags --get LDFLAGS),-C link-arg=$(f))
 else
 # dh-cargo's wrapper: --target, -j, release profile, RUSTFLAGS from dpkg-buildflags.
 CARGO = /usr/share/cargo/bin/cargo
 CARGO_FLAGS =
 endif
+
+CARGO_TARGET_OUT = target/$(DEB_HOST_RUST_TYPE)/release
 
 %:
 	dh $@
@@ -52,11 +62,11 @@ else
 endif
 
 override_dh_auto_build:
-	$(CARGO) build $(CARGO_FLAGS) --package qsh-cli --bins
+	$(CARGO) build $(CARGO_FLAGS) $(CARGO_PACKAGES) --bins
 
 override_dh_auto_test:
 ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
-	$(CARGO) test $(CARGO_FLAGS) --workspace
+	$(CARGO) test $(CARGO_FLAGS) $(CARGO_PACKAGES)
 endif
 
 # dh_install, dh_installman and dh_bash-completion take it from here (debian/qsh-*.install, ...).
@@ -72,9 +82,16 @@ override_dh_gencontrol:
 ifeq (,$(filter pkg.qsh.vendored,$(DEB_BUILD_PROFILES)))
 	/usr/share/cargo/bin/dh-cargo-built-using qsh-client
 	/usr/share/cargo/bin/dh-cargo-built-using qsh-server
-endif
 	dh_gencontrol
+else
+	# Built from vendor/, not from other packages' sources: no Built-Using.
+	dh_gencontrol -- -Vcargo:Built-Using= -Vcargo:Static-Built-Using= -Vcargo:X-Cargo-Built-Using=
+endif
 
 override_dh_auto_clean:
-	dh_auto_clean
 	rm -rf target debian/cargo_home debian/cargo_registry
+
+# dh_clean deletes *.orig files, and cargo checks vendor/*/Cargo.toml.orig against
+# .cargo-checksum.json.
+override_dh_clean:
+	dh_clean -XCargo.toml.orig

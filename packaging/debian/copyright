@@ -10,14 +10,440 @@ License: MIT or Apache-2.0
 Files: debian/*
 Copyright: The qsh authors
 License: MIT or Apache-2.0
+Comment: The Files: vendor/... paragraphs below cover the crates in the orig component tarball
+ qsh_VERSION.orig-vendor.tar.xz (`cargo vendor --locked --versioned-dirs`), present only in
+ builds with the pkg.qsh.vendored profile. They are generated from Cargo.lock by
+ packaging/ci/debian-copyright.py in the upstream repository; review them on every update.
 
-Files: vendor/*
-Copyright: Placeholder: the authors of each vendored crate, see vendor/*/Cargo.toml
-License: Placeholder
-Comment: Only present in builds with the pkg.qsh.vendored profile, from the orig component
- tarball qsh_VERSION.orig-vendor.tar.xz. Before uploading such a build, replace this stanza
- with one stanza per license found in the vendored crates (for example generated with
- `cargo deny list -l crate` or `debcargo`'s copyright helper) and review it by hand.
+Files: vendor/anstyle-1.0.14/*
+Copyright: The anstyle authors
+License: MIT or Apache-2.0
+
+Files: vendor/bumpalo-3.20.3/*
+Copyright: Nick Fitzgerald
+License: MIT or Apache-2.0
+
+Files: vendor/bytes-1.12.1/*
+Copyright: Carl Lerche
+ Sean McArthur
+License: MIT
+
+Files: vendor/cc-1.6.0/*
+Copyright: The cc authors
+License: MIT or Apache-2.0
+
+Files: vendor/cfg-if-1.0.5/*
+Copyright: Alex Crichton
+License: MIT or Apache-2.0
+
+Files: vendor/cfg_aliases-0.2.2/*
+Copyright: Zicklag
+License: MIT
+
+Files: vendor/chacha20-0.10.2/*
+Copyright: RustCrypto Developers
+License: MIT or Apache-2.0
+
+Files: vendor/clap-4.6.7/*
+Copyright: The clap authors
+License: MIT or Apache-2.0
+
+Files: vendor/clap_builder-4.6.7/*
+Copyright: The clap_builder authors
+License: MIT or Apache-2.0
+
+Files: vendor/clap_complete-4.6.11/*
+Copyright: The clap_complete authors
+License: MIT or Apache-2.0
+
+Files: vendor/clap_derive-4.6.7/*
+Copyright: The clap_derive authors
+License: MIT or Apache-2.0
+
+Files: vendor/clap_lex-1.1.1/*
+Copyright: The clap_lex authors
+License: MIT or Apache-2.0
+
+Files: vendor/clap_mangen-0.2.33/*
+Copyright: The clap_mangen authors
+License: MIT or Apache-2.0
+
+Files: vendor/cpufeatures-0.3.1/*
+Copyright: RustCrypto Developers
+License: MIT or Apache-2.0
+
+Files: vendor/deranged-0.5.8/*
+Copyright: Jacob Pratt
+License: MIT or Apache-2.0
+
+Files: vendor/equivalent-1.0.2/*
+Copyright: The equivalent authors
+License: Apache-2.0 or MIT
+
+Files: vendor/errno-0.3.14/*
+Copyright: Chris Wong
+ Dan Gohman
+License: MIT or Apache-2.0
+
+Files: vendor/find-msvc-tools-0.1.14/*
+Copyright: The find-msvc-tools authors
+License: MIT or Apache-2.0
+
+Files: vendor/futures-core-0.3.34/*
+Copyright: The futures-core authors
+License: MIT or Apache-2.0
+
+Files: vendor/futures-task-0.3.34/*
+Copyright: The futures-task authors
+License: MIT or Apache-2.0
+
+Files: vendor/futures-util-0.3.34/*
+Copyright: The futures-util authors
+License: MIT or Apache-2.0
+
+Files: vendor/getrandom-0.2.17/*
+Copyright: The Rand Project Developers
+License: MIT or Apache-2.0
+
+Files: vendor/getrandom-0.4.3/*
+Copyright: The Rand Project Developers
+License: MIT or Apache-2.0
+
+Files: vendor/hashbrown-0.17.1/*
+Copyright: The hashbrown authors
+License: MIT or Apache-2.0
+
+Files: vendor/heck-0.5.0/*
+Copyright: The heck authors
+License: MIT or Apache-2.0
+
+Files: vendor/indexmap-2.14.2/*
+Copyright: The indexmap authors
+License: Apache-2.0 or MIT
+
+Files: vendor/itoa-1.0.18/*
+Copyright: David Tolnay
+License: MIT or Apache-2.0
+
+Files: vendor/js-sys-0.3.106/*
+Copyright: The wasm-bindgen Developers
+License: MIT or Apache-2.0
+
+Files: vendor/libc-0.2.190/*
+Copyright: The libc authors
+License: MIT or Apache-2.0
+
+Files: vendor/lru-slab-0.1.3/*
+Copyright: Benjamin Saunders
+License: MIT or Apache-2.0 or Zlib
+
+Files: vendor/memchr-2.8.3/*
+Copyright: Andrew Gallant
+ bluss
+License: Unlicense or MIT
+
+Files: vendor/mio-1.2.4/*
+Copyright: Carl Lerche
+ Thomas de Zeeuw
+ Tokio Contributors
+License: MIT
+
+Files: vendor/num-conv-0.1.0/*
+Copyright: Jacob Pratt
+License: MIT or Apache-2.0
+
+Files: vendor/once_cell-1.21.4/*
+Copyright: Aleksey Kladov
+License: MIT or Apache-2.0
+
+Files: vendor/pin-project-lite-0.2.17/*
+Copyright: The pin-project-lite authors
+License: Apache-2.0 or MIT
+
+Files: vendor/powerfmt-0.2.1/*
+Copyright: Jacob Pratt
+License: MIT or Apache-2.0
+
+Files: vendor/proc-macro2-1.0.107/*
+Copyright: David Tolnay
+ Alex Crichton
+License: MIT or Apache-2.0
+
+Files: vendor/quinn-0.11.12/*
+Copyright: The quinn authors
+License: MIT or Apache-2.0
+
+Files: vendor/quinn-proto-0.11.19/*
+Copyright: The quinn-proto authors
+License: MIT or Apache-2.0
+
+Files: vendor/quinn-udp-0.5.16/*
+Copyright: The quinn-udp authors
+License: MIT or Apache-2.0
+
+Files: vendor/quote-1.0.47/*
+Copyright: David Tolnay
+License: MIT or Apache-2.0
+
+Files: vendor/r-efi-6.0.0/*
+Copyright: The r-efi authors
+License: MIT or Apache-2.0 or LGPL-2.1+
+
+Files: vendor/rand-0.10.3/*
+Copyright: The Rand Project Developers
+ The Rust Project Developers
+License: MIT or Apache-2.0
+
+Files: vendor/rand_core-0.10.1/*
+Copyright: The Rand Project Developers
+License: MIT or Apache-2.0
+
+Files: vendor/rand_pcg-0.10.2/*
+Copyright: The Rand Project Developers
+License: MIT or Apache-2.0
+
+Files: vendor/rcgen-0.13.2/*
+Copyright: The rcgen authors
+License: MIT or Apache-2.0
+
+Files: vendor/ring-0.17.14/*
+Copyright: The ring authors
+License: Apache-2.0 and ISC
+
+Files: vendor/roff-1.1.1/*
+Copyright: The roff authors
+License: MIT or Apache-2.0
+
+Files: vendor/rustc-hash-2.1.3/*
+Copyright: The Rust Project Developers
+License: Apache-2.0 or MIT
+
+Files: vendor/rustls-0.23.45/*
+Copyright: The rustls authors
+License: Apache-2.0 or ISC or MIT
+
+Files: vendor/rustls-pki-types-1.15.1/*
+Copyright: The rustls-pki-types authors
+License: MIT or Apache-2.0
+
+Files: vendor/rustls-webpki-0.103.15/*
+Copyright: The rustls-webpki authors
+License: ISC
+
+Files: vendor/rustversion-1.0.23/*
+Copyright: David Tolnay
+License: MIT or Apache-2.0
+
+Files: vendor/serde-1.0.229/*
+Copyright: Erick Tryzelaar
+ David Tolnay
+License: MIT or Apache-2.0
+
+Files: vendor/serde_core-1.0.229/*
+Copyright: Erick Tryzelaar
+ David Tolnay
+License: MIT or Apache-2.0
+
+Files: vendor/serde_derive-1.0.229/*
+Copyright: Erick Tryzelaar
+ David Tolnay
+License: MIT or Apache-2.0
+
+Files: vendor/serde_json-1.0.151/*
+Copyright: Erick Tryzelaar
+ David Tolnay
+License: MIT or Apache-2.0
+
+Files: vendor/serde_spanned-1.1.1/*
+Copyright: The serde_spanned authors
+License: MIT or Apache-2.0
+
+Files: vendor/shlex-2.0.1/*
+Copyright: comex
+ Fenhl
+ Adrian Taylor
+ Alex Touchet
+ Daniel Parks
+ Garrett Berg
+License: MIT or Apache-2.0
+
+Files: vendor/signal-hook-registry-1.4.8/*
+Copyright: Michal 'vorner' Vaner
+ Masaki Hara
+License: MIT or Apache-2.0
+
+Files: vendor/slab-0.4.12/*
+Copyright: Carl Lerche
+License: MIT
+
+Files: vendor/socket2-0.6.5/*
+Copyright: Alex Crichton
+ Thomas de Zeeuw
+License: MIT or Apache-2.0
+
+Files: vendor/subtle-2.6.1/*
+Copyright: Isis Lovecruft
+ Henry de Valence
+License: BSD-3-Clause
+
+Files: vendor/syn-3.0.6/*
+Copyright: David Tolnay
+License: MIT or Apache-2.0
+
+Files: vendor/thiserror-2.0.21/*
+Copyright: David Tolnay
+License: MIT or Apache-2.0
+
+Files: vendor/thiserror-impl-2.0.21/*
+Copyright: David Tolnay
+License: MIT or Apache-2.0
+
+Files: vendor/time-0.3.45/*
+Copyright: Jacob Pratt
+ Time contributors
+License: MIT or Apache-2.0
+
+Files: vendor/time-core-0.1.7/*
+Copyright: Jacob Pratt
+ Time contributors
+License: MIT or Apache-2.0
+
+Files: vendor/tinyvec-1.13.3/*
+Copyright: Lokathor
+License: Zlib or Apache-2.0 or MIT
+
+Files: vendor/tokio-1.53.2/*
+Copyright: Tokio Contributors
+License: MIT
+
+Files: vendor/tokio-macros-2.7.2/*
+Copyright: Tokio Contributors
+License: MIT
+
+Files: vendor/tokio-rustls-0.26.6/*
+Copyright: The tokio-rustls authors
+License: MIT or Apache-2.0
+
+Files: vendor/toml-1.1.6+spec-1.1.0/*
+Copyright: The toml authors
+License: MIT or Apache-2.0
+
+Files: vendor/toml_datetime-1.1.1+spec-1.1.0/*
+Copyright: The toml_datetime authors
+License: MIT or Apache-2.0
+
+Files: vendor/toml_parser-1.1.3+spec-1.1.0/*
+Copyright: The toml_parser authors
+License: MIT or Apache-2.0
+
+Files: vendor/toml_writer-1.1.2+spec-1.1.0/*
+Copyright: The toml_writer authors
+License: MIT or Apache-2.0
+
+Files: vendor/tracing-0.1.44/*
+Copyright: Eliza Weisman
+ Tokio Contributors
+License: MIT
+
+Files: vendor/tracing-core-0.1.36/*
+Copyright: Tokio Contributors
+License: MIT
+
+Files: vendor/unicode-ident-1.0.26/*
+Copyright: David Tolnay
+License: (MIT or Apache-2.0) and Unicode-3.0
+
+Files: vendor/untrusted-0.9.0/*
+Copyright: Brian Smith
+License: ISC
+
+Files: vendor/wasi-0.11.1+wasi-snapshot-preview1/*
+Copyright: The Cranelift Project Developers
+License: Apache-2.0 with LLVM exception or Apache-2.0 or MIT
+
+Files: vendor/wasm-bindgen-0.2.129/*
+Copyright: The wasm-bindgen Developers
+License: MIT or Apache-2.0
+
+Files: vendor/wasm-bindgen-macro-0.2.129/*
+Copyright: The wasm-bindgen Developers
+License: MIT or Apache-2.0
+
+Files: vendor/wasm-bindgen-macro-support-0.2.129/*
+Copyright: The wasm-bindgen Developers
+License: MIT or Apache-2.0
+
+Files: vendor/wasm-bindgen-shared-0.2.129/*
+Copyright: The wasm-bindgen Developers
+License: MIT or Apache-2.0
+
+Files: vendor/web-time-1.1.0/*
+Copyright: The web-time authors
+License: MIT or Apache-2.0
+
+Files: vendor/windows-link-0.2.1/*
+Copyright: The windows-link authors
+License: MIT or Apache-2.0
+
+Files: vendor/windows-sys-0.52.0/*
+Copyright: Microsoft
+License: MIT or Apache-2.0
+
+Files: vendor/windows-sys-0.61.2/*
+Copyright: The windows-sys authors
+License: MIT or Apache-2.0
+
+Files: vendor/windows-targets-0.52.6/*
+Copyright: Microsoft
+License: MIT or Apache-2.0
+
+Files: vendor/windows_aarch64_gnullvm-0.52.6/*
+Copyright: Microsoft
+License: MIT or Apache-2.0
+
+Files: vendor/windows_aarch64_msvc-0.52.6/*
+Copyright: Microsoft
+License: MIT or Apache-2.0
+
+Files: vendor/windows_i686_gnu-0.52.6/*
+Copyright: Microsoft
+License: MIT or Apache-2.0
+
+Files: vendor/windows_i686_gnullvm-0.52.6/*
+Copyright: Microsoft
+License: MIT or Apache-2.0
+
+Files: vendor/windows_i686_msvc-0.52.6/*
+Copyright: Microsoft
+License: MIT or Apache-2.0
+
+Files: vendor/windows_x86_64_gnu-0.52.6/*
+Copyright: Microsoft
+License: MIT or Apache-2.0
+
+Files: vendor/windows_x86_64_gnullvm-0.52.6/*
+Copyright: Microsoft
+License: MIT or Apache-2.0
+
+Files: vendor/windows_x86_64_msvc-0.52.6/*
+Copyright: Microsoft
+License: MIT or Apache-2.0
+
+Files: vendor/winnow-1.0.4/*
+Copyright: The winnow authors
+License: MIT
+
+Files: vendor/yasna-0.5.2/*
+Copyright: Masaki Hara
+License: MIT or Apache-2.0
+
+Files: vendor/zeroize-1.9.0/*
+Copyright: The RustCrypto Project Developers
+License: Apache-2.0 or MIT
+
+Files: vendor/zmij-1.0.23/*
+Copyright: David Tolnay
+License: MIT
 
 License: MIT
  Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -53,3 +479,156 @@ License: Apache-2.0
  .
  On Debian systems, the complete text of the Apache License, Version 2.0
  can be found in "/usr/share/common-licenses/Apache-2.0".
+
+License: ISC
+ Permission to use, copy, modify, and/or distribute this software for any
+ purpose with or without fee is hereby granted, provided that the above
+ copyright notice and this permission notice appear in all copies.
+ .
+ THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
+ SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR
+ IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+License: BSD-3-Clause
+ Redistribution and use in source and binary forms, with or without
+ modification, are permitted provided that the following conditions are met:
+ .
+ 1. Redistributions of source code must retain the above copyright notice,
+    this list of conditions and the following disclaimer.
+ .
+ 2. Redistributions in binary form must reproduce the above copyright
+    notice, this list of conditions and the following disclaimer in the
+    documentation and/or other materials provided with the distribution.
+ .
+ 3. Neither the name of the copyright holder nor the names of its
+    contributors may be used to endorse or promote products derived from
+    this software without specific prior written permission.
+ .
+ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ POSSIBILITY OF SUCH DAMAGE.
+
+License: Zlib
+ This software is provided 'as-is', without any express or implied
+ warranty. In no event will the authors be held liable for any damages
+ arising from the use of this software.
+ .
+ Permission is granted to anyone to use this software for any purpose,
+ including commercial applications, and to alter it and redistribute it
+ freely, subject to the following restrictions:
+ .
+ 1. The origin of this software must not be misrepresented; you must not
+    claim that you wrote the original software. If you use this software
+    in a product, an acknowledgment in the product documentation would be
+    appreciated but is not required.
+ 2. Altered source versions must be plainly marked as such, and must not be
+    misrepresented as being the original software.
+ 3. This notice may not be removed or altered from any source distribution.
+
+License: Unlicense
+ This is free and unencumbered software released into the public domain.
+ .
+ Anyone is free to copy, modify, publish, use, compile, sell, or
+ distribute this software, either in source code form or as a compiled
+ binary, for any purpose, commercial or non-commercial, and by any
+ means.
+ .
+ In jurisdictions that recognize copyright laws, the author or authors
+ of this software dedicate any and all copyright interest in the
+ software to the public domain. We make this dedication for the benefit
+ of the public at large and to the detriment of our heirs and
+ successors. We intend this dedication to be an overt act of
+ relinquishment in perpetuity of all present and future rights to this
+ software under copyright law.
+ .
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+ EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+ IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+ OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+ ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+ OTHER DEALINGS IN THE SOFTWARE.
+ .
+ For more information, please refer to <https://unlicense.org/>
+
+License: Unicode-3.0
+ UNICODE LICENSE V3
+ .
+ COPYRIGHT AND PERMISSION NOTICE
+ .
+ Copyright (c) 1991-2023 Unicode, Inc.
+ .
+ NOTICE TO USER: Carefully read the following legal agreement. BY
+ DOWNLOADING, INSTALLING, COPYING OR OTHERWISE USING DATA FILES, AND/OR
+ SOFTWARE, YOU UNEQUIVOCALLY ACCEPT, AND AGREE TO BE BOUND BY, ALL OF THE
+ TERMS AND CONDITIONS OF THIS AGREEMENT. IF YOU DO NOT AGREE, DO NOT
+ DOWNLOAD, INSTALL, COPY, DISTRIBUTE OR USE THE DATA FILES OR SOFTWARE.
+ .
+ Permission is hereby granted, free of charge, to any person obtaining a
+ copy of data files and any associated documentation (the "Data Files") or
+ software and any associated documentation (the "Software") to deal in the
+ Data Files or Software without restriction, including without limitation
+ the rights to use, copy, modify, merge, publish, distribute, and/or sell
+ copies of the Data Files or Software, and to permit persons to whom the
+ Data Files or Software are furnished to do so, provided that either (a)
+ this copyright and permission notice appear with all copies of the Data
+ Files or Software, or (b) this copyright and permission notice appear in
+ associated Documentation.
+ .
+ THE DATA FILES AND SOFTWARE ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
+ KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF
+ THIRD PARTY RIGHTS.
+ .
+ IN NO EVENT SHALL THE COPYRIGHT HOLDER OR HOLDERS INCLUDED IN THIS NOTICE
+ BE LIABLE FOR ANY CLAIM, OR ANY SPECIAL INDIRECT OR CONSEQUENTIAL DAMAGES,
+ OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS,
+ WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION,
+ ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THE DATA
+ FILES OR SOFTWARE.
+ .
+ Except as contained in this notice, the name of a copyright holder shall
+ not be used in advertising or otherwise to promote the sale, use or other
+ dealings in these Data Files or Software without prior written
+ authorization of the copyright holder.
+
+License: LGPL-2.1+
+ This library is free software; you can redistribute it and/or modify it
+ under the terms of the GNU Lesser General Public License as published by
+ the Free Software Foundation; either version 2.1 of the License, or (at
+ your option) any later version.
+ .
+ On Debian systems, the complete text of the GNU Lesser General Public
+ License version 2.1 can be found in "/usr/share/common-licenses/LGPL-2.1".
+
+License: Apache-2.0 with LLVM exception
+ Licensed under the Apache License, Version 2.0 (see the Apache-2.0 paragraph),
+ with the following exception:
+ .
+ ---- LLVM Exceptions to the Apache 2.0 License ----
+ .
+ As an exception, if, as a result of your compiling your source code, portions
+ of this Software are embedded into an Object form of such source code, you
+ may redistribute such embedded portions in such Object form without complying
+ with the conditions of Sections 4(a), 4(b) and 4(d) of the License.
+ .
+ In addition, if you combine or link compiled forms of this Software with
+ software that is licensed under the GPLv2 ("Combined Software") and if a
+ court of competent jurisdiction determines that the patent provision (Section
+ 3), the indemnity provision (Section 9) or other Section of the License
+ conflicts with the conditions of the GPLv2, you may retroactively and
+ prospectively choose to deem waived or otherwise exclude such Section(s) of
+ the License, but only in their entirety and only with respect to the Combined
+ Software.
