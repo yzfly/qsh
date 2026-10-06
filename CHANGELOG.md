@@ -11,12 +11,20 @@ needs a section `## [X.Y.Z] - YYYY-MM-DD` here before its tag is pushed.
 
 ## [Unreleased]
 
-## [0.3.0] - 2026-10-06
+## [0.5.0] - 2026-10-07
 
-Connections that learn (milestone M2, part 1).
+Connections that optimize themselves (milestone M2). 0.3.0 and 0.4.0 were development
+milestones and were not released; their changes are listed here.
 
 ### Added
 
+- Smart catch-up: when output floods a slow link, the server stops streaming the backlog and
+  sends the current screen instead (a SNAPSHOT, built from a model of the terminal), marking
+  the skipped output in scrollback. Ctrl-C during `cat bigfile` on a 270 ms link takes effect
+  in about half a second instead of tens of seconds. A new client process attaching to a
+  session gets the recent scrollback and then the current screen.
+- Compression: on a slow path the server compresses output with zstd (decoded by a bounded
+  decoder of our own); a 1.5 MB build log over 300 kB/s takes 0.4 s instead of 5 s.
 - Path memory: per network, qsh remembers which transport and port worked and starts with it
   at once; a transport that is blocked there is skipped, then re-probed in the background
   (1 min up to 24 h). When a better transport comes back, sessions move to it without a
@@ -31,13 +39,29 @@ Connections that learn (milestone M2, part 1).
 - In-place daemon upgrade: when a newer `qsh-server` reaches the daemon (or on
   `qsh-server upgrade`, or by itself when idle), it executes the new version in its own
   process: same process id, same ports, every session and its programs kept; clients reconnect
-  within about a second. If the new version cannot take over, the old one carries on. The
-  systemd unit reloads with `qsh-server upgrade`.
+  within about a second. If the new version cannot take over, the old one carries on and that
+  program is not tried again automatically. The systemd unit reloads with `qsh-server upgrade`.
+- `qsh-server doctor` checks what matters for qsh on this host (ports and firewall: ufw,
+  firewalld, nftables, iptables; UDP buffers, GSO/GRO, BBR, IPv6, MTU, linger, the runtime
+  directory, SELinux and AppArmor, the clock, limits, conntrack, cloud and container) and
+  prints the exact fix for this distribution. `qsh doctor HOST` adds what the client sees:
+  which transports work from here, RTT, loss, MTU, NAT. `--json` for scripts.
+- `qsh-server tune` shows what it would change (sysctl.d, modules-load.d, the firewall,
+  linger), and with `--apply` (as root, after asking) changes it; `--revert` puts every file
+  back byte for byte, with its mode and owner. A firewalld service and a ufw application
+  profile ship with the packages.
+- Release signatures: `SHA256SUMS` is signed (minisign, Ed25519). `qsh install` and the install
+  script verify it; the public key is in docs/security.md.
 - The daemon asks for 4 MiB UDP buffers and uses BBR for TLS over TCP where the kernel has it.
 
 ### Changed
 
+- Release builds unwind on panic: a fault in the screen model or the codec turns that feature
+  off for one session; it never takes down the daemon or other sessions.
 - `qsh-server status` reports ports, extra ports, sessions and upgrade state.
+- The offer to install `qsh-server` on a host now defaults to no.
+- Text from the server (errors, `qsh ls`, doctor reports) is shown with control characters and
+  escape sequences removed.
 
 ### Fixed
 
@@ -48,6 +72,17 @@ Connections that learn (milestone M2, part 1).
   4 MiB); output keeps flowing during a large paste into a terminal session too.
 - After UDP was blocked during a session, a new `qsh attach` still tried QUIC first: the
   failure is now recorded when TLS wins the race, and the last winner breaks ties.
+- `qsh install` no longer falls back to plain http, and it checks the release signature.
+
+### Security
+
+- Output a program prints can no longer exhaust the daemon's memory or CPU through the screen
+  model: string sequences (OSC, DCS, APC, ...) never reach it, repeat counts are clamped to
+  the screen, and each model has a work budget.
+- The program an upgrade runs is opened once, checked through that descriptor (including every
+  directory above it) and executed by descriptor.
+- `qsh-server tune --revert` accepts only a root-owned, private record of changes `tune`
+  itself makes.
 
 ## [0.2.1] - 2026-10-06
 
@@ -126,8 +161,8 @@ The first preview. The protocol and command line may still change before 1.0.
   Linux 9, Alpine, Arch, openSUSE Tumbleweed and Amazon Linux 2023, with UDP blocked and with
   only ssh reachable.
 
-[Unreleased]: https://github.com/yzfly/qsh/compare/v0.3.0...HEAD
-[0.3.0]: https://github.com/yzfly/qsh/compare/v0.2.1...v0.3.0
+[Unreleased]: https://github.com/yzfly/qsh/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/yzfly/qsh/compare/v0.2.1...v0.5.0
 [0.2.1]: https://github.com/yzfly/qsh/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/yzfly/qsh/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/yzfly/qsh/compare/v0.1.0...v0.1.1
