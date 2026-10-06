@@ -57,3 +57,14 @@
 - [ ] 第三方解析器 panic 隔离：release 改为 unwind + catch_unwind，画面模型或编解码出错只关掉这个会话的该功能，不拖垮 daemon
 - [ ] 规范按 WP-2 实际实现修正（EL 规则、最小 RTT、路径速率、输入触发不受滞后、alt 屏、ruzstd 事实、快照被拒后的安全回退）
 - [ ] 审查问题修完后：本地 `scripts/local-test.sh --chaos`（含 flood_interrupt、compression）、手动跑一轮完整 CI（macOS、长时间模糊测试、9 发行版、打包、混沌），全绿后公开仓库、发 0.5.0
+- 本地/特权侧审查结果（待修，panic 隔离完成后统一修）：
+  - [ ] H1 升级失败后对同一新程序反复自动重试，每次断开所有连接、新登录失败 → 失败的程序（dev, ino, 版本）记住并跨回退保留，自动升级不再重试，`--force` 仍可用
+  - [ ] H3 `tune --root DIR` 混用宿主命令、不检查 root、完全信任 DIR 里的还原记录（可让 root 执行任意命令、写任意文件）→ 改为仅测试用的隐藏选项或禁用命令；还原记录白名单校验、属主/权限检查、O_NOFOLLOW
+  - [ ] M1 升级可执行文件按路径检查又按路径执行（TOCTOU）→ 打开一次 fd，fstat 校验，检查父目录，execveat(AT_EMPTY_PATH)
+  - [ ] M2 tune 把 0640 的防火墙规则文件抄进 0644 的记录、还原后权限变宽 → 记录 0600，还原原属主和权限
+  - [ ] M3 回退在新程序解析参数、建运行时之后才武装 → 恢复参数版本化或放进加密状态，main 一开始就武装
+  - [ ] L1 install 的 http 回退、远端 curl 无 --proto =https；DESIGN 承诺的签名还没有 → 只用 https；发版签名（minisign/cosign）进 0.5.0 或写明
+  - [ ] L2 root 下命令走继承的 PATH；doctor --tune 用 sudo 跑用户可写的 qsh-server；ssh -t 缺转发关闭选项
+  - [ ] L3 服务端文本（错误、doctor 报告、ls）原样进终端 → 统一过滤控制字符，doctor 输出限长
+  - [ ] L4 预发布版本号按文本比较 → 按 semver 数字比较
+  - [ ] L5 安装提示默认 Yes → 改为默认 No 或要求明确输入
