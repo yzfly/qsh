@@ -11,16 +11,33 @@ needs a section `## [X.Y.Z] - YYYY-MM-DD` here before its tag is pushed.
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-10-06
+
+The first preview. The protocol and command line may still change before 1.0.
+
 ### Added
 
-- Design document (`docs/DESIGN.md`): architecture, the standard-component bar, command line,
-  self-optimizing connections and milestones.
-- The qsh/1 protocol specification (`docs/protocol.md`) and security model (`docs/security.md`).
-- Workspace with the `qsh-core` library and the `qsh-cli` package (`qsh` and `qsh-server`).
-- Install script for release binaries (`scripts/install.sh`), with checksum verification.
-- CI (format, lints, tests on Linux and macOS, MSRV, `cargo deny`, fuzzing, docs), release builds
-  of static binaries for six targets with provenance attestations, and end-to-end tests on nine
-  Linux distributions.
-- Packaging for Debian, RPM, Alpine, Arch and Homebrew, a systemd user unit and an OpenRC script.
+- `qsh [user@]host [command]`: log in with your own ssh (keys, agent, `~/.ssh/config`,
+  ProxyJump, passwords and 2FA), then continue the session over QUIC. The session survives
+  network changes and sleep; after a reconnect both sides resend what the other missed.
+- Three transports raced on every connect: QUIC, TLS 1.3 over TCP, and a pipe through ssh, so
+  qsh works where UDP or the daemon's ports are blocked.
+- Escapes after Enter: `~.` end, `~d` detach, `~s` connection status, `~?` help, `~~` a `~`.
+- Commands without a terminal are byte exact like ssh: stdout and stderr apart, end of input
+  delivered, the remote exit status returned.
+- `qsh-server`: a per-user daemon started on demand over ssh, no root and no configuration; the
+  first free port of 60443-60542 on UDP and TCP; `status`, `stop`, a systemd user unit.
+- Security: the daemon certificate is pinned through ssh, attach proofs are bound to the
+  connection with the TLS exporter and are mutual, session keys rotate on every attach, limits
+  and QUIC Retry before authentication, control sockets checked both ways.
+- The qsh/1 protocol specification (`docs/protocol.md`), security model (`docs/security.md`) and
+  design (`docs/DESIGN.md`).
+- `qsh-core`, the library behind both programs, for embedding.
+- Static binaries for Linux (x86_64, aarch64, armv7, riscv64) and macOS, `.deb`, `.rpm` and
+  `.apk` packages, an install script, man pages and shell completions.
+- Tested end to end against a real sshd on Ubuntu 20.04 and 24.04, Debian 12, Fedora, Rocky
+  Linux 9, Alpine, Arch, openSUSE Tumbleweed and Amazon Linux 2023, with UDP blocked and with
+  only ssh reachable.
 
-[Unreleased]: https://github.com/yzfly/qsh/commits/main
+[Unreleased]: https://github.com/yzfly/qsh/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/yzfly/qsh/releases/tag/v0.1.0
