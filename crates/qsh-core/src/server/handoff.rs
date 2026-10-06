@@ -1703,7 +1703,8 @@ mod tests {
         let link = dir.join("link");
         std::os::unix::fs::symlink(&exe, &link).unwrap();
         let opened = Exe::open(&link).unwrap();
-        assert_eq!(opened.real, exe);
+        // canonicalize: on macOS the temporary directory is /var/..., really /private/var/...
+        assert_eq!(opened.real, exe.canonicalize().unwrap());
         let me = crate::sys::euid();
         let private = Some(4242);
         assert_eq!(dir_refusal(0, 0, 0o40755, me, None), None);

@@ -1485,7 +1485,10 @@ compression raises it by the compression factor. While the stream is being compr
 path's rate is `T × ρ`, with `ρ` the moving average of compressed size / raw size of the recent
 frames (the same average that decides "compressible" above); while it is sent uncompressed it is
 `T`. Comparing `T` itself with the limit would make compression turn itself off on a slow path
-as soon as it worked (`T` rises above the limit) and back on when `T` fell again.
+as soon as it worked (`T` rises above the limit) and back on when `T` fell again. Before the
+attachment has a delivery-rate sample the path's rate is unknown (QUIC's congestion window over
+its round trip says nothing about a slow link behind a fast first hop), and the stream is
+compressed; the first samples decide.
 
 ### 7.13 Session lifetime
 

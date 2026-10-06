@@ -60,7 +60,11 @@ qshl_host_snapshot() {
     echo "## qdiscs"
     tc qdisc show
     echo "## nftables"
-    if command -v nft >/dev/null; then sudo -n nft -s list ruleset | qshl_nft_stable; fi
+    # stderr apart: iptables-nft prints warnings there, which the snapshot's 2>&1 would splice
+    # into the listing (they say nothing about the state)
+    if command -v nft >/dev/null; then
+        { sudo -n nft -s list ruleset 2>/dev/null || echo "(nft list ruleset failed)"; } | qshl_nft_stable
+    fi
     echo "## sysctls"
     sysctl net.ipv4.ip_forward net.ipv6.conf.all.forwarding net.ipv4.conf.all.promote_secondaries
     echo "## namespaces"

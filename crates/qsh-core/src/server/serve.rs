@@ -1486,10 +1486,15 @@ async fn terminal(
                     }
                     let room = (window - in_flight) as usize;
                     let ready = out.end(session).saturating_sub(out.sent);
+                    // Before the first delivery-rate sample the path's rate is unknown: the
+                    // initial estimate is QUIC's congestion window over its round trip, which
+                    // says nothing about a slow link behind a fast first hop (or the test
+                    // link). Compress then; the samples decide (m2.md 7.2)
+                    let path_rate = if out.rate.sampled(now).is_zero() { 0.0 } else { rate };
                     let compress = out
                         .squeeze
                         .as_ref()
-                        .is_some_and(|z| z.wanted(now, rate, ready, out.sent));
+                        .is_some_and(|z| z.wanted(now, path_rate, ready, out.sent));
                     let max = if compress { MAX_ZSTD_CONTENT } else { PREFERRED_DATA };
                     let before = batch.len();
                     match out.next(session, max.min(room), compress, &mut batch) {

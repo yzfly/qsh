@@ -498,6 +498,7 @@ impl Pool {
                 RaceEvent::Connected(won) => *won,
             };
             let (attempt, handshake) = (won.attempt, won.handshake);
+            let answers = Answers::of(&won.connection);
             match tokio::time::timeout(ATTACH_TIMEOUT, Conn::hello_offering(won.connection, ctx.offer)).await {
                 Ok(Ok(conn)) => {
                     log::debug(format_args!(
@@ -542,8 +543,9 @@ impl Pool {
                     race.failed(attempt.transport, e);
                 }
                 Err(_) => {
-                    record_attempt(attempt, FailureKind::Hello.as_str());
-                    failures.push((attempt.transport, FailureKind::Hello));
+                    let kind = answers.hello_timeout();
+                    record_attempt(attempt, kind.as_str());
+                    failures.push((attempt.transport, kind));
                     race.failed(
                         attempt.transport,
                         io::Error::new(io::ErrorKind::TimedOut, "no SERVER_HELLO"),
@@ -1092,6 +1094,40 @@ struct Probe {
     probing: Arc<AtomicBool>,
 }
 
+/// What the server sent on a new QUIC connection, counted when its handshake completed: for
+/// telling a hello that never came because something blocks the connection (deep packet
+/// inspection: after the handshake no packet gets through any more) from one that is only
+/// slow (a lossy, long path: at 20 % loss a lost packet of the hello exchange waits for QUIC's
+/// probe timeout, doubled for each further loss, and 5 s go by while the server's packets
+/// keep arriving). Only the first is a fact about the network that path memory should keep:
+/// recorded, it left QUIC out of the next races on that network for a minute, and the
+/// sessions on TLS, whose congestion control collapses at that loss (16.8 s for a Ctrl-C).
+struct Answers(Option<(quinn::Connection, u64)>);
+
+/// See [`Answers::hello_timeout`].
+const ANSWERS_SLOW: u64 = 2;
+
+impl Answers {
+    fn of(connection: &Connection) -> Answers {
+        Answers(
+            connection
+                .quic_connection()
+                .map(|q| (q.clone(), q.stats().udp_rx.datagrams)),
+        )
+    }
+
+    /// The kind of a hello that did not come in time: `Hello` (blocked), unless this is QUIC
+    /// and the server's packets kept arriving after the handshake (only slow: `Other`). More
+    /// than [`ANSWERS_SLOW`] of them: the packet confirming the handshake may still slip
+    /// through a box that blocks the flow from then on.
+    fn hello_timeout(&self) -> FailureKind {
+        match &self.0 {
+            Some((q, before)) if q.stats().udp_rx.datagrams > before + ANSWERS_SLOW => FailureKind::Other,
+            _ => FailureKind::Hello,
+        }
+    }
+}
+
 impl Probe {
     async fn run(self, transport: Transport, remembered: Option<u16>) {
         log::debug(format_args!("probing {transport} in the background"));
@@ -1109,6 +1145,7 @@ impl Probe {
                     }
                 }
                 RaceEvent::Connected(won) => {
+                    let answers = Answers::of(&won.connection);
                     match tokio::time::timeout(ATTACH_TIMEOUT, Conn::hello_offering(won.connection, self.ctx.offer))
                         .await
                     {
@@ -1122,8 +1159,11 @@ impl Probe {
                             log::debug(format_args!("probe of {transport}: {e}"));
                         }
                         Err(_) => {
-                            record_attempt(won.attempt, FailureKind::Hello.as_str());
-                            outcome = Err(FailureKind::Hello);
+                            let kind = answers.hello_timeout();
+                            record_attempt(won.attempt, kind.as_str());
+                            if kind.recorded() || matches!(outcome, Err(k) if !k.recorded()) {
+                                outcome = Err(kind);
+                            }
                         }
                     }
                 }

@@ -75,6 +75,10 @@ milestones and were not released; their changes are listed here.
 - On a lossy link a lost QUIC handshake packet could let TLS win the race, and QUIC's late
   answer was thrown away: sessions stayed on TLS and lost QUIC's roaming and keepalive learning.
   A better transport that answers late now takes the sessions over.
+- On a very lossy path a slow QUIC hello was recorded as a blocking middlebox, so later
+  connections stayed on TLS (which stalls badly under loss): a hello timeout now counts as
+  blocked only when the server's packets stop arriving.
+- Compression starts with the first output instead of after the first rate sample.
 - `qsh install` no longer falls back to plain http, and it checks the release signature.
 
 ### Security

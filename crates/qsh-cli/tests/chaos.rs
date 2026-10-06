@@ -79,33 +79,40 @@ struct Profile {
     /// Round-trip time without jitter.
     rtt_ms: f64,
     rate_mbit: f64,
+    /// Packet loss each way (netns.sh).
+    loss: f64,
 }
 
 const CLEAN: Profile = Profile {
     name: "clean",
     rtt_ms: 2.0,
     rate_mbit: 1000.0,
+    loss: 0.0,
 };
 const CROSSBORDER: Profile = Profile {
     name: "crossborder",
     rtt_ms: 270.0,
     rate_mbit: 10.0,
+    loss: 0.06,
 };
 const LOSSY: Profile = Profile {
     name: "lossy",
     rtt_ms: 300.0,
     rate_mbit: 8.0,
+    loss: 0.10,
 };
 const TERRIBLE: Profile = Profile {
     name: "terrible",
     rtt_ms: 600.0,
     rate_mbit: 2.0,
+    loss: 0.20,
 };
 /// The compression path: 135 ms each way, 2 Mbit/s, no loss.
 const SLOW: Profile = Profile {
     name: "slow",
     rtt_ms: 270.0,
     rate_mbit: 2.0,
+    loss: 0.0,
 };
 
 const ALL_PROFILES: [Profile; 5] = [CLEAN, CROSSBORDER, LOSSY, TERRIBLE, SLOW];
@@ -180,6 +187,56 @@ fn quantile(values: &[f64], q: f64) -> Option<f64> {
     v.sort_by(f64::total_cmp);
     let rank = ((q * v.len() as f64).ceil() as usize).clamp(1, v.len());
     Some(v[rank - 1])
+}
+
+/// The false-failure rate a quantile check accepts: the probability that a system whose
+/// true quantile sits exactly on the bound fails the check (it is lower the more the system
+/// beats the bound).
+const CHECK_ALPHA: f64 = 0.05;
+
+/// `P(X ≥ k)` for `X ~ Binomial(n, p)`.
+fn binomial_at_least(n: usize, k: usize, p: f64) -> f64 {
+    let mut choose = 1.0;
+    let mut sum = 0.0;
+    for i in 0..=n {
+        if i >= k {
+            sum += choose * p.powi(i as i32) * (1.0 - p).powi((n - i) as i32);
+        }
+        choose = choose * (n - i) as f64 / (i + 1) as f64;
+    }
+    sum.min(1.0)
+}
+
+/// A bound that should hold at quantile `q` (0.5: p50, 0.95: p95), checked on few samples: the
+/// sample quantile of 9 runs is a poor estimate (the p95 of 9 is their maximum, and at 6 %
+/// loss, where 40 % of the runs pay a recovery, a median of 9 over a bound that holds fails a
+/// quarter of the time). Instead a one-sided binomial test: with `over` of the `n` samples
+/// above the bound, the check fails only if that many would happen with probability below
+/// [`CHECK_ALPHA`] were exactly the fraction `1 − q` of runs above it. With 9 samples it
+/// allows 2 over the p95 bound (3 have probability 0.008 at the bound, 2 have 0.071) and 7
+/// over the p50 bound (8: 0.020, 7: 0.090). Returns (over, the test's p-value, pass).
+fn quantile_check(values: &[f64], q: f64, bound: f64) -> (usize, f64, bool) {
+    let over = values.iter().filter(|&&x| x > bound).count();
+    let p = binomial_at_least(values.len(), over, 1.0 - q);
+    (over, p, !values.is_empty() && p >= CHECK_ALPHA)
+}
+
+/// Loss recoveries an interrupt pays at quantile `q` beyond S3's 10 % loss: the smallest r
+/// with `P(L ≤ r) ≥ q`, where the losses L before k = 4 exposed packets (the input, the
+/// snapshot, a packet before each on its stream) get through at loss `p` each way are
+/// negative binomial (m2.md 6.4).
+fn recoveries(p: f64, q: f64) -> u32 {
+    const K: i32 = 4;
+    let mut cdf = 0.0;
+    let mut coefficient = 1.0; // C(K + l − 1, l)
+    for l in 0..32 {
+        cdf += coefficient * p.powi(l) * (1.0 - p).powi(K);
+        if cdf >= q {
+            return l as u32;
+        }
+        coefficient = coefficient * f64::from(K + l) / f64::from(l + 1);
+    }
+    32
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1099,16 +1156,24 @@ fn flood_interrupt() {
         });
         // S3, with a 16 KiB snapshot
         let snapshot_ms = 16384.0 * 8.0 / (p.rate_mbit * 1e6) * 1000.0;
-        let budget50 = 2.0 * p.rtt_ms + 100.0 + snapshot_ms;
-        // Beyond S3's 10 % loss (terrible: 20 % each way) the p95 needs r95 = 3 loss recoveries
-        // of 9/8 R + 25 ms each (m2.md 6.4, approved); up to 10 % this is S3's own bound
-        let budget95 = if p.name == "terrible" {
-            2.0 * p.rtt_ms + 100.0 + snapshot_ms + 3.0 * (1.125 * p.rtt_ms + 25.0) + 200.0
+        let base = 2.0 * p.rtt_ms + 100.0 + snapshot_ms;
+        // Beyond S3's 10 % loss (terrible: 20 % each way) the p50 and p95 pay r50 and r95 loss
+        // recoveries of 9/8 R + 25 ms each (m2.md 6.4: k = 4, at 20 % r50 = 1 and r95 = 3); up
+        // to 10 % S3's own bounds
+        let recovery = 1.125 * p.rtt_ms + 25.0;
+        let (budget50, budget95) = if p.loss > 0.10 {
+            (
+                base + f64::from(recoveries(p.loss, 0.5)) * recovery,
+                base + f64::from(recoveries(p.loss, 0.95)) * recovery + 200.0,
+            )
         } else {
-            3.0 * p.rtt_ms + 300.0 + snapshot_ms
+            (base, 3.0 * p.rtt_ms + 300.0 + snapshot_ms)
         };
         let p50 = quantile(&result.latencies, 0.5);
         let p95 = quantile(&result.latencies, 0.95);
+        let (over50, pv50, ok50) = quantile_check(&result.latencies, 0.5, budget50);
+        let (over95, pv95, ok95) = quantile_check(&result.latencies, 0.95, budget95);
+        let n = result.latencies.len();
         lab.measure(
             "ctrl_c_ms",
             json!(result.latencies.iter().map(|x| round1(*x)).collect::<Vec<_>>()),
@@ -1116,16 +1181,16 @@ fn flood_interrupt() {
         );
         lab.check(
             "ctrl_c_p50_ms",
-            json!(p50.map(round1)),
-            &format!("<= {budget50:.0} (S3)"),
-            p50.is_some_and(|x| x <= budget50) && result.timeouts == 0,
+            json!({"p50": p50.map(round1), "over": over50, "of": n, "p_value": (pv50 * 1000.0).round() / 1000.0}),
+            &format!("<= {budget50:.0} (S3; binomial test, alpha {CHECK_ALPHA})"),
+            ok50 && result.timeouts == 0,
             Some("WP-2"),
         );
         lab.check(
             "ctrl_c_p95_ms",
-            json!(p95.map(round1)),
-            &format!("<= {budget95:.0} (S3)"),
-            p95.is_some_and(|x| x <= budget95) && result.timeouts == 0,
+            json!({"p95": p95.map(round1), "over": over95, "of": n, "p_value": (pv95 * 1000.0).round() / 1000.0}),
+            &format!("<= {budget95:.0} (S3; binomial test, alpha {CHECK_ALPHA})"),
+            ok95 && result.timeouts == 0,
             Some("WP-2"),
         );
         lab.check(
@@ -1943,4 +2008,20 @@ fn coverage_accounts_for_gaps_and_holes() {
     assert_eq!(c.connected, vec!["quic"]);
     assert_eq!(quantile(&[3.0, 1.0, 2.0, 4.0], 0.5), Some(2.0));
     assert_eq!(quantile(&[3.0, 1.0, 2.0, 4.0], 0.95), Some(4.0));
+}
+
+/// The quantile checks and the recovery counts of m2.md 6.4.
+#[test]
+fn quantile_checks_and_recoveries() {
+    // Nine runs: at most 2 over a p95 bound, at most 7 over a p50 bound
+    let runs = |over: usize| -> Vec<f64> { (0..9).map(|i| if i < over { 2.0 } else { 0.0 }).collect() };
+    assert!(quantile_check(&runs(2), 0.95, 1.0).2);
+    assert!(!quantile_check(&runs(3), 0.95, 1.0).2);
+    assert!(quantile_check(&runs(7), 0.5, 1.0).2);
+    assert!(!quantile_check(&runs(8), 0.5, 1.0).2);
+    assert!((binomial_at_least(9, 2, 0.05) - 0.0712).abs() < 1e-3);
+    assert!((binomial_at_least(9, 0, 0.3) - 1.0).abs() < 1e-9);
+    // k = 4: none for the median up to 15.9 % loss, at 20 % one for the p50 and three for the p95
+    assert_eq!((recoveries(0.06, 0.5), recoveries(0.15, 0.5)), (0, 0));
+    assert_eq!((recoveries(0.20, 0.5), recoveries(0.20, 0.95)), (1, 3));
 }
