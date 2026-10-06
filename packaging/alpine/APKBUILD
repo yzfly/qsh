@@ -5,7 +5,7 @@
 # The cargo feature self-install (downloads release binaries at runtime) is off by default and
 # stays off.
 pkgname=qsh
-pkgver=0.2.0
+pkgver=0.5.0
 pkgrel=0
 pkgdesc="Remote shell over QUIC whose sessions survive network changes"
 url="https://github.com/yzfly/qsh"
@@ -80,5 +80,5 @@ server_openrc() {
 }
 
 sha512sums="
-373cca21814f5e26aaad9fab02ae1b30ead4e107eee6d1c7f8e201ce54a0f615804eefeb78748c86f7211e0ad597fdad918d2f6af3ea9411f6aa2742de87b78a  qsh-0.2.0.tar.gz
+b37803a1caa634802c462ae731e5ea63ef84cd9582dd2b9a37f198f5896b8891aa1c89405c47d72cb69b1d558b8fae4bfe9cf95b0e6ce6d17698a9f833219ec1  qsh-0.5.0.tar.gz
 "

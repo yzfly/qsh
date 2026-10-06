@@ -7,8 +7,8 @@
 class Qsh < Formula
   desc "Remote shell over QUIC whose sessions survive network changes"
   homepage "https://github.com/yzfly/qsh"
-  url "https://github.com/yzfly/qsh/archive/refs/tags/v0.2.0.tar.gz"
-  sha256 "48bffc66548c16c2f2c2b45c6ad2b020cbcc199d690dea73ab1df57e7bbcdca3"
+  url "https://github.com/yzfly/qsh/archive/refs/tags/v0.5.0.tar.gz"
+  sha256 "24ccb936407180414d721bb0a0aa12541303b0b12d40de72894f416b2c4a32ee"
   license any_of: ["MIT", "Apache-2.0"]
   head "https://github.com/yzfly/qsh.git", branch: "main"
 

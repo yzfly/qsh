@@ -81,3 +81,13 @@
   - [ ] 本地测试流程：忽略 fail2ban 动态集合；/tmp 下的测试目录被升级目录检查拒绝（CI 里通过）；nat ka 本地读不到
   - [ ] 打包：Debian testing / unstable 仓库 crate 构建因新依赖（vt100 0.16、ruzstd）失败 → 发行版构建的特性开关
   - [x] CI 通过：9 个发行版端到端、发版流水线试跑（6 平台 + 签名）、混沌里原地升级（0.0.1 → 0.5.0 同 pid）
+
+## 0.5.0 发布（2026-10-07）
+
+- [x] M2 完成，0.5.0 公开发布：https://github.com/yzfly/qsh/releases/tag/v0.5.0（15 个资产，SHA256SUMS 有 minisign 签名，构建来源证明可验证）；仓库已恢复公开
+- [x] 发布关卡：本地 `scripts/local-test.sh --chaos` 40/40（每个网络条件 15 次），CI 全绿（Linux、macOS、MSRV、deny、9 个模糊测试目标、9 个发行版、打包、混沌、发版试跑）
+- [x] 新用户实测：一行命令 `--require-signature` 安装，签名验证通过，版本 0.5.0
+- [ ] 待用户处理：GitHub 账号 Actions 付款失败或超出支出上限（私有期间额度用完）；仓库公开后 Actions 免费，不影响后续
+- [ ] 待用户决定的对外动作：AUR 上传、Homebrew tap、Debian ITP、Fedora 包审核（技术上已就绪：Fedora rawhide 和 Debian testing 均可只用官方仓库 crate 构建）
+- [ ] 对比基准（qsh vs ssh vs mosh）写进 README 前，测量方法和措辞先给用户过目
+- [ ] CI 上那一次「极差网络下首个提示符没出现」仍未复现，已加 -vv 日志和状态快照，下次出现即可定位

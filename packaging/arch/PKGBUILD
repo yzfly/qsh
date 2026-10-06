@@ -6,7 +6,7 @@
 # self-install (downloads release binaries at runtime) is off by default and stays off.
 
 pkgname=qsh
-pkgver=0.2.0
+pkgver=0.5.0
 pkgrel=1
 pkgdesc='Remote shell over QUIC whose sessions survive network changes'
 arch=('x86_64' 'aarch64' 'armv7h' 'riscv64')
@@ -20,7 +20,7 @@ optdepends=('openssh: to start sessions (qsh bootstraps over ssh)')
 options=('!lto')
 backup=('etc/ufw/applications.d/qsh')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
-sha256sums=('48bffc66548c16c2f2c2b45c6ad2b020cbcc199d690dea73ab1df57e7bbcdca3')
+sha256sums=('24ccb936407180414d721bb0a0aa12541303b0b12d40de72894f416b2c4a32ee')
 
 prepare() {
 	cd "$pkgname-$pkgver"

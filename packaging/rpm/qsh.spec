@@ -14,7 +14,7 @@
 %bcond vendor 0
 
 Name:           qsh
-Version:        0.2.0
+Version:        0.5.0
 Release:        %autorelease
 Summary:        Remote shell over QUIC whose sessions survive network changes
 
