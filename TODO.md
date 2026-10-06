@@ -35,9 +35,9 @@
 ## M2 实现（按 docs/m2.md §13 工作包）
 
 - [x] WP-0 接口：拆分 client（conn / pool / session）、SNAPSHOT / OUTPUT_ZSTD 编解码与 zstd 帧头检查、RESTART、bootstrap extra_ports、M2 配置项、QSH_TRANSCRIPT 测试钩子、服务端输出钩子
-- [ ] WP-1 客户端：路径记忆、NAT 保活学习、备用端口、后台重探与切到更好的传输
-- [ ] WP-4 服务端：备用端口、daemon 原地升级不丢会话、socket 缓冲、TLS 上的 BBR
-- [ ] WP-5 混沌测试与对比基准（GitHub Actions 里 netns + netem）
+- [x] WP-1 客户端：路径记忆、NAT 保活学习、备用端口、后台重探与切到更好的传输
+- [x] WP-4 服务端：备用端口、daemon 原地升级不丢会话、socket 缓冲、TLS 上的 BBR
+- [x] WP-5 混沌测试与对比基准（CI 手动触发；本地 `scripts/local-test.sh --chaos`）
 - [ ] WP-2 智能追帧（vt100 画面模型 + SNAPSHOT）与 zstd 压缩 → 0.4.0
 - [ ] WP-3 `doctor` / `tune`（按发行版）→ 0.5.0
 - [x] 只用发行版自带 crate 构建：Fedora rawhide、Debian testing 通过（CI 必过项）；Debian unstable 卡在上游 synstructure 迁移，等 Rust 团队
@@ -45,5 +45,8 @@
 ## 2026-10-06 用户要求
 
 - [x] 0.5.0 做完之前不公开发布，不要把有 bug 的代码公开：仓库已改回私有（0 star / fork）；0.3.0、0.4.0 只在 main 上完成和验证，不打 tag；0.5.0 全部测试通过后再公开并发版
-- [ ] 在本地做详尽测试：`scripts/local-test.sh`（全量测试 + 本地无 root 的真实 sshd 端到端 + sudo 网络命名空间里的本地混沌测试，严格隔离、不动宿主网络）；CI 改为 push 只跑 Linux，其余手动触发、发版前跑一轮
+- [x] 在本地做详尽测试（`scripts/local-test.sh`，34 项，约 5 分钟；能复现修复前的大文件卡住 bug）：`scripts/local-test.sh`（全量测试 + 本地无 root 的真实 sshd 端到端 + sudo 网络命名空间里的本地混沌测试，严格隔离、不动宿主网络）；CI 改为 push 只跑 Linux，其余手动触发、发版前跑一轮
 - [x] 清理磁盘：2.9G → 19G 空闲（TokenSSH 38 个干净的旧 agent 工作树、mingjian 的构建产物）
+- [x] 0.3.0（未发布，main 47b3763）：管道会话流控死锁修复（大文件双向传输卡住）、UDP 被封后重新接回直接走 TLS
+- [ ] 观察：crossborder 下 UDP 中途被封 11.1 s 恢复，离 12 s 上限太近，WP-2 后再看能否更快发现死路
+- [ ] 待定：`qsh-server stop` 后已连接的客户端退出码是 1（ssh 断开是 255），发 0.5.0 前统一核对退出码表
