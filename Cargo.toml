@@ -8,7 +8,7 @@ default-members = ["crates/qsh-core", "crates/qsh-cli"]
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 # quinn 0.11.11 needs 1.85; that is also the rustc of Debian 13 (trixie)
 rust-version = "1.85"

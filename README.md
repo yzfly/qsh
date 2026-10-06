@@ -56,7 +56,7 @@ read it first? It is [scripts/install.sh](scripts/install.sh).
 
 ```sh
 cargo install --locked qsh-cli                          # qsh and qsh-server
-cargo install --locked qsh-cli --features self-install  # plus `qsh install HOST`
+cargo install --locked qsh-cli --features self-install  # plus `qsh install HOST` (M1)
 ```
 
 **Packages**: `.deb`, `.rpm` and `.apk` packages are attached to every
@@ -84,9 +84,15 @@ qsh -p 2222 alice@10.0.0.5      # ssh's options work: -p -l -i -J -F -o -4 -6 -v
 qsh myserver -- htop            # run a command in a session
 ```
 
-The server needs `qsh-server`, nothing else: no root, no daemon to enable, no config file. The
-first time you connect to a host without it, qsh offers to install it into `~/.local/bin` there
-(or install it yourself: `qsh install myserver`, or the install script with `--server-only`).
+The server needs `qsh-server`, nothing else: no root, no daemon to enable, no config file. Install
+it into `~/.local/bin` on the host with the same script:
+
+```sh
+ssh myserver 'curl -fsSL https://github.com/yzfly/qsh/releases/latest/download/install.sh | sh -s -- --server-only'
+```
+
+When a host does not have it, qsh says so and prints that command. From M1, `qsh` offers to
+install it for you the first time (`qsh install myserver`).
 
 qsh listens on the first free UDP and TCP port from 60443–60542 on the server. If a firewall
 blocks them, qsh still works: it falls back to TLS over TCP, then to a pipe through ssh itself.

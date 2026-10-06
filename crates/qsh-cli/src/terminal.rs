@@ -14,6 +14,9 @@ use tokio::sync::mpsc;
 
 use crate::escape::{Action, EscapeFilter, HELP};
 
+/// The install script of the latest release, which `--server-only` turns into a server install.
+const INSTALL_URL: &str = "https://github.com/yzfly/qsh/releases/latest/download/install.sh";
+
 /// Tell the user about a lost connection only when it stays lost this long.
 const OUTAGE_NOTICE_AFTER: Duration = Duration::from_secs(3);
 
@@ -229,7 +232,10 @@ pub async fn run(mut config: ClientConfig, verbose: bool) -> i32 {
             client::EXIT_ERROR
         }
         Ok(Err(ClientError::NoServer)) => {
-            eprintln!("qsh: qsh-server is not installed on {host}; run: qsh install {host}");
+            eprintln!(
+                "qsh: qsh-server is not installed on {host}; install it there (no root needed) with:\n  \
+                 ssh {host} 'curl -fsSL {INSTALL_URL} | sh -s -- --server-only'"
+            );
             client::EXIT_NO_SERVER
         }
         // ssh told the user what went wrong

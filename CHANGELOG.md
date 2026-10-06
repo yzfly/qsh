@@ -11,6 +11,15 @@ needs a section `## [X.Y.Z] - YYYY-MM-DD` here before its tag is pushed.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-06
+
+### Fixed
+
+- When a host has no `qsh-server`, qsh printed `run: qsh install HOST`, a command that comes
+  only in M1. It now prints a command that works today:
+  `ssh HOST 'curl -fsSL https://github.com/yzfly/qsh/releases/latest/download/install.sh | sh -s -- --server-only'`.
+  The install script and the READMEs say the same.
+
 ## [0.1.0] - 2026-10-06
 
 The first preview. The protocol and command line may still change before 1.0.
@@ -39,5 +48,6 @@ The first preview. The protocol and command line may still change before 1.0.
   Linux 9, Alpine, Arch, openSUSE Tumbleweed and Amazon Linux 2023, with UDP blocked and with
   only ssh reachable.
 
-[Unreleased]: https://github.com/yzfly/qsh/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/yzfly/qsh/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/yzfly/qsh/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/yzfly/qsh/releases/tag/v0.1.0

@@ -257,7 +257,7 @@ main() {
         say "    export PATH=\"$bindir:\$PATH\""
     fi
     if [ "$server_only" != 1 ]; then
-        say "done: try 'qsh HOST' (qsh offers to install qsh-server on HOST the first time)"
+        say "done: try 'qsh HOST'; HOST needs qsh-server too: run this script there with --server-only"
     fi
 }
 

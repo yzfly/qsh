@@ -1,6 +1,6 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH qsh 1  "qsh 0.1.0" 
+.TH qsh 1  "qsh 0.1.1" 
 .SH NAME
 qsh \- Remote shell over QUIC: sessions survive network changes, sleep and roaming
 .SH SYNOPSIS
@@ -53,7 +53,7 @@ Escapes (after Enter): ~. end the session, ~d detach, ~s status, ~? help, ~~ a l
 Exit status: the remote program\*(Aqs status (128 + N when it was killed by signal N); 255 when
 qsh or ssh failed; 42 when the host has no qsh\-server.
 .SH VERSION
-v0.1.0
+v0.1.1
 .SH ESCAPES
 Typed right after Enter, as with
 .BR ssh (1):

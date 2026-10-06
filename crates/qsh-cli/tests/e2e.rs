@@ -64,7 +64,7 @@ fn a_host_without_qsh_server_exits_42_with_a_hint() {
     assert_eq!(out.status.code(), Some(42));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("qsh-server is not installed on nosrv; run: qsh install nosrv"),
+        stderr.contains("qsh-server is not installed on nosrv") && stderr.contains("ssh nosrv 'curl -fsSL https://github.com/yzfly/qsh/releases/latest/download/install.sh | sh -s -- --server-only'"),
         "{stderr}"
     );
     // ssh failing itself is 255

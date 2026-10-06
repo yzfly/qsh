@@ -54,7 +54,7 @@ curl -fsSL https://github.com/yzfly/qsh/releases/latest/download/install.sh | sh
 
 ```sh
 cargo install --locked qsh-cli                          # qsh 和 qsh-server
-cargo install --locked qsh-cli --features self-install  # 再加上 `qsh install HOST`
+cargo install --locked qsh-cli --features self-install  # 再加上 `qsh install HOST`（M1）
 ```
 
 **软件包**：每个[发布](https://github.com/yzfly/qsh/releases)都附带 `.deb`、`.rpm` 和 `.apk`。
@@ -82,9 +82,14 @@ qsh -p 2222 alice@10.0.0.5      # ssh 的选项照样可用：-p -l -i -J -F -o 
 qsh myserver -- htop            # 在会话里运行一个命令
 ```
 
-服务器上只需要 `qsh-server`：不要 root，不用启用守护进程，没有配置文件。第一次连接一台还没有
-它的主机时，qsh 会提议把它装到那台主机的 `~/.local/bin`（也可以自己装：`qsh install myserver`，
-或者用安装脚本加 `--server-only`）。
+服务器上只需要 `qsh-server`：不要 root，不用启用守护进程，没有配置文件。用同一个脚本把它装到那台
+主机的 `~/.local/bin`：
+
+```sh
+ssh myserver 'curl -fsSL https://github.com/yzfly/qsh/releases/latest/download/install.sh | sh -s -- --server-only'
+```
+
+主机上没有它时，qsh 会提示并给出这条命令。从 M1 起，第一次连接时 `qsh` 会直接提议替你安装（`qsh install myserver`）。
 
 qsh 在服务器上监听 60443–60542 中第一个空闲的 UDP 和 TCP 端口。即使防火墙挡住了它们，qsh
 仍然可用：先退到 TCP 上的 TLS，再退到经由 ssh 本身的管道。`qsh doctor myserver`
