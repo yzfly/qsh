@@ -281,11 +281,30 @@ already has what qsh protects there. What matters is what it can do to the clien
   checks each zstd frame's header before decompressing: one single-segment frame with a declared
   content size of at most 64 KiB, no dictionary, nothing after it; the decoder stops at the
   declared size. Memory per message is therefore bounded by a 64 KiB window and 64 KiB of output
-  whatever the frame claims, and the decoder (`ruzstd`) is written in Rust.
+  whatever the frame claims.
+- **Our own zstd decoder.** The bound above holds only if the decoder checks every copy it
+  makes, and the available pure-Rust decoder (`ruzstd`) does not: it limits neither what one
+  sequence nor what one block produces, so a message of a few kilobytes could make it allocate
+  gigabytes before any size check. qsh therefore decodes with its own decoder
+  (`qsh-core/src/codec/decode.rs`, RFC 8878 sections 3 and 4, about 800 lines of Rust without
+  `unsafe`), restricted to the frames protocol §7.12 allows. Its bounds: the header is checked
+  before anything else; every literal copy and every match is checked against the declared
+  content size before it is made; a block larger than the window (the declared size) is
+  refused; it allocates at most the declared size (≤ 64 KiB) plus one block's literals, and its
+  tables have fixed sizes; work per message is linear in the frame and the output. It is tested
+  with libzstd 1.5.5 frames of every level and block and literal type, and fuzzed in CI
+  (`zstd_frame`): no panic on any input, exactly the declared size for whatever it accepts, the
+  same bytes as `ruzstd` where both accept (run only on frames ours accepted, so the reference
+  stays bounded too), and a round trip of our own frames. `ruzstd` is used only as the server's
+  encoder, on output the server itself produced. A build without the cargo feature `zstd` has
+  neither and never negotiates compression.
 - **Snapshots** are terminal bytes like any output and reach the terminal the same way; a
   hostile server could send the same bytes as OUTPUT. A correct server builds them from a screen
   model with a fixed set of sequences (protocol §7.8.4), so that a snapshot never replays
-  queries, clipboard writes or resets the program once sent; a client MAY enforce that profile. The client keeps at most 1 MiB of
+  queries, clipboard writes or resets the program once sent; a client MAY enforce that profile
+  (qsh does, before writing any of a snapshot). A client that refuses a snapshot stops
+  accepting snapshots for that session (protocol §7.8.4), so a hostile server or a buggy
+  encoder costs one reconnect, not a loop. The client keeps at most 1 MiB of
   the bootstrap's output while it keeps draining ssh's stdout to the end (protocol §10.4), does
   all offset arithmetic checked and rejects attach offsets beyond what it sent (protocol §7.3),
   and resets with UNKNOWN_CHANNEL any stream the server opens without a negotiated reason
@@ -397,7 +416,8 @@ audit logs. `qsh-server tune --apply` is the only part of qsh that changes anyth
 | Per-user daemon, no root | §4.3 here | privilege escalation; cross-user access |
 | Socket peer credential checks on both ends, `lstat` of the runtime directory by every user of it, explicit 0700/0600 modes | §4.3 here | other local users reaching the daemon, or posing as it to local clients |
 | Session environment built from a fixed list | protocol §10.3 | stale ssh agent sockets and connection variables leaking into sessions |
-| zstd frame header checked before decompression, 64 KiB bound, Rust decoder | protocol §7.12 | decompression bombs, decoder memory bugs on the client |
+| zstd frame header checked before decompression, 64 KiB bound checked on every copy by our own fuzzed Rust decoder | protocol §7.12, §4.6 here | decompression bombs, decoder memory bugs on the client |
+| Screen model faults contained (unwinding, `catch_unwind`): catch-up off for that session only | protocol §7.8.7, §7 here | a program's output crashing the daemon and every session |
 | Snapshots built from a model with a fixed profile | protocol §7.8.4 | replaying terminal queries (input injection), clipboard writes, resets |
 | Upgrade by exec in place: validated, probed executable; only listed descriptors inherited; encrypted state | §4.8 here | sessions lost or hijacked during upgrades; key material on disk |
 | Path memory hashed, bounded, advisory | §4.4 here | location history in clear; a corrupt file blocking connections |
@@ -473,7 +493,16 @@ daemon's private key):
   lines); they exist only up to 262 144 cells (larger terminals get none), so a client cannot
   make the daemon allocate a model for an absurd size. Feeding the model costs CPU per byte of
   output, which the program itself produces (the user's own load). Compression happens only
-  below 4 MiB/s of delivery rate.
+  below 4 MiB/s of path rate (protocol §7.12).
+- **Faults in the screen model.** The model is a terminal emulator fed with whatever the
+  session's program writes, which is attacker-controlled whenever the program shows untrusted
+  data (`cat` of a downloaded file, a log, a web page in a text browser). A bug there (a panic
+  in `vt100` or in our encoder) must not become a way to stop the daemon: a fault in the screen
+  model disables catch-up for that session only (protocol §7.8.7). Release builds unwind on
+  panic instead of aborting, and every call into the model, the snapshot encoder and the codec
+  runs under `catch_unwind`; the session's model is dropped and logged, the session continues
+  without snapshots (gap plus redraw), and the daemon and the other sessions are not affected.
+  The fuzz target `screen_model` runs in CI to find such bugs before users do.
 - **Decompression** on the client is bounded per message (protocol §7.12).
 
 ## 8. Deployment guidance
@@ -513,6 +542,10 @@ daemon's private key):
   the daemon's memory. Clients see SESSION_UNKNOWN and start a new session. An upgrade of
   `qsh-server` keeps them (section 4.8), from the first version that implements upgrades on: the
   daemon that is replaced must already know how.
+- **Snapshots do not keep the invisible attribute** (SGR 8) in this implementation, whose screen
+  model does not track it (protocol §7.8.4): text a program drew invisible on the screen is
+  visible after a snapshot. Programs that hide secrets turn off echo instead, which is not
+  affected.
 - **Keystroke timing** is not obfuscated (OpenSSH has done so since 9.5). Planned.
 - **No post-quantum key exchange yet** with the ring provider; recorded traffic could be
   decrypted by a future quantum computer. qsh will enable X25519MLKEM768 when its crypto

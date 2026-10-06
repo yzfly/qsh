@@ -962,12 +962,22 @@ newly acknowledged offsets (minus skipped ranges inside them) divided by the tim
 previous accepted ACK, used only when output was waiting in the replay buffer during the whole
 interval (otherwise the sample measures the program, not the path); `T` is the maximum of the
 per-second averages of the samples of the last 10 s; before the first sample, `cwnd / srtt` of
-the QUIC connection, or 1 MiB/s on the mux layer. With `R` the smoothed round-trip time (QUIC's
-estimate, or PING over the mux layer, which the server then sends every 5 s while it streams
-output), the window is `clamp(1.25 × T × (R + 100 ms), 64 KiB, 8 MiB)` on a tty session and
-`max(2 × T × (R + 100 ms), 256 KiB)`, at most 8 MiB, on a pipe session. `T` is counted in
-output offsets (uncompressed bytes), so the window converts to the same time with and without
-compression (section 7.12).
+the QUIC connection, or 1 MiB/s on the mux layer. With `R` the connection's **minimum recent
+round-trip time** (below), the window is `clamp(1.25 × T × (R + 100 ms), 64 KiB, 8 MiB)` on a
+tty session and `max(2 × T × (R + 100 ms), 256 KiB)`, at most 8 MiB, on a pipe session. `T` is
+counted in output offsets (uncompressed bytes), so the window converts to the same time with
+and without compression (section 7.12).
+
+`R` is a decaying minimum of the connection's RTT samples: a sample below the current minimum
+replaces it, and so does any sample once the current minimum is 30 s old; 100 ms before the
+first sample. Samples: on QUIC, the QUIC stack's own RTT estimate, read whenever the server
+computes a window; on the mux layer (TLS, ssh pipe), the time from a server PING to its PONG
+(section 5.5), with PINGs at each attach and every 5 s while the connection has an attachment.
+`R` MUST NOT be the smoothed RTT: the window and the queue would feed each other. A window
+larger than the path holds builds a queue in the transport (over the mux layer the PING waits
+behind it too), the queue raises the smoothed RTT, which enlarges the window, which builds a
+longer queue, up to the 8 MiB cap, and an interrupt then waits behind all of it. The minimum is
+the path's delay without the queue the window itself causes, as in BBR's `min_rtt` filter.
 
 **Client, input.** The client keeps all unacknowledged input in its replay buffer, with a
 capacity of at least 64 KiB (default 1 MiB) and at most `MAX_INPUT_IN_FLIGHT` (section 7.4). It MUST NOT discard unacknowledged input: dropping
@@ -1064,22 +1074,36 @@ snapshot; the program redraws after the RESIZE it receives.
 of:
 
 - printable characters, UTF-8 encoded (no C0 control characters except CR and LF, no DEL, no C1
-  control characters, no invalid UTF-8), and CR LF line ends;
-- the escape sequences in the table below, with decimal parameters and nothing else (ESC is
-  0x1b, CSI is ESC `[`, OSC is ESC `]`, ST is ESC `\`).
+  control characters, no invalid UTF-8), and CR LF line ends: a CR is always followed by an LF,
+  and an LF always follows a CR;
+- the escape sequences in the table below and nothing else (ESC is 0x1b, CSI is ESC `[`, OSC is
+  ESC `]`, ST is ESC `\`). Parameters are decimal: each one is present and has 1 to 9 digits
+  (no empty parameters; the only empty parameter list allowed is SGR's, `CSI m`); no
+  intermediate bytes other than the `!` of DECSTR and the SP of DECSCUSR.
 
 | Sequence | Name | Purpose |
 |---|---|---|
-| `CSI ! p` | DECSTR, soft reset | the first sequence of every snapshot: resets the pen, cursor visibility, origin and insert modes, autowrap (on), cursor keys and keypad (normal), the scroll region, the saved cursor and the character sets, without clearing the screen or the scrollback |
-| `CSI ? 1049 h`, `CSI ? 1049 l` | alternate screen | switch screens (`h` also saves the cursor and clears the alternate screen) |
-| `CSI Pr ; Pc H` | CUP | position the cursor |
-| `CSI K` | EL | erase to the end of the line with the default background (only right after `CSI m`) |
-| `CSI Pm m` | SGR | parameters 0, 1, 2, 3, 4, 5, 7, 8, 9, 22 – 25, 27 – 29, 30 – 37, 39, 40 – 47, 49, 90 – 97, 100 – 107, `38;5;n`, `48;5;n`, `38;2;r;g;b`, `48;2;r;g;b`; an empty parameter list means 0 |
-| `CSI Pt ; Pb r` | DECSTBM | the scroll region |
+| `CSI ! p` | DECSTR, soft reset | the first sequence of every snapshot (`Data` starts with these 4 bytes): resets the pen, cursor visibility, origin and insert modes, autowrap (on), cursor keys and keypad (normal), the scroll region, the saved cursor and the character sets, without clearing the screen or the scrollback |
+| `CSI ? 1049 h`, `CSI ? 1049 l` | alternate screen | switch screens (`h` also saves the cursor and clears the alternate screen); 1049 is never combined with other modes in one sequence |
+| `CSI Pr ; Pc H` | CUP | position the cursor; both parameters present, each at least 1 |
+| `CSI K` | EL | erase to the end of the line with the default background; only while the pen is the default (below) |
+| `CSI Pm m` | SGR | parameters 0, 1, 2, 3, 4, 5, 7, 8, 9, 22 – 25, 27 – 29, 30 – 37, 39, 40 – 47, 49, 90 – 97, 100 – 107, `38;5;n`, `48;5;n`, `38;2;r;g;b`, `48;2;r;g;b` (n, r, g, b at most 255); an empty parameter list means 0 |
+| `CSI Pt ; Pb r` | DECSTBM | the scroll region; 1 ≤ `Pt` < `Pb` |
 | `CSI ? Pm ; … h`, `CSI ? Pm ; … l` with one or more Pm from 1, 9, 25, 1000, 1002, 1003, 1004, 1005, 1006, 1015, 2004 | DEC private modes (set / reset several at once) | application cursor keys (1), cursor visible (25), mouse tracking (9, 1000, 1002, 1003) and its encodings (1005, 1006, 1015), focus reporting (1004), bracketed paste (2004) |
 | `ESC =`, `ESC >` | DECKPAM, DECKPNM | application / normal keypad |
-| `OSC 1 ; text ST`, `OSC 2 ; text ST` | icon name, window title | `text`: at most 256 bytes of printable UTF-8 |
-| `CSI Ps SP q` with Ps 0 – 6 | DECSCUSR | cursor style (OPTIONAL) |
+| `OSC 1 ; text ST`, `OSC 2 ; text ST` | icon name, window title | `text`: at most 256 bytes of printable UTF-8 (no control characters, so no ESC inside) |
+| `CSI Ps SP q` with Ps 0 – 6 | DECSCUSR | cursor style (OPTIONAL); `Ps` present |
+
+**The default pen, for EL.** EL is allowed only while the pen is the default, so that it erases
+with the default background in every terminal (EL fills with the current background). The pen
+is the default from the DECSTR at the start until the first SGR sequence, and after any SGR
+sequence whose parameter list is empty or ends with the attribute 0 (`CSI m`, `CSI 0 m`,
+`CSI 31;0 m`; not a 0 that is the value of a `38` / `48` color, as in `CSI 38;5;0 m`); after any
+other SGR sequence it is not, even if its parameters happen to restore every default
+(`CSI 1;22 m`). So EL may follow text written since the start or since such an
+SGR directly: in appendix A.8, the EL after `$ ls` follows text written with the default pen
+(no SGR since DECSTR), and the EL after `a.txt` follows `CSI m`. A receiver that checks the
+profile tracks exactly this.
 
 A server MUST NOT put anything else into `Data`, and MUST build `Data` from its screen model,
 never by copying bytes of the program's output. In particular `Data` never contains a sequence
@@ -1090,15 +1114,34 @@ scrollback in many terminals).
 
 **What the snapshot reproduces.** The cells of the normal screen and, when the alternate screen
 is active, of the alternate screen too: characters including wide and combining characters,
-their SGR attributes (bold, faint, italic, underline, blink, inverse, invisible, strikethrough,
-foreground and background in the 16-color, 256-color and 24-bit forms), and line wrapping (a
-row that continues on the next row is written up to its last column and followed directly by
-the next row's cells, so the terminal's own wrapping joins them); which screen is active; the
-cursor position (of both screens: the normal screen's cursor is restored when the program
-leaves the alternate screen) and its visibility; the scroll region; the current SGR pen; the
-state of each DEC private mode of the table; the keypad mode; the window title and icon name;
-and, in a skip snapshot of the normal screen, up to 100 lines of the skipped output that
-scrolled off the screen (the *tail*), pushed into the terminal's scrollback.
+their SGR attributes (bold, faint, italic, underline, inverse, foreground and background in the
+16-color, 256-color and 24-bit forms; blink, invisible and strikethrough as far as the model
+keeps them, below), and line wrapping (a row that continues on the next row is written up to its
+last column and followed directly by the next row's cells, so the terminal's own wrapping joins
+them); which screen is active; the cursor position (of both screens: the normal screen's cursor
+is restored when the program leaves the alternate screen) and its visibility; the scroll region;
+the current SGR pen; the state of each DEC private mode of the table; the keypad mode; the
+window title and icon name; and, in a skip snapshot taken while the normal screen is active, up
+to 100 lines of the skipped output that scrolled off the screen (the *tail*), pushed into the
+terminal's scrollback.
+
+**Blink, invisible and strikethrough** (SGR 5, 8, 9 and their resets 25, 28, 29) are part of the
+profile: a receiver MUST accept them, and a server whose model keeps them SHOULD reproduce them.
+A server whose screen model does not keep them (the reference implementation's, built on the
+`vt100` crate) leaves them out: such cells are drawn without them, so text a program drew
+invisible becomes visible in the snapshot, and blinking or struck-through text is shown plain.
+The receiver cannot tell the difference and need not.
+
+**The tail.** The tail is for the user's reading, not an exact record: the server SHOULD NOT
+include lines the client already received before the skip (fewer lines are better than
+duplicated ones), and MAY therefore include fewer lines than actually scrolled off, for example
+when it counts line feeds rather than scrolls, or when the cursor's row at the start of the skip
+is not known (the reference implementation counts the line feeds on the normal screen since the
+first output chunk that ends at or after the client's expected offset, subtracts `Rows` − 1,
+and takes at most 100 of the newest lines that scrolled off its model). A client MUST NOT assume
+that the tail is complete, that it begins where the client's output ended, or that it has any
+particular number of lines; the skipped amount it reports is `Offset` − `S`, never derived
+from the tail.
 
 **What it does not reproduce**: the scrollback older than the tail (that is the gap), the saved
 cursor (DECSC), character set designations, origin mode, insert mode, tab stops, a pending
@@ -1111,17 +1154,32 @@ snapshot (section 7.7) to repair what the snapshot cannot express.
 
 1. `CSI ! p`.
 2. The normal screen: `CSI ? 1049 l`, then
-   - in a skip snapshot, the *scroll-push*: `CSI <Rows> ; 1 H`, CR LF, then each tail line
-     followed by `CSI m` and CR LF, then Rows − 1 times CR LF. This moves the previous screen
-     and the tail into the terminal's scrollback and leaves the screen blank, using only
-     scrolling, which every terminal keeps in its scrollback (erasing the display does not);
+   - in a skip snapshot taken while the normal screen is active, the *scroll-push*:
+     `CSI <Rows> ; 1 H`, CR LF, then each tail line followed by `CSI m` and CR LF, then
+     Rows − 1 times CR LF. This moves the previous screen and the tail into the terminal's
+     scrollback and leaves the screen blank, using only scrolling, which every terminal keeps
+     in its scrollback (erasing the display does not). A skip snapshot taken while the
+     alternate screen is active MUST NOT contain a scroll-push or a tail: step 2 starts with
+     the rows, as in a resync snapshot. (The user is looking at a full-screen program; under a
+     sustained flood a scroll-push in every snapshot would fill the scrollback with copies of
+     the unchanged normal screen. Lines that scrolled off the normal screen during such a skip
+     belong to the gap.);
    - then every row of the normal screen, top to bottom: `CSI <row> ; 1 H` (omitted when the
-     previous row wraps into this one), the cells with the SGR changes they need, `CSI m`, and
-     `CSI K` when the row ends in blank cells with default attributes (cells that are blank but
-     have a background color are written as spaces).
+     previous row wraps into this one), the cells with the SGR changes they need, `CSI m` if
+     the pen is not the default after the last cell, and `CSI K` when the row ends in blank
+     cells with default attributes (cells that are blank but have a background color are
+     written as spaces). Two refinements keep a terminal's leftover state from showing through:
+     a row the previous row wraps into gets at least one character, since the terminal wraps
+     only when a character is written (an EL at the pending wrap would erase the previous row's
+     last column instead); and a row written up to its last column that does not wrap MAY be
+     erased with `CSI K` first (right after its CUP, or after its first character when the
+     previous row wraps into it), which also clears a wrap flag the terminal may have kept for
+     that row from before.
 3. If the alternate screen is active: `CSI <r> ; <c> H` to the normal screen's cursor,
    `CSI ? 1049 h`, then every row of the alternate screen as in step 2.
-4. `CSI <top> ; <bottom> r` if the active screen's scroll region is not the whole screen.
+4. `CSI <top> ; <bottom> r` if the active screen's scroll region is not the whole screen and
+   has at least two rows (a region of one row, which a resize can leave behind, cannot be
+   expressed by DECSTBM and is left out).
 5. Every DEC private mode of the table except 1 and 25, set (`h`) or reset (`l`) explicitly
    (DECSTR does not reset them), the modes in each state MAY be combined in one sequence;
    mode 1 and the keypad only when they differ from DECSTR's defaults; then the window title and
@@ -1134,12 +1192,35 @@ lines in the scrollback.
 
 **Client processing.** The client removes whatever it drew itself (a status line), writes
 `Data` to the terminal unchanged, and passes it through whatever it uses to follow the
-terminal's state (for example which screen is active). Before a skip snapshot on the normal
-screen it SHOULD write one line of its own saying how many bytes were skipped; the scroll-push
-then moves that line into the scrollback, where it marks the gap. A client MAY check that
-`Data` follows this section; one that does buffers the whole snapshot (at most 1 MiB) and
-writes it only when it passes, and otherwise fails the channel with PROTOCOL_VIOLATION without
-writing any of it.
+terminal's state (for example which screen is active). Before a skip snapshot with a
+scroll-push (one that does not switch to the alternate screen) it SHOULD write one line of its
+own saying how many bytes were skipped; the scroll-push then moves that line into the
+scrollback, where it marks the gap. A client MAY check that `Data` follows the profile of this
+section (the characters and sequences allowed, DECSTR first, EL only with the default pen; the
+order is not checkable and is not checked); one that does buffers the whole snapshot (at most
+1 MiB) and writes it only when it passes, and otherwise fails the channel with
+PROTOCOL_VIOLATION without writing any of it.
+
+**After a refused snapshot.** A client that fails a channel because of a snapshot (it fails the
+profile check, its parts disagree or exceed `MAX_SNAPSHOT`, or a part's zstd frame is
+rejected) has met either a hostile server or a bug in the server's encoder, which would repeat
+on every attach and turn the reconnects into a loop. Such a client therefore:
+
+- MUST NOT set ACCEPT_SNAPSHOT on any later ATTACH of that session for as long as the client
+  process runs (an embedding application: as long as it keeps the session), and re-attaches
+  without it from its unchanged `received` (no part of the refused snapshot was written). It
+  then gets the output itself, or OUTPUT_GAP and a redraw, as a client without snapshots does;
+- SHOULD record the event where the user and a bug report can see it: its log at the level of
+  warnings, naming the session, the snapshot's `Offset` and the reason, and a counter in its
+  connection status;
+- SHOULD, when the rejected part was a zstd frame or when a compressed OUTPUT_ZSTD fails the
+  rules of section 7.12 (or the client's own decoder fails on it), also stop offering the `zstd`
+  capability on its later connections to that server for as long as the process runs, at the
+  latest after the second such failure, for the same reason.
+
+A server that receives such an ERROR (PROTOCOL_VIOLATION or FRAME_ERROR) on an attachment right
+after it sent a snapshot or compressed output SHOULD log it with the session id: it is the only
+trace of an encoder bug on the server side.
 
 #### 7.8.5 When a server sends a snapshot
 
@@ -1148,17 +1229,31 @@ RECOMMENDED (the reference implementation's rules; `U` = output not yet acknowle
 as in section 7.6):
 
 - **Backlog**: `U > max(2 s × T, 256 KiB)`, once the attachment has at least 1 s of delivery
-  rate samples (500 ms on QUIC).
+  rate samples (500 ms on QUIC), and subject to the hysteresis.
 - **Input**: the server accepts INPUT while `B > max(window, 64 KiB)`. It stops sending from
-  the backlog at once and takes the snapshot when the program's output pauses for 20 ms, or
-  after 100 ms, whichever comes first, so that the snapshot shows the program's reaction (an
-  interrupt, a key typed into a pager).
-- **Hysteresis**: no new snapshot before the previous one has been acknowledged (`Received` ≥
-  its `Offset`) and 1 s has passed.
+  the backlog at once and takes the snapshot when the program's output pauses for 20 ms
+  (measured from the input), or after 100 ms, whichever comes first, so that the snapshot shows
+  the program's reaction (an interrupt, a key typed into a pager). The input trigger is **not**
+  subject to the hysteresis nor to the sampling requirement: an interrupt typed right after a
+  backlog snapshot would otherwise wait for that snapshot's acknowledgement and up to a second,
+  far beyond the interrupt latency this mechanism exists for. One input episode gives at most
+  one snapshot; INPUT that arrives while the server already waits for the program's reaction
+  does not restart the wait.
+- **Hysteresis** (backlog trigger only): no new backlog snapshot before the previous snapshot
+  has been acknowledged (`Received` ≥ its `Offset`) and 1 s has passed since it was sent.
 
 The snapshot is taken at the replay buffer's current end `E` (`Offset` = `E`); the server then
 continues with OUTPUT from `E`. After a snapshot the server does not make the program redraw
-(except as said in section 7.8.4).
+(except as said in section 7.8.4). If no snapshot can be made (it would exceed `MAX_SNAPSHOT`,
+or the session lost its model, section 7.8.7), the server sends OUTPUT_GAP{`sent_end`, `E`}
+instead and makes the program redraw (section 7.7); for the hysteresis this counts as a
+snapshot at `E`.
+
+Output that falls out of the replay buffer before it was sent is skipped with OUTPUT_GAP at
+once, whatever is in flight (section 7.6); on an attachment that takes snapshots the server
+follows such a gap with a resync snapshot once it has sent the output after it (instead of
+making the program redraw, section 7.7). Resync snapshots (here and in section 7.8.6) are not
+subject to the hysteresis.
 
 #### 7.8.6 Attach
 
@@ -1169,8 +1264,22 @@ the first LF within the 4 096 bytes after it if there is one, or `C` = `end` if 
 screen is active at `end`. It sends OUTPUT_GAP{S, C} (if `C` > `S`), the output from `C` to
 `end`, and then a resync snapshot, instead of making the program redraw. This applies to FRESH
 attaches too: a new client process still receives the scrollback (section 7.2) when the path can
-carry it within the budget, and the newest part of it plus the exact screen when it cannot.
-Without snapshots the server behaves as section 7.3 says.
+carry it within the budget, and the newest part of it plus the exact screen when it cannot. An
+attach at LATEST (`S` = `end`) gets a resync snapshot right away instead of a redraw. Without
+snapshots the server behaves as section 7.3 says.
+
+#### 7.8.7 Faults in the screen model
+
+The screen model runs on output the program chose, and models of terminal emulators have bugs.
+A fault in the screen model, or in encoding a snapshot from it, MUST affect only that session's
+catch-up: the server drops the session's model and continues the session as one without a model
+(OUTPUT_GAP and a redraw where a snapshot would have been sent, section 7.7). It MUST NOT end
+the session, other sessions or the daemon. (The reference implementation is written in Rust;
+release builds unwind on panic, and every call into the model and the codec runs under
+`catch_unwind`.) The same holds for compression: a fault while compressing a message sends it
+uncompressed. A client treats a fault of its own decoder like a frame it cannot decode: it
+fails the channel or the connection and falls back as section 7.8.4 says after a refused
+snapshot or a rejected frame.
 
 ### 7.9 RESIZE (0x17)
 
@@ -1315,18 +1424,31 @@ uncompressed and compresses when it sends.
 4. after decompression, the frame's last block (and its content checksum, if the
    Content_Checksum_flag is set, which the receiver then verifies) ends exactly at the end of the
    payload, and exactly Frame_Content_Size bytes were produced. A decoder MUST stop as soon as
-   it would produce more.
+   it would produce more: every literal copy and every match is checked against the declared
+   size before it is made, and a block that would decode to more than the window
+   (Block_Maximum_Size, RFC 8878 section 3.1.1.2) is a violation. A decoder that checks the
+   size only after a block or after the frame does not meet this rule: the sequences of a single
+   block can ask for far more output than the block's limit, so a message of a few kilobytes
+   could make such a decoder produce gigabytes before any check.
 
 These rules bound what a receiver commits per message, whatever the sender does: a 64 KiB
 window, 64 KiB of output and the decoder's fixed tables. A message of a few bytes can therefore
 expand to at most 64 KiB, and the receiver's memory and CPU per message are bounded.
 
-**When to compress** (RECOMMENDED, the reference implementation's policy): when the
-attachment's delivery rate `T` (section 7.6) is below 4 MiB/s; when at least 512 bytes are
-ready (single keystroke echoes go out raw and at once), reading up to 64 KiB of backlog per
-message; while the recent frames of the stream compressed to less than 85 % of their size
-(otherwise stop, and try one chunk again after 1 MiB or 2 s); and only when the frame is at
-least 10 % smaller than the raw data. A sender MAY use any compression level.
+**When to compress** (RECOMMENDED, the reference implementation's policy): when the path's
+rate is below 4 MiB/s (`COMPRESS_BELOW`); when at least 512 bytes are ready (single keystroke
+echoes go out raw and at once), reading up to 64 KiB of backlog per message; while the recent
+frames of the stream compressed to less than 85 % of their size (otherwise stop, and try one
+chunk again after 1 MiB or 2 s); and only when the frame is at least 10 % smaller than the raw
+data. A sender MAY use any compression level.
+
+The **path's rate** is the rate at which the path carries the stream's bytes as sent, not the
+delivery rate `T` itself: `T` counts output offsets (uncompressed bytes, section 7.6), so
+compression raises it by the compression factor. While the stream is being compressed the
+path's rate is `T × ρ`, with `ρ` the moving average of compressed size / raw size of the recent
+frames (the same average that decides "compressible" above); while it is sent uncompressed it is
+`T`. Comparing `T` itself with the limit would make compression turn itself off on a slow path
+as soon as it worked (`T` rises above the limit) and back on when `T` fell again.
 
 ### 7.13 Session lifetime
 
@@ -2378,9 +2500,12 @@ The threat model, the assets and adversaries, and the reasoning behind each mech
   every offset and count, and never trust a peer's value as a size without a bound. Every parser
   in the reference implementation is fuzzed.
 - Compressed output is bounded before it is decompressed: one single-segment frame per message,
-  at most 64 KiB declared and produced (section 7.12). Snapshots are at most 1 MiB, built by the
-  server from its screen model with a fixed set of sequences that cannot make the client's
-  terminal answer, write the clipboard or reset it (section 7.8.4).
+  at most 64 KiB declared and produced, checked on every copy, not only per block (section
+  7.12). Snapshots are at most 1 MiB, built by the server from its screen model with a fixed set
+  of sequences that cannot make the client's terminal answer, write the clipboard or reset it
+  (section 7.8.4); a client that refuses one stops accepting snapshots for that session, so a
+  faulty encoder cannot cause a reconnect loop (section 7.8.4). A fault in the server's screen
+  model affects only that session's catch-up (section 7.8.7).
 - A daemon restart in place (section 10.6) keeps sessions and keys inside the process; the
   requirements on the state it carries across the exec are in security.md §4.8.
 
@@ -2612,6 +2737,9 @@ they follow section 7.8.4.
 1b 5b 33 3b 33 48          CSI 3 ; 3 H        the cursor
 ```
 
+Every EL here is written with the default pen (section 7.8.4): the one after `$ ls` follows text
+written since DECSTR with no SGR, the ones after `a.txt` and `$` follow `CSI m`.
+
 ### A.9 OUTPUT_ZSTD
 
 `hello\r\n` at offset 4 096, as a zstd frame with one raw block. Frame_Header_Descriptor 0x20:
@@ -2837,11 +2965,12 @@ detached-daemon requirement of section 10.4.
 | Snapshot tail | ≤ 100 lines | 7.8.4 |
 | Catch-up: backlog trigger (RECOMMENDED) | unacknowledged output > max(2 s × delivery rate, 256 KiB) | 7.8.5 |
 | Catch-up: input trigger settle (RECOMMENDED) | 20 ms of quiet output, at most 100 ms | 7.8.5 |
-| Catch-up: hysteresis (RECOMMENDED) | previous snapshot acknowledged and 1 s | 7.8.5 |
+| Catch-up: hysteresis (RECOMMENDED; backlog trigger only) | previous snapshot acknowledged and 1 s | 7.8.5 |
 | ACK cadence while streaming, with ACCEPT_SNAPSHOT (SHOULD) | 16 384 bytes or 50 ms | 7.5 |
 | Pacing window, tty session (RECOMMENDED) | clamp(1.25 × T × (R + 100 ms), 64 KiB, 8 MiB) | 7.6 |
+| Pacing `R` (RECOMMENDED) | minimum RTT, a sample older than 30 s replaced by the next; 100 ms before any; mux layer: server PING at attach and every 5 s | 7.6 |
 | zstd declared content size (`MAX_ZSTD_CONTENT`) | 1 – 65 536 bytes | 7.12 |
-| Compress below (RECOMMENDED) | 4 MiB/s delivery rate, chunks ≥ 512 bytes | 7.12 |
+| Compress below (RECOMMENDED, `COMPRESS_BELOW`) | 4 MiB/s path rate (T × compression ratio while compressing), chunks ≥ 512 bytes | 7.12 |
 | Extra ports announced | ≤ 8 | 10.4, 12.6 |
 | Direct race attempts at once (SHOULD NOT exceed) | 6 | 12.1 |
 | Stagger between ports of one transport | 300 ms | 12.1 |
