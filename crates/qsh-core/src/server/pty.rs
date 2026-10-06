@@ -731,10 +731,11 @@ mod tests {
     #[tokio::test]
     async fn a_pipe_session_is_byte_exact_with_stderr_apart() {
         let s = start(
-            "echo term=${TERM-none}; wc -c; od -An -tx1 </dev/null; echo oops >&2; exit 3",
+            "echo term=$(/usr/bin/env | grep -c ^TERM=); wc -c; od -An -tx1 </dev/null; echo oops >&2; exit 3",
             true,
         );
-        wait_output(&s, "term=none").await;
+        // Through env(1): macOS /bin/sh (bash) sets TERM=dumb in the shell itself when it is unset
+        wait_output(&s, "term=0").await;
         let mut input = vec![b'a'; 10000];
         input.extend_from_slice(b"\r\x03\x13\x04\n");
         s.write_input(input);
