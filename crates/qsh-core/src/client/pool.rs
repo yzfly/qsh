@@ -119,6 +119,8 @@ struct Ctx {
     generation: u64,
     /// The keepalive interval for this network now.
     keepalive: Duration,
+    /// The capabilities offered in the hello (m2.md 6, 7).
+    offer: super::conn::Offer,
 }
 
 impl Ctx {
@@ -430,6 +432,7 @@ impl Pool {
             network,
             generation: self.generation(),
             keepalive,
+            offer: super::conn::Offer::of(config),
         };
         match self.race(&planned, &ctx).await {
             Ok(c) => Ok((c, ctx)),
@@ -480,7 +483,7 @@ impl Pool {
                 RaceEvent::Connected(won) => *won,
             };
             let (attempt, handshake) = (won.attempt, won.handshake);
-            match tokio::time::timeout(ATTACH_TIMEOUT, Conn::hello(won.connection)).await {
+            match tokio::time::timeout(ATTACH_TIMEOUT, Conn::hello_offering(won.connection, ctx.offer)).await {
                 Ok(Ok(conn)) => {
                     log::debug(format_args!(
                         "connected over {} port {} in {} ms",
@@ -1023,7 +1026,9 @@ impl Probe {
                     }
                 }
                 RaceEvent::Connected(won) => {
-                    match tokio::time::timeout(ATTACH_TIMEOUT, Conn::hello(won.connection)).await {
+                    match tokio::time::timeout(ATTACH_TIMEOUT, Conn::hello_offering(won.connection, self.ctx.offer))
+                        .await
+                    {
                         Ok(Ok(conn)) => {
                             record_attempt(won.attempt, "ok");
                             outcome = Ok((conn, won.attempt, won.handshake));

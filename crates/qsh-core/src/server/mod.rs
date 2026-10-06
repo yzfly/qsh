@@ -144,9 +144,10 @@ pub struct ServerConfig {
     /// More ports to listen on, UDP and TCP independently, where the bind succeeds (m2.md
     /// section 5; at most 8, the primary port skipped). Announced in the bootstrap reply.
     pub extra_ports: Vec<u16>,
-    /// Keep screen models and offer the `snapshot` capability (m2.md section 6). Not used yet.
+    /// Keep a screen model of each tty session and accept the `snapshot` capability (m2.md
+    /// section 6): clients far behind get the current screen instead of the backlog.
     pub snapshot: bool,
-    /// Accept the `zstd` capability (m2.md section 7). Not used yet.
+    /// Accept the `zstd` capability (m2.md section 7): compress output on slow paths.
     pub compression: bool,
     /// When the daemon upgrades itself in place (m2.md section 10).
     pub upgrade: crate::config::Upgrade,

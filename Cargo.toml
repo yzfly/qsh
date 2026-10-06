@@ -35,6 +35,19 @@ zeroize = { version = "1.7", default-features = false, features = ["alloc"] }
 # the line of every key for warnings, without serde. rust-toml in Debian and Fedora.
 toml = { version = "1", default-features = false, features = ["std", "parse"] }
 clap = { version = "4.5", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "env"] }
+# The daemon's screen model for smart catch-up (m2.md 6.2): a terminal emulator state, MIT,
+# with vte (the alacritty parser) and unicode-width; rust-vt100 in Debian and Fedora. 0.16:
+# 0.15 has neither the faint attribute nor Screen::set_size.
+vt100 = "0.16"
+# zstd for OUTPUT_ZSTD (m2.md 7.3): pure Rust, encoder and decoder, MIT; rust-ruzstd in Debian
+# and Fedora. 0.8 is the first with an encoder. The lock file keeps 0.8.1, the newest that
+# builds with Rust 1.85 (0.8.2 uses u32::is_multiple_of, 0.8.3 declares 1.87).
+# Only its encoder is used: its decoder does not bound what one block produces (a few bytes
+# can expand to gigabytes), so qsh decodes with its own bounded decoder (codec.rs).
+ruzstd = { version = "0.8.1", default-features = false, features = ["std"] }
+# XXH64, for the optional content checksum of received zstd frames; in the tree with ruzstd and
+# quinn's dependencies before, rust-twox-hash in Debian and Fedora.
+twox-hash = { version = "2", default-features = false, features = ["xxhash64"] }
 
 [workspace.lints.rust]
 # deny, not forbid: qsh-core allows it in sys.rs alone; qsh-cli forbids it in its sources

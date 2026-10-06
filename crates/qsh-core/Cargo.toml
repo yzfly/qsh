@@ -12,9 +12,12 @@ keywords = ["ssh", "quic", "shell", "terminal", "mosh"]
 categories = ["network-programming", "command-line-utilities"]
 
 [features]
-default = ["hub"]
+default = ["hub", "zstd"]
 # The resident client that keeps one connection per server for many terminals (embedders)
 hub = []
+# Compression (the `zstd` capability, OUTPUT_ZSTD, protocol.md 7.12) with the pure Rust ruzstd;
+# without it the capability is never offered
+zstd = ["dep:ruzstd", "dep:twox-hash"]
 # Unstable environment hooks for the upgrade and chaos tests (QSH_TEST_VERSION,
 # QSH_TEST_HANDOFF_FAULT): never in release or distribution builds
 test-hooks = []
@@ -31,6 +34,9 @@ serde_json.workspace = true
 libc.workspace = true
 zeroize.workspace = true
 toml.workspace = true
+vt100.workspace = true
+ruzstd = { workspace = true, optional = true }
+twox-hash = { workspace = true, optional = true }
 
 [dev-dependencies]
 # Paused time for the network watcher's debounce tests
@@ -38,3 +44,8 @@ tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true
+
+# The catch-up and compression tests throttle the daemon's output (QSH_TEST_THROTTLE)
+[[test]]
+name = "catchup"
+required-features = ["test-hooks"]

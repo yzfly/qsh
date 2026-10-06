@@ -120,7 +120,17 @@ pub fn status_line(destination: &str, status: &Status) -> String {
     if let Some(rtt) = status.rtt {
         parts.push(format!("rtt {} ms", rtt.as_millis()));
     }
-    parts.push(format!("in {}", human_bytes(status.bytes_in)));
+    if status.compressed.0 > 0 {
+        // What arrived compressed, and its size on the wire
+        parts.push(format!(
+            "in {} ({} as {} zstd)",
+            human_bytes(status.bytes_in),
+            human_bytes(status.compressed.0),
+            human_bytes(status.compressed.1)
+        ));
+    } else {
+        parts.push(format!("in {}", human_bytes(status.bytes_in)));
+    }
     parts.push(format!("out {}", human_bytes(status.bytes_out)));
     if let Some(since) = status.connected_since {
         parts.push(format!("attached {}", human_duration(since.elapsed())));
@@ -134,6 +144,13 @@ pub fn status_line(destination: &str, status: &Status) -> String {
     }
     if status.skipped > 0 {
         parts.push(format!("{} skipped", human_bytes(status.skipped)));
+    }
+    if status.snapshots > 0 {
+        parts.push(format!(
+            "{} screen{} sent instead of a backlog",
+            status.snapshots,
+            if status.snapshots == 1 { "" } else { "s" }
+        ));
     }
     parts.join(", ")
 }
@@ -301,6 +318,10 @@ pub async fn run(mut config: ClientConfig, start: Start, options: TerminalOption
     restore_on_exit();
     let tty = sys::is_tty(&std::io::stdin());
     config.tty = tty;
+    // Snapshots redraw a terminal: only when the output goes to one (m2.md 6.7)
+    if !sys::is_tty(&std::io::stdout()) {
+        config.catchup = qsh_core::config::Catchup::Off;
+    }
     config.interactive = tty || sys::is_tty(&std::io::stderr());
     config.size = window_size();
     let mut offered = false;
@@ -614,6 +635,17 @@ mod tests {
                 && line.contains("in 12.3 kB")
                 && line.contains("attached 2m05s")
                 && line.contains("1 reconnect"),
+            "{line}"
+        );
+        assert!(
+            !line.contains("zstd") && !line.contains("instead of a backlog"),
+            "{line}"
+        );
+        s.compressed = (40_000_000, 10_000_000);
+        s.snapshots = 2;
+        let line = status_line("h", &s);
+        assert!(
+            line.contains("(40.0 MB as 10.0 MB zstd)") && line.contains("2 screens sent instead of a backlog"),
             "{line}"
         );
         assert_eq!(attempts_line(&Status::default()), None);

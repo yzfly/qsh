@@ -18,6 +18,7 @@
 #![warn(missing_docs)]
 
 pub mod client;
+pub mod codec;
 pub mod config;
 pub mod crypto;
 #[cfg(feature = "hub")]
@@ -27,6 +28,7 @@ pub mod mux;
 pub mod netwatch;
 pub mod paths;
 pub mod proto;
+pub mod screen;
 pub mod server;
 pub mod session;
 pub mod sys;

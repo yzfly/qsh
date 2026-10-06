@@ -257,9 +257,9 @@ pub struct HostSettings {
     pub replay_on_attach: bool,
     /// Remember per network which transport and port worked (`path_memory`, m2.md section 3).
     pub path_memory: bool,
-    /// Smart catch-up (`catchup`, m2.md section 6; reserved, not used by this version).
+    /// Smart catch-up (`catchup`, m2.md section 6).
     pub catchup: Catchup,
-    /// Compression (`compression`, m2.md section 7; reserved, not used by this version).
+    /// Compression (`compression`, m2.md section 7).
     pub compression: Compression,
 }
 
@@ -368,10 +368,9 @@ pub struct ServerSettings {
     pub replay_bytes: Option<usize>,
     /// Limits on unauthenticated connections (`[server.preauth]`).
     pub preauth: PreauthSettings,
-    /// Screen models and the `snapshot` capability (`snapshot`, m2.md section 6; not used by
-    /// this version).
+    /// Screen models and the `snapshot` capability (`snapshot`, m2.md section 6).
     pub snapshot: Option<bool>,
-    /// Accept the `zstd` capability (`compression`, m2.md section 7; not used by this version).
+    /// Accept the `zstd` capability (`compression`, m2.md section 7).
     pub compression: Option<bool>,
     /// When the daemon upgrades itself in place (`upgrade`, m2.md section 10).
     pub upgrade: Option<Upgrade>,

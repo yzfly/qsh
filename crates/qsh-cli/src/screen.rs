@@ -1,5 +1,6 @@
 //! What qsh draws on the user's terminal besides the session's output: the notice shown while
-//! the connection is lost.
+//! the connection is lost. (The line before a snapshot that replaced a backlog, m2.md 6.7, is
+//! written by the session itself, in order with the output.)
 //!
 //! The notice must not corrupt what the remote program drew, so where it goes depends on the
 //! screen the program uses, which [`AltScreen`] follows in the output:
@@ -148,6 +149,18 @@ mod tests {
         s.feed(&long);
         assert!(!s.active());
         assert!(s.params.len() <= MAX_PARAMS);
+    }
+
+    /// A snapshot (protocol.md 7.8.4) passes through the tracker like output: it leaves the
+    /// terminal on the screen the program uses.
+    #[test]
+    fn follows_snapshots() {
+        let mut s = AltScreen::default();
+        s.feed(b"\x1b[?1049h");
+        s.feed(b"\x1b[!p\x1b[?1049l\x1b[1;1H$ \x1b[K\x1b[1;3H");
+        assert!(!s.active());
+        s.feed(b"\x1b[!p\x1b[?1049l\x1b[1;1H\x1b[K\x1b[1;1H\x1b[?1049h\x1b[1;1Hvim\x1b[K");
+        assert!(s.active());
     }
 
     #[test]

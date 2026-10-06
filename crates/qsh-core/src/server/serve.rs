@@ -1,31 +1,51 @@
 //! Serving qsh/1 connections on the daemon: the control stream (protocol.md section 5),
 //! authentication (section 6) and terminal channels (sections 7 and 7.14), on any transport.
+//!
+//! Output on a terminal channel is paced by the delivery rate the client's ACKs show (m2.md
+//! 6.3, `pacing.rs`); compressed with zstd on slow paths when the client offered it (7.12);
+//! and on a tty session whose client accepts snapshots, a backlog the path cannot carry is
+//! replaced by the current screen from the session's model (7.8, smart catch-up), as is the
+//! old output of an attach that the path could not carry in about two seconds.
+
+mod pacing;
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
+use self::pacing::{Catchup, MinRtt, Rate, Squeeze, Step};
 use super::gate::Ticket;
-use super::pty::{Keys, PtySession, SessionId, Stream};
+use super::pty::{Keys, OutputSink, PtySession, SessionId, Stream};
 use super::{count, Shared};
+use crate::codec;
 use crate::crypto::{self, SessionKey};
 use crate::log;
 use crate::mux::Role;
 use crate::proto::limits::*;
 use crate::proto::message::{
-    canonical_ip, ATTACH_FRESH, LATEST, MAX_ATTACH, MAX_CONTROL, MAX_HELLO, MAX_TERMINAL, PREFERRED_DATA,
+    canonical_ip, ATTACH_ACCEPT_SNAPSHOT, ATTACH_FRESH, LATEST, MAX_ATTACH, MAX_CONTROL, MAX_HELLO, MAX_TERMINAL,
+    PREFERRED_DATA, SNAPSHOT_FINAL, SNAPSHOT_ZSTD,
 };
-use crate::proto::{read_message, ErrorCode, ExitStatus, FramingError, Message, IMPLEMENTATION, VERSION};
+use crate::proto::zstd::MAX_ZSTD_CONTENT;
+use crate::proto::{caps, read_message, ErrorCode, ExitStatus, FramingError, Message, IMPLEMENTATION, VERSION};
+use crate::screen::Live;
 use crate::transport::{tls, Connection, RecvStream, SendStream, Transport};
 
-/// Output sent but not acknowledged on one attachment, at most, per output stream (7.6).
-const PACING_WINDOW: u64 = 512 * 1024;
+/// The round trip time assumed before one is measured.
+const DEFAULT_RTT: Duration = Duration::from_millis(100);
+/// PING this often over the mux transports while attached, for the round trip time (QUIC
+/// measures its own).
+const PING_INTERVAL: Duration = Duration::from_secs(5);
+/// A snapshot is sent in parts of at most this much (7.8.3).
+const SNAPSHOT_PART: usize = 32 * 1024;
+/// Snapshots smaller than this are not compressed (m2.md 6.8).
+const SNAPSHOT_COMPRESS_MIN: usize = 1024;
 /// An authenticated connection that received nothing for this long is gone (clients PING
 /// every 15 s).
 const SILENT_CONNECTION: Duration = Duration::from_secs(90);
@@ -185,9 +205,58 @@ struct Conn {
     last_rx: Mutex<Instant>,
     /// The peer's address, for the failure limit per source (none for the ssh pipe).
     source: Option<IpAddr>,
+    /// The capabilities negotiated in the hello (5.4): snapshots, compression.
+    snapshot: bool,
+    zstd: bool,
+    /// The smallest recent round trip time: QUIC's estimate, or PING over the mux layer.
+    min_rtt: Mutex<MinRtt>,
+    /// When the last PING went out (mux transports).
+    pinged: Mutex<Option<Instant>>,
 }
 
 impl Conn {
+    /// `R` for the pacing window (m2.md 6.3): the smallest recent round trip time.
+    fn rtt(&self) -> Duration {
+        let mut min = self.min_rtt.lock().unwrap();
+        if let Some(rtt) = self.connection.rtt() {
+            min.sample(Instant::now(), rtt);
+        }
+        min.get().unwrap_or(DEFAULT_RTT)
+    }
+
+    /// The delivery rate before the first sample: QUIC's congestion window over its round trip
+    /// time; 1 MiB/s on the mux transports.
+    fn initial_rate(&self) -> f64 {
+        match self.connection.quic_connection() {
+            Some(quic) => {
+                let path = quic.stats().path;
+                path.cwnd as f64 / path.rtt.max(Duration::from_millis(1)).as_secs_f64()
+            }
+            None => pacing::INITIAL_RATE_MUX,
+        }
+    }
+
+    /// A PING for the round trip time, over the mux transports (QUIC has its own estimate).
+    fn ping(&self) {
+        if self.connection.transport() == Transport::Quic {
+            return;
+        }
+        *self.pinged.lock().unwrap() = Some(Instant::now());
+        let data = self.established.elapsed().as_micros() as u64;
+        let _ = self.control.send(Control::Send(Message::Ping { data }));
+    }
+
+    /// The PONG to one of our PINGs.
+    fn pong(&self, data: u64) {
+        let now = self.established.elapsed().as_micros() as u64;
+        if let Some(rtt) = now.checked_sub(data) {
+            self.min_rtt
+                .lock()
+                .unwrap()
+                .sample(Instant::now(), Duration::from_micros(rtt));
+        }
+    }
+
     fn close(&self, code: ErrorCode, why: &str) {
         let _ = self.control.send(Control::Close(code, why.to_string()));
     }
@@ -216,14 +285,16 @@ async fn serve_connection(shared: Arc<Shared>, connection: Connection, ticket: O
         }
         let mut recv = BufReader::new(recv);
         match read_message(&mut recv, MAX_HELLO).await {
-            Ok(Some(Message::ClientHello { versions, .. })) => Ok((send, recv, versions)),
+            Ok(Some(Message::ClientHello {
+                versions, capabilities, ..
+            })) => Ok((send, recv, versions, capabilities)),
             Ok(None) => Err(ErrorCode::NO_ERROR),
             Ok(Some(_)) => Err(ErrorCode::PROTOCOL_VIOLATION),
             Err(e) => Err(e.code()),
         }
     })
     .await;
-    let (mut ctl_send, ctl_recv, versions) = match hello {
+    let (mut ctl_send, ctl_recv, versions, offered) = match hello {
         Ok(Ok(h)) => h,
         Ok(Err(code)) => {
             connection.close(code, "");
@@ -251,11 +322,22 @@ async fn serve_connection(shared: Arc<Shared>, connection: Connection, ticket: O
     let established = Instant::now();
     let nonce = crypto::random::<32>();
     let remote = connection.remote_address();
+    // The capabilities this daemon supports and enables, that the client offered (5.4)
+    let config = &shared.config;
+    let snapshot = config.snapshot && offered.iter().any(|c| c == caps::SNAPSHOT);
+    let zstd = config.compression && codec::AVAILABLE && offered.iter().any(|c| c == caps::ZSTD);
+    let mut capabilities = Vec::new();
+    if snapshot {
+        capabilities.push(caps::SNAPSHOT.to_string());
+    }
+    if zstd {
+        capabilities.push(caps::ZSTD.to_string());
+    }
     let first = [
         Message::ServerHello {
             version: u64::from(VERSION),
             nonce,
-            capabilities: Vec::new(),
+            capabilities,
             implementation: IMPLEMENTATION.into(),
         },
         path_info(0, remote),
@@ -280,6 +362,10 @@ async fn serve_connection(shared: Arc<Shared>, connection: Connection, ticket: O
         failures: AtomicUsize::new(0),
         last_rx: Mutex::new(Instant::now()),
         source: (transport != Transport::Ssh).then(|| remote.map(|a| a.ip())).flatten(),
+        snapshot,
+        zstd,
+        min_rtt: Mutex::new(MinRtt::new()),
+        pinged: Mutex::new(None),
     });
     log::debug(format_args!("{transport} connection from {remote:?}"));
 
@@ -361,7 +447,8 @@ async fn control_reader(conn: Arc<Conn>, mut recv: BufReader<RecvStream>) {
             Message::Ping { data } => {
                 let _ = conn.control.send(Control::Send(Message::Pong { data }));
             }
-            Message::Pong { .. } | Message::GoAway { .. } | Message::Unknown { .. } => {}
+            Message::Pong { data } => conn.pong(data),
+            Message::GoAway { .. } | Message::Unknown { .. } => {}
             // The client closes the connection after its ERROR
             Message::Error { .. } => return conn.connection.close(ErrorCode::NO_ERROR, ""),
             _ => {
@@ -402,6 +489,11 @@ async fn watchdog(conn: Arc<Conn>, mut remote: Option<SocketAddr>) {
         }
         if conn.attachments.load(Ordering::SeqCst) > 0 {
             idle_since = Instant::now();
+            // The round trip time for pacing (m2.md 2): QUIC measures it, the mux layer pings
+            let due = conn.pinged.lock().unwrap().is_none_or(|t| t.elapsed() >= PING_INTERVAL);
+            if due {
+                conn.ping();
+            }
         } else if idle_since.elapsed() > IDLE_CONNECTION {
             let _ = conn.control.send(Control::GoAwayClose(ErrorCode::IDLE));
             return;
@@ -446,6 +538,8 @@ struct Attachment {
     next_input: u64,
     /// Make the program redraw (LATEST).
     redraw: bool,
+    /// Snapshots allowed: a tty session, `snapshot` negotiated, ACCEPT_SNAPSHOT (7.8.2).
+    snapshots: bool,
 }
 
 /// Where a stream starts on a new attachment (7.3 step 1, 7.14.5): `received`, or the end for
@@ -563,6 +657,7 @@ async fn channel(conn: Arc<Conn>, id: u64, mut send: SendStream, recv: RecvStrea
                 error_start,
                 next_input: input_received,
                 redraw: output_received == LATEST,
+                snapshots: !s.pipe && conn.snapshot && flags & ATTACH_ACCEPT_SNAPSHOT != 0,
             },
         ))
     });
@@ -624,39 +719,77 @@ enum Outcome {
     Remove(Option<ErrorCode>),
 }
 
-/// One output stream of an attachment (7.5, 7.6).
+/// One output stream of an attachment (7.5, 7.6), with its pacing state (m2.md 6.3).
 struct Out {
     stream: Stream,
     /// `sent_end`: just after the last byte sent or skipped.
     sent: u64,
     /// The highest acknowledgement accepted on this attachment.
     last_ack: u64,
-    /// The `To` of the latest OUTPUT_GAP: skipped bytes are not in flight.
+    /// The `To` of the latest OUTPUT_GAP or the `Offset` of the latest SNAPSHOT: skipped bytes
+    /// are not in flight.
     gap_to: u64,
+    /// Skipped ranges not yet passed by `last_ack`: not delivery, for the rate samples.
+    skipped: VecDeque<(u64, u64)>,
+    /// The last snapshot's data, in flight until an ACK reaches its offset: (offset, bytes).
+    snapshot: Option<(u64, u64)>,
+    /// The delivery rate `T`.
+    rate: Rate,
+    /// The compression policy, when `zstd` was negotiated (never for ERROR_OUTPUT).
+    squeeze: Option<Squeeze>,
 }
 
 impl Out {
-    fn new(stream: Stream, start: u64) -> Out {
+    fn new(stream: Stream, start: u64, initial_rate: f64, zstd: bool) -> Out {
         Out {
             stream,
             sent: start,
             last_ack: start,
             gap_to: start,
+            skipped: VecDeque::new(),
+            snapshot: None,
+            rate: Rate::new(initial_rate),
+            squeeze: (zstd && stream == Stream::Output).then(Squeeze::new),
         }
     }
 
+    /// Output in flight (7.6): sent and neither acknowledged nor skipped, and the data of a
+    /// snapshot not acknowledged yet.
     fn in_flight(&self) -> u64 {
-        self.sent - self.last_ack.max(self.gap_to)
+        let snapshot = self.snapshot.filter(|s| self.last_ack < s.0).map_or(0, |s| s.1);
+        self.sent - self.last_ack.max(self.gap_to) + snapshot
+    }
+
+    /// Output from where this stream is up to `to` is skipped (OUTPUT_GAP or SNAPSHOT).
+    fn skip(&mut self, to: u64) {
+        if to > self.sent {
+            self.skipped.push_back((self.sent, to));
+        }
+        self.sent = self.sent.max(to);
+        self.gap_to = to;
     }
 
     /// An acknowledgement of this stream (7.5): beyond what was sent is a SEQUENCE_ERROR, below
-    /// the last one is stale and ignored.
+    /// the last one is stale and ignored. A new one is a delivery-rate sample (6.3).
     fn ack(&mut self, session: &PtySession, received: u64) -> Result<(), ErrorCode> {
         if received > self.sent {
             return Err(ErrorCode::SEQUENCE_ERROR);
         }
         if received > self.last_ack {
+            let mut delivered = received - self.last_ack;
+            for &(from, to) in &self.skipped {
+                let (low, high) = (from.max(self.last_ack), to.min(received));
+                if high > low {
+                    delivered -= high - low;
+                }
+            }
+            self.skipped.retain(|r| r.1 > received);
+            let waiting = self.end(session) > self.sent;
+            self.rate.ack(Instant::now(), delivered, waiting);
             self.last_ack = received;
+            if self.snapshot.is_some_and(|s| received >= s.0) {
+                self.snapshot = None;
+            }
             session.ack(self.stream, received);
         }
         Ok(())
@@ -670,9 +803,10 @@ impl Out {
     }
 
     /// Up to `max` bytes of output from where this stream is, as messages: OUTPUT_GAP first if
-    /// they fell out of the replay buffer. None when there is nothing to send; otherwise
-    /// whether there was a gap.
-    fn next(&mut self, session: &PtySession, max: usize, batch: &mut Vec<Message>) -> Option<bool> {
+    /// they fell out of the replay buffer; one OUTPUT_ZSTD when `compress` and the frame is
+    /// at least 10 % smaller (m2.md 7.2), OUTPUT otherwise. None when there is nothing to
+    /// send; otherwise whether there was a gap.
+    fn next(&mut self, session: &PtySession, max: usize, compress: bool, batch: &mut Vec<Message>) -> Option<bool> {
         let (start, bytes) = session.buffer(self.stream).lock().unwrap().read_from(self.sent, max);
         if bytes.is_empty() {
             return None;
@@ -685,15 +819,235 @@ impl Out {
                 from: self.sent,
                 to: start,
             });
-            self.gap_to = start;
+            self.skip(start);
         }
         self.sent = start + bytes.len() as u64;
-        batch.push(self.message(start, bytes));
+        if let Some(squeeze) = self.squeeze.as_mut().filter(|_| compress) {
+            if bytes.len() >= pacing::COMPRESS_MIN {
+                if let Some(frame) = codec::compress(&bytes) {
+                    squeeze.record(Instant::now(), bytes.len(), frame.len(), self.sent);
+                    if frame.len() * 10 <= bytes.len() * 9 {
+                        batch.push(Message::OutputZstd { offset: start, frame });
+                        return Some(gap);
+                    }
+                }
+            }
+        }
+        let mut offset = start;
+        for chunk in bytes.chunks(PREFERRED_DATA) {
+            batch.push(self.message(offset, chunk.to_vec()));
+            offset += chunk.len() as u64;
+        }
         Some(gap)
     }
 
     fn end(&self, session: &PtySession) -> u64 {
         session.buffer(self.stream).lock().unwrap().end()
+    }
+}
+
+/// The screen models of the sessions (m2.md 6.2), for their attachments. Each model is owned by
+/// its session's output sink and lives as long as the session.
+static MODELS: LazyLock<Mutex<HashMap<SessionId, Weak<Mutex<Live>>>>> = LazyLock::new(Default::default);
+
+/// Feeds a session's model with its output, under the output buffer's lock.
+struct ModelSink(Arc<Mutex<Live>>);
+
+impl OutputSink for ModelSink {
+    fn output(&mut self, offset: u64, bytes: &[u8]) {
+        self.0.lock().unwrap().feed(offset, bytes);
+    }
+
+    fn handoff(&mut self) -> Option<(u16, u16, Vec<u8>)> {
+        self.0.lock().unwrap().handoff()
+    }
+}
+
+/// Give a new tty session (or one adopted in an upgrade, before its threads start) its screen
+/// model, unless `[server] snapshot` is off: the model handed over by the previous image when
+/// there is one (m2.md 6.8), else a fresh one of the terminal's size, fed with what the output
+/// buffer holds.
+pub(crate) fn install_model(shared: &Shared, session: &PtySession) {
+    if session.pipe || !shared.config.snapshot {
+        return;
+    }
+    let live = match session.take_resumed_model() {
+        Some(model) => {
+            let end = session.output.lock().unwrap().end();
+            Live::resumed(model.cols, model.rows, &model.snapshot, end)
+        }
+        None => {
+            let (cols, rows) = session.window_size().unwrap_or((80, 24));
+            Live::new(cols, rows)
+        }
+    };
+    let live = Arc::new(Mutex::new(live));
+    {
+        let mut models = MODELS.lock().unwrap();
+        models.retain(|_, m| m.strong_count() > 0);
+        models.insert(session.id, Arc::downgrade(&live));
+    }
+    session.set_output_sink(Some(Box::new(ModelSink(live))));
+}
+
+/// The model of a session, if it has one.
+fn model_of(session: &PtySession) -> Option<Arc<Mutex<Live>>> {
+    MODELS.lock().unwrap().get(&session.id).and_then(Weak::upgrade)
+}
+
+/// Resize a tty session's terminal, and its model at the same point of its output.
+fn resize_session(session: &PtySession, cols: u16, rows: u16) {
+    if cols == 0 || rows == 0 {
+        return;
+    }
+    if let Some(model) = model_of(session) {
+        let _buffer = session.output.lock().unwrap();
+        model.lock().unwrap().resize(cols, rows);
+    }
+    session.resize(cols, rows);
+}
+
+/// Where an attachment with snapshots starts streaming (m2.md 6.5): None to stream from
+/// `start`; otherwise the cut, where the newest `budget` of the output begins (just after a
+/// line end, if there is one in the next 4 KiB), or the end while the alternate screen is
+/// active; a resync snapshot follows.
+fn attach_cut(session: &PtySession, model: &Mutex<Live>, start: u64, rate: f64) -> Option<u64> {
+    let buffer = session.output.lock().unwrap();
+    let (base, end) = (buffer.base(), buffer.end());
+    let budget = ((pacing::CATCHUP_AFTER.as_secs_f64() * rate) as u64).max(pacing::CATCHUP_MIN);
+    if start >= base && end - start <= budget {
+        return None;
+    }
+    let mut cut = base.max(end.saturating_sub(budget));
+    let (at, ahead) = buffer.read_from(cut, 4096);
+    if let Some(i) = ahead.iter().position(|&b| b == b'\n') {
+        cut = at + i as u64 + 1;
+    }
+    if model.lock().unwrap().alternate() {
+        cut = end;
+    }
+    Some(cut.max(start))
+}
+
+/// Put a snapshot of `model` into `batch` (7.8): a skip snapshot replaces the output not sent
+/// yet; a resync snapshot (not `skip`) first sends it, so that it skips nothing. Parts of
+/// 32 KiB, compressed when `zstd` (7.8.3). The output buffer is locked before the model (the
+/// order of the reader thread), so the model stands exactly at the buffer's end. Returns
+/// whether the program should redraw as well. Without a usable snapshot (beyond the size
+/// limit, or the model's end before what was sent): a skip falls back to OUTPUT_GAP and a
+/// redraw (7.7), a resync is given up.
+fn send_snapshot(
+    session: &PtySession,
+    model: &Mutex<Live>,
+    out: &mut Out,
+    catchup: &mut Catchup,
+    zstd: bool,
+    skip: bool,
+    batch: &mut Vec<Message>,
+) -> bool {
+    let now = Instant::now();
+    let buffer = session.output.lock().unwrap();
+    let snapshot = model.lock().unwrap().snapshot(skip.then_some(out.sent));
+    let Some(snapshot) = snapshot.filter(|s| s.offset >= out.sent) else {
+        let end = buffer.end();
+        drop(buffer);
+        if skip && end > out.sent {
+            batch.push(Message::OutputGap {
+                from: out.sent,
+                to: end,
+            });
+            out.skip(end);
+            catchup.taken(now, end);
+            return true;
+        }
+        catchup.abandon();
+        return false;
+    };
+    if !skip {
+        let want = (snapshot.offset - out.sent) as usize;
+        let (at, bytes) = buffer.read_from(out.sent, want);
+        if at != out.sent || bytes.len() != want {
+            catchup.abandon();
+            return false;
+        }
+        drop(buffer);
+        let mut offset = at;
+        for chunk in bytes.chunks(PREFERRED_DATA) {
+            batch.push(Message::Output {
+                offset,
+                data: chunk.to_vec(),
+            });
+            offset += chunk.len() as u64;
+        }
+        out.sent = snapshot.offset;
+    } else {
+        drop(buffer);
+    }
+    let parts: Vec<&[u8]> = snapshot.data.chunks(SNAPSHOT_PART).collect();
+    for (i, part) in parts.iter().enumerate() {
+        let mut flags = if i + 1 == parts.len() { SNAPSHOT_FINAL } else { 0 };
+        let mut data = part.to_vec();
+        if zstd && snapshot.data.len() >= SNAPSHOT_COMPRESS_MIN {
+            if let Some(frame) = codec::compress(part).filter(|f| f.len() * 10 <= part.len() * 9) {
+                data = frame;
+                flags |= SNAPSHOT_ZSTD;
+            }
+        }
+        batch.push(Message::Snapshot {
+            offset: snapshot.offset,
+            flags,
+            cols: snapshot.cols,
+            rows: snapshot.rows,
+            data,
+        });
+    }
+    out.skip(snapshot.offset);
+    out.snapshot = Some((snapshot.offset, snapshot.data.len() as u64));
+    catchup.taken(now, snapshot.offset);
+    snapshot.redraw
+}
+
+/// A slow link for the tests (`QSH_TEST_THROTTLE`, bytes per second, in builds with the
+/// `test-hooks` feature): the attachment sends output at most at that rate.
+#[derive(Debug)]
+struct Throttle {
+    rate: f64,
+    /// Bytes that may be sent now (negative: in debt).
+    tokens: f64,
+    at: Instant,
+}
+
+impl Throttle {
+    fn from_env() -> Option<Throttle> {
+        if !cfg!(feature = "test-hooks") {
+            return None;
+        }
+        let rate: f64 = std::env::var("QSH_TEST_THROTTLE").ok()?.parse().ok()?;
+        (rate > 0.0).then(|| Throttle {
+            rate,
+            tokens: 0.0,
+            at: Instant::now(),
+        })
+    }
+
+    /// None when output may be sent now; else when it may.
+    fn wait(&mut self, now: Instant) -> Option<Instant> {
+        self.tokens = (self.tokens + now.saturating_duration_since(self.at).as_secs_f64() * self.rate).min(16384.0);
+        self.at = now;
+        (self.tokens < 0.0).then(|| now + Duration::from_secs_f64(-self.tokens / self.rate))
+    }
+
+    fn spend(&mut self, messages: &[Message]) {
+        let bytes: usize = messages
+            .iter()
+            .map(|m| match m {
+                Message::Output { data, .. } | Message::ErrorOutput { data, .. } => data.len(),
+                Message::OutputZstd { frame, .. } => frame.len(),
+                Message::Snapshot { data, .. } => data.len(),
+                _ => 0,
+            })
+            .sum();
+        self.tokens -= bytes as f64;
     }
 }
 
@@ -769,23 +1123,51 @@ async fn terminal(
         error_start,
         mut next_input,
         redraw,
+        snapshots,
     } = attachment;
     if write(send, &[attached]).await.is_err() {
         return Outcome::Finished;
     }
     let pipe = session.pipe;
     if !pipe {
-        session.resize(size.cols, size.rows);
+        resize_session(session, size.cols, size.rows);
     }
     session.ack(Stream::Output, start);
-    let mut outs = vec![Out::new(Stream::Output, start)];
+    let initial_rate = conn.initial_rate();
+    let mut outs = vec![Out::new(Stream::Output, start, initial_rate, conn.zstd)];
     if pipe {
         session.ack(Stream::Error, error_start);
-        outs.push(Out::new(Stream::Error, error_start));
+        outs.push(Out::new(Stream::Error, error_start, initial_rate, false));
     }
-    if redraw {
-        session.redraw();
+    conn.ping();
+    // Smart catch-up (7.8): with a model, snapshots instead of a backlog the path cannot carry
+    let model = snapshots.then(|| model_of(session)).flatten();
+    let quic = conn.connection.transport() == Transport::Quic;
+    let mut catchup = model
+        .as_ref()
+        .map(|_| Catchup::new(Instant::now(), outs[0].end(session), quic));
+    let mut batch = Vec::new();
+    match (catchup.as_mut(), model.as_ref()) {
+        (Some(catchup), Some(model)) => {
+            // An attach replays what the path carries in about two seconds, then repaints the
+            // screen exactly (m2.md 6.5); after LATEST the screen is repainted too, instead of
+            // making the program redraw
+            if let Some(cut) = attach_cut(session, model, start, initial_rate) {
+                if cut > start {
+                    batch.push(Message::OutputGap { from: start, to: cut });
+                    outs[0].skip(cut);
+                }
+                catchup.resync = true;
+            }
+            catchup.resync |= redraw;
+        }
+        _ => {
+            if redraw {
+                session.redraw();
+            }
+        }
     }
+    let mut throttle = Throttle::from_env();
     let mut exit_sent = false;
     // Input that does not fit in the input queue now. The stream is read on regardless: ACKs
     // behind the input may be what the program waits for (7.14.5), and RESIZE, DETACH, HANGUP
@@ -834,7 +1216,7 @@ async fn terminal(
             return Outcome::Error(code);
         }
 
-        let mut batch = Vec::new();
+        let now = Instant::now();
         // The input received since the last ACK (7.5)
         if next_input != acked_input {
             batch.push(Message::Ack {
@@ -843,21 +1225,100 @@ async fn terminal(
             });
             acked_input = next_input;
         }
-        // Output, paced: at most PACING_WINDOW in flight per stream (7.6)
         let mut redraw = false;
+        // Until when output waits: for the program's reaction to input (the output stream
+        // only), or for the test link
+        let mut hold: Option<Instant> = None;
+        let mut wait: Option<Instant> = None;
         if !exit_sent {
-            for out in outs.iter_mut() {
-                while out.in_flight() < PACING_WINDOW {
-                    let room = (PACING_WINDOW - out.in_flight()) as usize;
-                    match out.next(session, room.min(PREFERRED_DATA), &mut batch) {
-                        Some(gap) => redraw |= gap,
-                        None => break,
+            if let (Some(catchup), Some(model)) = (catchup.as_mut(), model.as_ref()) {
+                let out = &mut outs[0];
+                let end = out.end(session);
+                catchup.output(now, end);
+                let unacked = end - out.last_ack.max(out.gap_to);
+                let step = catchup.step(now, unacked, out.last_ack, out.rate.rate(now), out.rate.sampled(now));
+                // A snapshot waits for the test link like output
+                let link = throttle.as_mut().and_then(|t| t.wait(now));
+                let before = batch.len();
+                match step {
+                    Step::Hold(until) => hold = Some(until),
+                    Step::Snapshot | Step::Send if link.is_some() => wait = link,
+                    Step::Snapshot => {
+                        redraw |= send_snapshot(session, model, out, catchup, conn.zstd, true, &mut batch)
                     }
+                    // Caught up after an attach: the resync snapshot
+                    Step::Send if catchup.resync && end - out.sent <= PREFERRED_DATA as u64 => {
+                        redraw |= send_snapshot(session, model, out, catchup, conn.zstd, false, &mut batch)
+                    }
+                    Step::Send => {}
+                }
+                if let Some(t) = throttle.as_mut() {
+                    t.spend(&batch[before..]);
+                }
+            }
+            // Output, paced: at most a window in flight per stream (7.6, m2.md 6.3)
+            let rtt = conn.rtt();
+            let mut gap = false;
+            for (i, out) in outs.iter_mut().enumerate() {
+                if i == 0 && hold.is_some() {
+                    continue;
+                }
+                if !pipe {
+                    // Output that fell out of the replay buffer is skipped whatever is in
+                    // flight: skipped bytes are not in flight (7.6, 7.7)
+                    let base = session.buffer(out.stream).lock().unwrap().base();
+                    if base > out.sent {
+                        batch.push(Message::OutputGap {
+                            from: out.sent,
+                            to: base,
+                        });
+                        out.skip(base);
+                        gap = true;
+                    }
+                }
+                let rate = out.rate.rate(now);
+                let window = pacing::window(rate, rtt, pipe);
+                loop {
+                    let in_flight = out.in_flight();
+                    if in_flight >= window {
+                        break;
+                    }
+                    if let Some(t) = throttle.as_mut().and_then(|t| t.wait(now)) {
+                        wait = Some(t);
+                        break;
+                    }
+                    let room = (window - in_flight) as usize;
+                    let ready = out.end(session).saturating_sub(out.sent);
+                    let compress = out
+                        .squeeze
+                        .as_ref()
+                        .is_some_and(|z| z.wanted(now, rate, ready, out.sent));
+                    let max = if compress { MAX_ZSTD_CONTENT } else { PREFERRED_DATA };
+                    let before = batch.len();
+                    match out.next(session, max.min(room), compress, &mut batch) {
+                        Some(skipped) => gap |= skipped,
+                        None => {
+                            out.rate.limited();
+                            break;
+                        }
+                    }
+                    if let Some(t) = throttle.as_mut() {
+                        t.spend(&batch[before..]);
+                    }
+                }
+            }
+            if gap {
+                // After a gap the screen is repainted: by a resync snapshot when the client
+                // takes them, by the program otherwise (7.7)
+                match catchup.as_mut() {
+                    Some(catchup) => catchup.resync = true,
+                    None => redraw = true,
                 }
             }
             if let Some(status) = session.exit_status() {
                 // EXIT comes after all output (7.10)
-                if outs.iter().all(|o| o.sent == o.end(session)) {
+                let waiting = catchup.as_ref().is_some_and(|c| c.interrupted());
+                if !waiting && outs.iter().all(|o| o.sent == o.end(session)) {
                     batch.push(exit_message(session, &outs, status));
                     exit_sent = true;
                 }
@@ -867,18 +1328,25 @@ async fn terminal(
             if write(send, &batch).await.is_err() {
                 return Outcome::Finished;
             }
+            batch.clear();
             if redraw {
                 session.redraw();
             }
             continue;
         }
 
+        let until = match (hold, wait) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
         let first = tokio::select! {
             m = rx.recv() => m,
             // New output, the exit, a newer attach and removal all notify: no polling
             _ = &mut changed => continue,
             // The program read input: held input may fit now
             _ = &mut drained, if !held.bytes.is_empty() => continue,
+            // Output waited for the program's reaction to input, or for the test link
+            _ = tokio::time::sleep_until(until.unwrap_or(now).into()), if until.is_some() => continue,
         };
         // What is already there (a bounded number, so that output is not held back), then
         // one ACK for the input at the top of the loop (7.5)
@@ -917,6 +1385,13 @@ async fn terminal(
                     // More unacknowledged input than any client keeps (7.6)
                     if held.bytes.len() + data.len() > MAX_INPUT_IN_FLIGHT {
                         return Outcome::Error(ErrorCode::FLOW_CONTROL_ERROR);
+                    }
+                    if let Some(catchup) = catchup.as_mut() {
+                        // Typed during a backlog: the user wants the program now (m2.md 6.4)
+                        let out = &outs[0];
+                        let now = Instant::now();
+                        let window = pacing::window(out.rate.rate(now), conn.rtt(), pipe);
+                        catchup.input(now, out.end(session).saturating_sub(out.sent), window);
                     }
                     held.bytes.extend(data);
                     if let Err(code) = accept_held(session, generation, &mut held, &mut next_input) {
@@ -966,7 +1441,7 @@ async fn terminal(
                 // A pipe session has no terminal: RESIZE is ignored (7.14.5)
                 Message::Resize(size) => {
                     if !pipe {
-                        session.resize(size.cols, size.rows)
+                        resize_session(session, size.cols, size.rows)
                     }
                 }
                 Message::KeyConfirm { key_id } => {
@@ -1041,7 +1516,7 @@ async fn ending(session: &Arc<PtySession>, outs: &mut [Out], send: &mut SendStre
     let mut batch = Vec::new();
     for out in outs.iter_mut() {
         while batch.len() < HANGUP_MESSAGES {
-            if out.next(session, PREFERRED_DATA, &mut batch).is_none() {
+            if out.next(session, PREFERRED_DATA, false, &mut batch).is_none() {
                 break;
             }
         }

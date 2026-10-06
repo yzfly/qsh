@@ -827,6 +827,8 @@ fn commit(
     let runtime = Runtime::new(&identity, listeners)?;
     let mut kept = 0;
     for a in adopted {
+        // Its screen model first, from the state, before its threads add output
+        super::serve::install_model(&shared, &a.session);
         match a.start() {
             Ok(session) => {
                 shared.sessions.insert(session);

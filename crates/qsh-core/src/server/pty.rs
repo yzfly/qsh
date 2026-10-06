@@ -747,6 +747,11 @@ impl PtySession {
         }
     }
 
+    /// The terminal's size as (columns, rows); None on a pipe session or once hung up.
+    pub fn window_size(&self) -> Option<(u16, u16)> {
+        self.master.lock().unwrap().as_ref().and_then(sys::window_size)
+    }
+
     /// Make the program redraw its screen (as on SIGWINCH): shrink by a row and back. Used
     /// after an OUTPUT_GAP (section 7.7).
     pub fn redraw(&self) {

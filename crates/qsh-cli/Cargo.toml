@@ -21,7 +21,10 @@ name = "qsh-server"
 path = "src/bin/qsh-server.rs"
 
 [features]
-default = []
+default = ["zstd"]
+# Compression of output on slow paths (the `zstd` capability); distributions whose ruzstd is
+# older than 0.8 build without it
+zstd = ["qsh-core/zstd"]
 # `qsh install HOST` and the offer to install qsh-server: copies this machine's qsh-server or
 # downloads the release archive (with curl or wget, checked against SHA256SUMS). Release builds
 # turn it on; distributions build without it, so that qsh never downloads anything
@@ -45,4 +48,8 @@ workspace = true
 
 [[test]]
 name = "upgrade"
+required-features = ["test-hooks"]
+
+[[test]]
+name = "catchup"
 required-features = ["test-hooks"]

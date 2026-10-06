@@ -34,7 +34,7 @@ mod session;
 pub mod store;
 pub mod transcript;
 
-pub use conn::Conn;
+pub use conn::{Conn, Offer};
 pub use pool::Pool;
 pub use session::Session;
 
@@ -102,10 +102,12 @@ pub struct ClientConfig {
     /// (`path_memory`; m2.md section 3). False: neither read nor write it; what is learned
     /// lives only as long as the process.
     pub path_memory: bool,
-    /// Accept SNAPSHOT on tty sessions (`catchup`; m2.md section 6). Not used yet: the client
-    /// offers no capability.
+    /// Accept snapshots on tty sessions (`catchup`; m2.md section 6): when the output is far
+    /// behind, the server sends the current screen instead of the backlog. `Off` for output
+    /// that does not go to a terminal (`qsh` sets it when its stdout is not one).
     pub catchup: Catchup,
-    /// Offer the `zstd` capability (`compression`; m2.md section 7). Not used yet.
+    /// Offer the `zstd` capability (`compression`; m2.md section 7): the server compresses
+    /// output on slow paths.
     pub compression: Compression,
 }
 
@@ -155,7 +157,8 @@ pub enum Event {
     Connected(Transport),
     /// The connection was lost; reconnecting.
     Disconnected(String),
-    /// Bytes of output were skipped: they fell out of the server's replay buffer.
+    /// Bytes of output were skipped: they fell out of the server's replay buffer, or a
+    /// snapshot of the screen replaced them (smart catch-up).
     OutputSkipped(u64),
 }
 
@@ -192,8 +195,12 @@ pub struct Status {
     pub connected_since: Option<Instant>,
     /// Connections after the first.
     pub reconnects: u32,
-    /// Output bytes skipped (OUTPUT_GAP).
+    /// Output bytes skipped (OUTPUT_GAP, and the backlog a snapshot replaced).
     pub skipped: u64,
+    /// Snapshots that replaced a backlog (smart catch-up, m2.md 6).
+    pub snapshots: u64,
+    /// Output bytes that arrived compressed (OUTPUT_ZSTD), and the bytes of their frames.
+    pub compressed: (u64, u64),
     /// The session id.
     pub session: Option<[u8; 16]>,
     /// How each transport fared in the race of the current connection: "used", "failed: why",

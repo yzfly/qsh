@@ -21,9 +21,22 @@ use serde_json::Value;
 /// change, and the build's own binary may be group-writable (umask 002).
 fn install_server(world: &World) -> PathBuf {
     let path = world.dir.join("bin/qsh-server");
-    fs::copy(QSH_SERVER, &path).unwrap();
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    copy_executable(Path::new(QSH_SERVER), &path);
     path
+}
+
+/// Copy a program with cp(1), mode 0755. Not fs::copy: while this process holds the copy open
+/// for writing, a thread of another test may fork, and the child keeps that descriptor until
+/// it executes; running the copy then fails with ETXTBSY ("Text file busy").
+fn copy_executable(from: &Path, to: &Path) {
+    let ok = std::process::Command::new("cp")
+        .arg(from)
+        .arg(to)
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok, "cp {} {}", from.display(), to.display());
+    fs::set_permissions(to, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 /// Prints `tick-N` every 50 ms until `stop` exists, then exits 3.
@@ -288,8 +301,7 @@ fn a_daemon_upgrades_by_itself_when_its_program_was_replaced() {
     assert_eq!(status(&world)["restarts"], 0);
     // A package upgrade: a new file renamed over the old one
     let new = world.dir.join("bin/.qsh-server.new");
-    fs::copy(QSH_SERVER, &new).unwrap();
-    fs::set_permissions(&new, fs::Permissions::from_mode(0o755)).unwrap();
+    copy_executable(Path::new(QSH_SERVER), &new);
     fs::rename(&new, &server).unwrap();
     wait_until(
         Duration::from_secs(10),

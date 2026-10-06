@@ -233,6 +233,7 @@ fn bootstrap_op(shared: &Shared, request: &Request) -> Value {
             match PtySession::start(id, key.clone(), &spawn, &shared.account, shared.config.output_replay) {
                 Ok(session) => {
                     log::debug(format_args!("session {} started", &id.to_hex()[..8]));
+                    super::serve::install_model(shared, &session);
                     let pipe = session.pipe;
                     shared.sessions.insert(session);
                     credentials(shared, &id, &key, pipe)

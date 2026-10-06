@@ -84,10 +84,44 @@ pub(crate) struct PathChange {
     pub(crate) to: SocketAddr,
 }
 
+/// The optional features a client offers in its hello (protocol.md 5.4), and those the server
+/// then enabled on the connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Offer {
+    /// `snapshot` (7.8): the server may send SNAPSHOT to attachments that accept it.
+    pub snapshot: bool,
+    /// `zstd` (7.12): the server may compress output.
+    pub zstd: bool,
+}
+
+impl Offer {
+    /// What a client with `config` offers: snapshots unless `catchup` is off, compression
+    /// unless `compression` is off or this build has no zstd (m2.md 6.7, 7).
+    pub fn of(config: &super::ClientConfig) -> Offer {
+        Offer {
+            snapshot: config.catchup != crate::config::Catchup::Off,
+            zstd: crate::codec::AVAILABLE && config.compression != crate::config::Compression::Off,
+        }
+    }
+
+    fn names(&self) -> Vec<String> {
+        let mut names = Vec::new();
+        if self.snapshot {
+            names.push(proto::caps::SNAPSHOT.to_string());
+        }
+        if self.zstd {
+            names.push(proto::caps::ZSTD.to_string());
+        }
+        names
+    }
+}
+
 /// A connection after the hello exchange, with its control stream served in the background.
 pub struct Conn {
     pub(crate) connection: Connection,
     pub(crate) nonce: [u8; 32],
+    /// The capabilities negotiated.
+    pub(crate) capabilities: Offer,
     control: mpsc::UnboundedSender<Message>,
     /// When anything last arrived, on tokio's clock.
     last_rx: Mutex<tokio::time::Instant>,
@@ -144,26 +178,40 @@ impl Conn {
     /// server's nonce is needed before any ATTACH; elsewhere waiting costs one round trip
     /// and keeps the code simple.
     pub async fn hello(connection: Connection) -> io::Result<Arc<Conn>> {
+        Conn::hello_offering(connection, Offer::default()).await
+    }
+
+    /// [`Conn::hello`], offering the capabilities of `offer`.
+    pub async fn hello_offering(connection: Connection, offer: Offer) -> io::Result<Arc<Conn>> {
         let (_, mut send, recv) = connection.open().await?;
         let hello = Message::ClientHello {
             versions: vec![u64::from(proto::VERSION)],
-            capabilities: Vec::new(),
+            capabilities: offer.names(),
             implementation: proto::IMPLEMENTATION.into(),
         };
         write_message(&mut send, &hello).await?;
         let mut recv = BufReader::new(recv);
-        let nonce = match read_message(&mut recv, MAX_HELLO).await {
+        let (nonce, negotiated) = match read_message(&mut recv, MAX_HELLO).await {
             Ok(Some(Message::ServerHello {
                 version,
                 nonce,
                 capabilities,
                 ..
             })) => {
-                if version != u64::from(proto::VERSION) || !capabilities.is_empty() {
+                // Only capabilities we offered (5.4)
+                let offered = offer.names();
+                if version != u64::from(proto::VERSION) || capabilities.iter().any(|c| !offered.contains(c)) {
                     connection.close(ErrorCode::PROTOCOL_VIOLATION, "");
                     return Err(io::Error::new(io::ErrorKind::InvalidData, "bad SERVER_HELLO"));
                 }
-                nonce
+                let has = |name: &str| capabilities.iter().any(|c| c == name);
+                (
+                    nonce,
+                    Offer {
+                        snapshot: has(proto::caps::SNAPSHOT),
+                        zstd: has(proto::caps::ZSTD),
+                    },
+                )
             }
             Ok(Some(Message::Error { code, message })) => {
                 return Err(io::Error::other(format!(
@@ -184,6 +232,7 @@ impl Conn {
         let conn = Arc::new(Conn {
             connection,
             nonce,
+            capabilities: negotiated,
             control,
             last_rx: Mutex::new(tokio::time::Instant::now()),
             rx_count: std::sync::atomic::AtomicU64::new(0),

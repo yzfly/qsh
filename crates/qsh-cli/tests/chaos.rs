@@ -65,7 +65,7 @@ const FLOOD: &str = "yes 0123456789abcdefghijklmnopqrstuvwxyz0123456789abcdefghi
 
 /// Work packages that are merged: a check waiting only for these is hard. Add a package here
 /// when it lands; its criteria then fail the workflow instead of being reported.
-const LANDED: &[&str] = &["WP-1", "WP-4"];
+const LANDED: &[&str] = &["WP-1", "WP-2", "WP-4"];
 
 /// S1 after a mid-session block: the reconnect's QUIC attempt is cancelled when TLS wins, so it
 /// records no failure, and `ok` (whole days) ties QUIC and TLS on the same day, so the next plan

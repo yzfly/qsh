@@ -10,7 +10,9 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-qsh-core = { path = "../crates/qsh-core", default-features = false }
+qsh-core = { path = "../crates/qsh-core", default-features = false, features = ["zstd"] }
+# The reference for the differential check of qsh's own zstd decoder (zstd_frame)
+ruzstd = { version = "0.8.1", default-features = false, features = ["std"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt"] }
 
@@ -73,6 +75,13 @@ bench = false
 [[bin]]
 name = "handoff_state"
 path = "fuzz_targets/handoff_state.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "screen_model"
+path = "fuzz_targets/screen_model.rs"
 test = false
 doc = false
 bench = false

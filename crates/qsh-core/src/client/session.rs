@@ -2,8 +2,10 @@
 //! terminal channel (input, output, acknowledgements, gaps, exit), resume after a lost
 //! connection, and the client's state of the session.
 //!
-//! Work package WP-2 (m2.md sections 6 and 7) adds SNAPSHOT and OUTPUT_ZSTD to the channel
-//! here.
+//! With the capabilities of m2.md sections 6 and 7 the channel also carries OUTPUT_ZSTD
+//! (decompressed under the rules of protocol.md 7.12) and, on a tty session whose output goes
+//! to a terminal, SNAPSHOT: the current screen instead of a backlog (7.8), checked against the
+//! content profile and written as a whole, after a line that says what was skipped.
 
 use std::io;
 use std::sync::{Arc, Mutex};
@@ -20,13 +22,19 @@ use super::{
     bootstrap, bootstrap_reply, exit_code, host_of, jitter, ClientConfig, ClientError, Event, Input, Outcome, Status,
     Terminal, EXIT_ERROR,
 };
+use crate::codec;
 use crate::crypto::{self, Fingerprint, SessionKey};
 use crate::log;
 use crate::proto::bootstrap::{Credentials, ErrorKind, Reply, Request, SessionInfo};
 use crate::proto::limits::{ATTACH_TIMEOUT, RESEND_CHUNK, RESTART_RECONNECT};
-use crate::proto::message::{ATTACH_FRESH, LATEST, MAX_TERMINAL, PREFERRED_DATA};
+use crate::proto::message::{
+    ATTACH_ACCEPT_SNAPSHOT, ATTACH_FRESH, LATEST, MAX_SNAPSHOT, MAX_TERMINAL, PREFERRED_DATA, SNAPSHOT_FINAL,
+    SNAPSHOT_ZSTD,
+};
 use crate::proto::varint;
+use crate::proto::zstd::MAX_ZSTD_CONTENT;
 use crate::proto::{read_message, write_message, ErrorCode, ExitStatus, FramingError, Message, WindowSize};
+use crate::screen::snapshot::check_profile;
 use crate::session::{Inbound, ReplayBuffer, INPUT_REPLAY};
 use crate::transport::ssh::SshCommand;
 use crate::transport::{RecvStream, SendStream, Target};
@@ -37,9 +45,13 @@ const INPUT_ANSWER_WITHIN: Duration = Duration::from_secs(8);
 /// Unacknowledged input for this long: PING, so the control stream answers even if the
 /// terminal stream is held up.
 const INPUT_PING_AFTER: Duration = Duration::from_secs(1);
-/// ACK output after this much, or this long after it arrived (section 7.5).
+/// ACK output after this much, or this long after it arrived (section 7.5) …
 const ACK_BYTES: u64 = 32768;
 const ACK_DELAY: Duration = Duration::from_millis(200);
+/// … and on an attachment that accepts snapshots, more often: the server's pacing counts
+/// unacknowledged output, and prompt ACKs keep what is queued ahead of an interrupt small.
+const ACK_BYTES_SNAPSHOT: u64 = 16384;
+const ACK_DELAY_SNAPSHOT: Duration = Duration::from_millis(50);
 /// Local input is taken while less than this waits in the outbox: an ACK queued behind input
 /// waits for little more than this.
 const OUTBOX_INPUT: usize = 64 * 1024;
@@ -550,12 +562,19 @@ impl Session {
         } else {
             state.errors.received()
         };
+        // Snapshots on a tty session, when the server can send them and the output goes to a
+        // terminal (7.8.2; `catchup` off otherwise)
+        let accept = !state.pipe && conn.capabilities.snapshot && self.config.catchup != crate::config::Catchup::Off;
+        let mut flags = if state.fresh { ATTACH_FRESH } else { 0 };
+        if accept {
+            flags |= ATTACH_ACCEPT_SNAPSHOT;
+        }
         let attach = Message::Attach {
             session: state.session,
             proof: key.proof(&cb),
             output_received,
             size: state.size,
-            flags: if state.fresh { ATTACH_FRESH } else { 0 },
+            flags,
             error_received: state.pipe.then_some(error_received),
         };
         if let Err(e) = write_message(&mut send, &attach).await {
@@ -675,7 +694,8 @@ impl Session {
         });
         notify(terminal, Event::Connected(conn.transport()));
         let had_pending = !pending.is_empty();
-        self.pump(conn, state, terminal, send, recv, outbox, had_pending).await
+        self.pump(conn, state, terminal, send, recv, outbox, had_pending, accept)
+            .await
     }
 
     /// The attached terminal channel (sections 7.4 to 7.11).
@@ -695,6 +715,7 @@ impl Session {
         recv: BufReader<RecvStream>,
         mut outbox: Outbox,
         had_pending: bool,
+        accept: bool,
     ) -> Result<End, ClientError> {
         let (tx, mut rx) = mpsc::channel::<Result<Message, FramingError>>(64);
         let reader = tokio::spawn(async move {
@@ -716,6 +737,14 @@ impl Session {
         // What the last ACK said, for both output streams
         let mut acked = (state.output.received(), state.errors.received());
         let mut ack_due: Option<Instant> = None;
+        let (ack_bytes, ack_delay) = if accept {
+            (ACK_BYTES_SNAPSHOT, ACK_DELAY_SNAPSHOT)
+        } else {
+            (ACK_BYTES, ACK_DELAY)
+        };
+        let zstd = conn.capabilities.zstd;
+        // The parts of a snapshot received so far (7.8.3)
+        let mut snapshot: Option<Assembly> = None;
         let mut last_ping = Instant::now();
         // Since when typed input waits for any answer, and whether it was PINGed already
         let mut unanswered: Option<Instant> = had_pending.then(Instant::now);
@@ -741,6 +770,38 @@ impl Session {
                         Some(Ok(m)) => m,
                     };
                     let message_ty = MessageTy::of(&message);
+                    // The parts of a snapshot come back to back: no output in between (7.8.3)
+                    let output_stream = matches!(
+                        message,
+                        Message::Output { .. }
+                            | Message::OutputZstd { .. }
+                            | Message::OutputGap { .. }
+                            | Message::Exit { .. }
+                    );
+                    if snapshot.is_some() && output_stream {
+                        return Ok(protocol_violation(&mut send, &mut outbox).await);
+                    }
+                    // Decompressed output is output (7.12)
+                    let (message, frame) = match message {
+                        Message::OutputZstd { offset, frame } => {
+                            if !zstd {
+                                return Ok(protocol_violation(&mut send, &mut outbox).await);
+                            }
+                            match codec::decompress(&frame, MAX_ZSTD_CONTENT) {
+                                Ok(data) => {
+                                    let mut status = self.status.lock().unwrap();
+                                    status.compressed.0 += data.len() as u64;
+                                    status.compressed.1 += frame.len() as u64;
+                                    (Message::Output { offset, data }, Some(frame.len()))
+                                }
+                                Err(e) => {
+                                    log::debug(format_args!("OUTPUT_ZSTD refused: {e}"));
+                                    return Ok(frame_error(&mut send, &mut outbox).await);
+                                }
+                            }
+                        }
+                        other => (other, None),
+                    };
                     match message {
                         Message::Output { offset, data } | Message::ErrorOutput { offset, data } => {
                             let error = state.pipe && matches!(message_ty, MessageTy::ErrorOutput);
@@ -758,7 +819,7 @@ impl Session {
                                 errors: error,
                                 offset,
                                 data: &data,
-                                frame: None,
+                                frame,
                             });
                             let sink = match (&terminal.errors, error) {
                                 (Some(errors), true) => errors,
@@ -772,11 +833,88 @@ impl Session {
                             *stream = Inbound::at(offset + n);
                             self.status.lock().unwrap().bytes_in += n;
                             let unacked = (state.output.received() - acked.0) + (state.errors.received() - acked.1);
-                            if unacked >= ACK_BYTES {
+                            if unacked >= ack_bytes {
                                 ack(&mut outbox, state, &mut acked);
                                 ack_due = None;
                             } else {
-                                ack_due.get_or_insert_with(|| Instant::now() + ACK_DELAY);
+                                ack_due.get_or_insert_with(|| Instant::now() + ack_delay);
+                            }
+                        }
+                        Message::Snapshot { offset, flags, cols, rows, data } => {
+                            if !accept {
+                                // Only on an attachment that accepts them (7.8.2)
+                                return Ok(protocol_violation(&mut send, &mut outbox).await);
+                            }
+                            transcript::record(Record::Snapshot {
+                                session: &state.session,
+                                offset,
+                                flags,
+                                cols,
+                                rows,
+                                data: &data,
+                            });
+                            let expected = state.output.received();
+                            if offset < expected {
+                                return Ok(sequence_error(&mut send, &mut outbox).await);
+                            }
+                            let assembly = snapshot.get_or_insert_with(|| Assembly {
+                                offset,
+                                cols,
+                                rows,
+                                data: Vec::new(),
+                            });
+                            if (assembly.offset, assembly.cols, assembly.rows) != (offset, cols, rows) {
+                                return Ok(protocol_violation(&mut send, &mut outbox).await);
+                            }
+                            let part = if flags & SNAPSHOT_ZSTD != 0 {
+                                if !zstd {
+                                    return Ok(protocol_violation(&mut send, &mut outbox).await);
+                                }
+                                match codec::decompress(&data, MAX_ZSTD_CONTENT) {
+                                    Ok(part) => part,
+                                    Err(e) => {
+                                        log::debug(format_args!("SNAPSHOT refused: {e}"));
+                                        return Ok(frame_error(&mut send, &mut outbox).await);
+                                    }
+                                }
+                            } else {
+                                data
+                            };
+                            if assembly.data.len() + part.len() > MAX_SNAPSHOT {
+                                return Ok(frame_error(&mut send, &mut outbox).await);
+                            }
+                            assembly.data.extend_from_slice(&part);
+                            if flags & SNAPSHOT_FINAL != 0 {
+                                let assembly = snapshot.take().expect("assembling");
+                                // Only what the content profile allows reaches the terminal
+                                if let Err(e) = check_profile(&assembly.data) {
+                                    log::debug(format_args!("{e}"));
+                                    return Ok(protocol_violation(&mut send, &mut outbox).await);
+                                }
+                                let skipped = offset - expected;
+                                let mut bytes = Vec::with_capacity(assembly.data.len() + 80);
+                                // On the normal screen, a line that marks the skipped output; the
+                                // snapshot's scrolling pushes it into the scrollback (6.7)
+                                let alternate = assembly.data.windows(8).any(|w| w == b"\x1b[?1049h");
+                                if skipped > 0 && !alternate {
+                                    bytes.extend_from_slice(skip_notice(skipped).as_bytes());
+                                }
+                                bytes.extend_from_slice(&assembly.data);
+                                if terminal.output.send(bytes).await.is_err() {
+                                    return Ok(detach(&mut send, &mut outbox, &mut rx).await);
+                                }
+                                state.output = Inbound::at(offset);
+                                if skipped > 0 {
+                                    {
+                                        let mut status = self.status.lock().unwrap();
+                                        status.skipped = status.skipped.saturating_add(skipped);
+                                        status.snapshots += 1;
+                                    }
+                                    notify(terminal, Event::OutputSkipped(skipped));
+                                }
+                                // Acknowledged at once: the server sends no other snapshot before
+                                ack(&mut outbox, state, &mut acked);
+                                ack_due = None;
                             }
                         }
                         Message::OutputGap { from, to } => {
@@ -860,6 +998,11 @@ impl Session {
                     }
                     None => state.input_closed = true,
                 },
+                // ACKs on time (7.5): 50 ms matter on an attachment that accepts snapshots
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(ack_due.unwrap_or_else(Instant::now))), if ack_due.is_some() => {
+                    ack(&mut outbox, state, &mut acked);
+                    ack_due = None;
+                }
                 _ = tick.tick() => {
                     let now = Instant::now();
                     if ack_due.is_some_and(|t| now >= t) {
@@ -1015,6 +1158,36 @@ async fn protocol_violation(send: &mut SendStream, outbox: &mut Outbox) -> End {
     });
     let _ = outbox.flush(send).await;
     End::Lost("unexpected message from the server".into())
+}
+
+/// A frame of compressed data or a snapshot breaks the rules of 7.12 or 7.8.3: FRAME_ERROR
+/// (a stream error), and the attachment starts again.
+async fn frame_error(send: &mut SendStream, outbox: &mut Outbox) -> End {
+    outbox.push(&Message::Error {
+        code: ErrorCode::FRAME_ERROR,
+        message: String::new(),
+    });
+    let _ = outbox.flush(send).await;
+    End::Lost("a malformed frame from the server".into())
+}
+
+/// The parts of a snapshot received so far (7.8.3).
+#[derive(Debug)]
+struct Assembly {
+    offset: u64,
+    cols: u16,
+    rows: u16,
+    data: Vec<u8>,
+}
+
+/// The dim line written before a snapshot that skipped `bytes` of output (m2.md 6.7).
+fn skip_notice(bytes: u64) -> String {
+    let amount = match bytes {
+        0..=9999 => format!("{bytes} B"),
+        10_000..=9_999_999 => format!("{:.1} kB", bytes as f64 / 1e3),
+        _ => format!("{:.1} MB", bytes as f64 / 1e6),
+    };
+    format!("\r\n\x1b[2mqsh: skipped {amount} of output\x1b[m\r\n")
 }
 
 async fn sequence_error(send: &mut SendStream, outbox: &mut Outbox) -> End {
