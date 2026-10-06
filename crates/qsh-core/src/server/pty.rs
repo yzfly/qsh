@@ -132,8 +132,8 @@ pub struct PtySession {
     input: Mutex<Option<std::sync::mpsc::Sender<InputItem>>>,
     /// Input bytes queued for the program and not yet written (section 7.4).
     input_queued: Arc<AtomicUsize>,
-    /// Output produced by the program (a pipe session's stdout), kept until acknowledged; on a
-    /// tty session the oldest is dropped past capacity.
+    /// Output produced by the program: a pipe session's stdout, kept until acknowledged; on a
+    /// tty session kept as scrollback, acknowledged or not, the oldest dropped past capacity.
     pub output: Mutex<ReplayBuffer>,
     /// A pipe session's stderr, kept until acknowledged (empty on a tty session).
     pub errors: Mutex<ReplayBuffer>,
@@ -361,10 +361,14 @@ impl PtySession {
         }
     }
 
-    /// The client acknowledged `stream` up to `offset`: forget what is before it, and let a
-    /// pipe session's program write again if it was held back.
+    /// The client acknowledged `stream` up to `offset`. A pipe session forgets what is before it,
+    /// which lets its program write again if it was held back. A tty session keeps it, up to
+    /// the buffer's capacity, as scrollback: a new client process attaching (FRESH, from 0) gets
+    /// the recent output, not a blank screen (protocol.md 7.2 and 7.5 allow either).
     pub fn ack(&self, stream: Stream, offset: u64) {
-        self.buffer(stream).lock().unwrap().ack(offset);
+        if self.pipe {
+            self.buffer(stream).lock().unwrap().ack(offset);
+        }
         self.room.notify_all();
     }
 

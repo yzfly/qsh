@@ -896,7 +896,11 @@ ACK has a second field, `Error Received`, for the error output stream; section 7
   (an OUTPUT_GAP or SNAPSHOT moves `sent_end` to its `To` or `Offset`).
 
 An ACK is valid if `last_ack` ≤ `Received` ≤ `sent_end`; the sender then sets `last_ack` =
-`Received` and MAY discard bytes below `Received` from its replay buffer. An ACK with
+`Received` and MAY discard bytes below `Received` from its replay buffer. A server SHOULD NOT
+discard acknowledged output of a tty session before its replay capacity is reached: kept as
+scrollback, it is what a FRESH attach from offset 0 (a new client process, section 7.2) shows,
+instead of a blank screen. A pipe session's server discards acknowledged bytes, since its
+buffers are also its flow control (section 7.14). An ACK with
 `Received` > `sent_end` acknowledges bytes that were never sent: the receiver fails the channel
 with SEQUENCE_ERROR. An ACK with `Received` < `last_ack` is stale and MUST be ignored; it is not
 an error. (A correct peer never sends one: ACKs on a stream are not reordered and `Received`

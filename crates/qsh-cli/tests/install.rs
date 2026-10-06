@@ -104,7 +104,10 @@ fn install_from_a_file_then_connect() {
 fn a_binary_that_does_not_run_is_refused() {
     let w = world("inst-bad");
     let junk = w.dir.join("junk");
-    fs::write(&junk, b"\x7fELF not really").unwrap();
+    // A truncated ELF header, with the NUL bytes every real one has: a shell that gets ENOEXEC
+    // runs a file as a script unless it looks binary, and bash 3.2 (macOS's sh) looks only for a
+    // NUL before the first newline
+    fs::write(&junk, b"\x7fELF\x02\x01\x01\x00\x00\x00 not really").unwrap();
     let (code, _, err) = w.run(&["install", "bare", "--from", &junk.display().to_string()]);
     assert_eq!(code, 255, "{err}");
     assert!(err.contains("does not run on bare"), "{err}");

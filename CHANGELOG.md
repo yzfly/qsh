@@ -11,6 +11,30 @@ needs a section `## [X.Y.Z] - YYYY-MM-DD` here before its tag is pushed.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-06
+
+### Added
+
+- `qsh attach HOST [SESSION]`: back into a session after `~d`, a closed laptop or a killed
+  client, with the recent output replayed. Saved credentials make it direct, without ssh; when
+  they are stale, qsh asks the host again over ssh.
+- `qsh ls [HOST]` (`--json`) and `qsh kill HOST SESSION|--all`.
+- `qsh install HOST`, and on a terminal an offer to install `qsh-server` the first time a host
+  does not have it: a local copy when it fits, else the release download checked against
+  `SHA256SUMS`, else the install script on the host. The new binary must run before it replaces
+  anything. (Cargo feature `self-install`, on in release binaries and Homebrew.)
+- Configuration files `/etc/qsh/qsh_config` and `~/.config/qsh/config` (qsh_config(5)): per-host
+  transports, ssh program and options, escape character, install prompt, and a `[server]` table.
+- Network changes are noticed at once (netlink on Linux, the routing socket on macOS): the QUIC
+  connection moves to the new path and is probed; a dead path is replaced within seconds.
+- A connection notice on the bottom line in full-screen programs, removed when the connection is
+  back; `~s` shows every transport's outcome.
+
+### Changed
+
+- A tty session keeps acknowledged output as scrollback up to its 8 MiB buffer, so a new client
+  process attaching sees the recent output.
+
 ## [0.1.1] - 2026-10-06
 
 ### Fixed
@@ -48,6 +72,7 @@ The first preview. The protocol and command line may still change before 1.0.
   Linux 9, Alpine, Arch, openSUSE Tumbleweed and Amazon Linux 2023, with UDP blocked and with
   only ssh reachable.
 
-[Unreleased]: https://github.com/yzfly/qsh/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/yzfly/qsh/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/yzfly/qsh/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/yzfly/qsh/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/yzfly/qsh/releases/tag/v0.1.0

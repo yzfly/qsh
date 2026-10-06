@@ -272,13 +272,23 @@ fn attach_hint(text: &str) -> String {
     text[at..].chars().take_while(|c| c.is_ascii_hexdigit()).collect()
 }
 
-/// `~d`, then `qsh attach srv`: everything the program printed while nobody watched arrives,
-/// from the start of the session (FRESH, output from 0), with no ssh involved.
+/// A new client attaches FRESH with output from 0 and gets everything the server still buffers.
+/// A tty session keeps acknowledged output as scrollback (up to the replay capacity), so that is
+/// the whole history from tick 1, in order, without holes; the previous client ran long enough
+/// (tick 12, about 600 ms) for its ACKs (every 250 ms) to reach the server first.
+fn assert_replays_the_whole_history(all: &[u64]) {
+    assert_eq!(all.first(), Some(&1), "the scrollback is replayed from the start");
+    let expected: Vec<u64> = (1..=*all.last().unwrap()).collect();
+    assert_eq!(all, expected, "ticks lost or repeated");
+}
+
+/// `~d`, then `qsh attach srv`: everything the program printed while nobody watched arrives
+/// (FRESH, output from 0), with no ssh involved.
 #[test]
 fn attach_after_detach_replays_the_missed_output() {
     let world = World::new("reattach");
     let mut tty = Tty::spawn(world.qsh(&["srv", TICKER]));
-    tty.wait_for("tick-3\r", Duration::from_secs(20));
+    tty.wait_for("tick-12\r", Duration::from_secs(20));
     tty.send(b"\r~d");
     assert_eq!(tty.exit_code(Duration::from_secs(10)), 0);
     let text = tty.text();
@@ -308,10 +318,7 @@ fn attach_after_detach_replays_the_missed_output() {
     let bootstraps = world.bootstraps();
     let mut tty = Tty::spawn(world.qsh(&["attach", "srv"]));
     tty.wait_for(&format!("tick-{}\r", seen + 30), Duration::from_secs(20));
-    let all = ticks(&tty.text());
-    assert_eq!(all[0], 1, "the buffer is replayed from the start");
-    let expected: Vec<u64> = (1..=*all.last().unwrap()).collect();
-    assert_eq!(all, expected, "ticks lost or repeated");
+    assert_replays_the_whole_history(&ticks(&tty.text()));
     assert_eq!(world.bootstraps(), bootstraps, "no ssh: {}", world.ssh_log());
     // While attached, `qsh ls` says so
     let (_, out, _) = world.run(&["ls"]);
@@ -333,16 +340,14 @@ fn attach_after_detach_replays_the_missed_output() {
 fn attach_after_the_client_was_killed() {
     let world = World::new("killed");
     let mut tty = Tty::spawn(world.qsh(&["srv", TICKER]));
-    tty.wait_for("tick-3\r", Duration::from_secs(20));
+    tty.wait_for("tick-12\r", Duration::from_secs(20));
     kill(tty.child.id() as i32);
     let _ = tty.exit_code(Duration::from_secs(5));
     let seen = ticks(&tty.text()).last().copied().unwrap();
     let bootstraps = world.bootstraps();
     let mut tty = Tty::spawn(world.qsh(&["attach", "srv"]));
     tty.wait_for(&format!("tick-{}\r", seen + 20), Duration::from_secs(20));
-    let all = ticks(&tty.text());
-    let expected: Vec<u64> = (1..=*all.last().unwrap()).collect();
-    assert_eq!(all, expected, "ticks lost or repeated");
+    assert_replays_the_whole_history(&ticks(&tty.text()));
     assert_eq!(world.bootstraps(), bootstraps, "no ssh: {}", world.ssh_log());
     tty.send(b"\x03");
     assert_eq!(tty.exit_code(Duration::from_secs(10)), 130);

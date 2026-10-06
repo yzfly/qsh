@@ -5,6 +5,7 @@ qsh：基于 QUIC 的现代远程 shell，「你能 `ssh host`，就能 `qsh hos
 - 设计契约在 `docs/DESIGN.md`，协议规范在 `docs/protocol.md`，安全模型在 `docs/security.md`。改设计先改文档，再改代码。
 - 仓库 `yzfly/qsh`，分支 `main`。提交身份：`git -c user.name="yzfly" -c user.email="zphyix@gmail.com" commit ...`，commit message 不加任何 AI 署名。`gh` 前先 `gh auth switch --user yzfly`。
 - 用户需求清单在 `TODO.md`。
+- 发版：改根 `Cargo.toml` 的 `version` 和 `[workspace.dependencies] qsh-core` 的 version（两处要一致），`cargo xtask gen`（man 页带版本号），CHANGELOG 加 `## [X.Y.Z] - 日期` 一节，CI 全绿后推 `vX.Y.Z` tag。
 - 代码和公开文档用英文（面向全球、面向发行版）；TODO.md 和本文件用中文。
 - 起点代码：TokenSSH 仓库的 `link/`（`~/yzfly/tokenssh/link`），复用逻辑，不沿用其线协议。
 
